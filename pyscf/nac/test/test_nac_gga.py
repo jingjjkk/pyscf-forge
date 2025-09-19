@@ -27,35 +27,40 @@ from pyscf.sftda.tools_td import transition_analyze
 
 mol = gto.Mole()
 mol.atom = '''
-C    0.000000    0.000000    0.000000
-O    1.215000    0.000000    0.000000
-H    0.582000    0.940000    0.000000
-H    0.582000   -0.940000    0.000000
+C -0.0120104120 0.0599442180 -0.0888427793
+C 0.0286011823 -0.1052287787 1.3238349143
+H 0.8728781569 0.1757667241 -0.7614685688
+H -0.9766070983 0.0846922639 -0.6343504834
+H 0.7218310117 0.7184999742 1.6848421840
+H 0.7886291629 -0.9335393496 1.4864577930
 '''
 mol.basis = '6-31g'
 mol.spin = 2  
 mol.build()
 
 mf = dft.UKS(mol)
-mf.xc = 'b3lyp' 
+mf.xc = 'svwn' 
 mf.kernel()
 
 # TDA_SF object
-mftd1 = sftda.uks_sf.TDA_SF(mf)
+mftd1 = sftda.uks_sf.TDDFT_SF(mf)
 
 mftd1.max_space = 4000 #necessary
 mftd1.nstates = 4  # the number of excited states
 mftd1.extype = 1  
-mftd1.collinear_samples = 200
+mftd1.collinear_samples = 50
 
 mftd1.kernel()
 
 
-print(transition_analyze(mf, mftd1, mftd1.e[0], mftd1.xy[0], tdtype='TDA'))  #spin analysis
-print(transition_analyze(mf, mftd1, mftd1.e[2], mftd1.xy[2], tdtype='TDA'))
-
+print(transition_analyze(mf, mftd1, mftd1.e[1], mftd1.xy[1], tdtype='TDDFT'))  #spin analysis
+print(transition_analyze(mf, mftd1, mftd1.e[2], mftd1.xy[2], tdtype='TDDFT'))
+e1=mf.e_tot + mftd1.e[1]
+e2=mf.e_tot + mftd1.e[2]
+print(f"S1 energy: {e1}")
+print(f"S3 energy: {e2}")
 # nac object
-nac_grad = tduks_sf.NAC(mftd1)
+'''nac_grad = tduks_sf.NAC(mftd1)
 nac_grad.state_I = 1  # S0 
 nac_grad.state_J = 3  # S1
 
@@ -75,4 +80,4 @@ nac_grad.use_etfs = False
 nac = nac_grad.kernel()
 print("\nNon-Adiabatic Coupling (NAC)without ETF between S0 and S1:")
 for i, atom in enumerate(mol._atom):
-    print(f"Atom {i + 1} ({atom[0]}): {nac[i]}")
+    print(f"Atom {i + 1} ({atom[0]}): {nac[i]}")'''
