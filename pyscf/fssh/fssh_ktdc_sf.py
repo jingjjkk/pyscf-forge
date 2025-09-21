@@ -295,7 +295,9 @@ class FSSH_SF(FSSH):
         self.tdgrad.state = self.cur_state
 
         # The SF-TDDFT gradient scanner returns only the gradient
-        grad = self.tdgrad(mol_temp) 
+        energy_grad = self.tdgrad(mol_temp) 
+        # 解包返回的元组
+        energy_current, grad = energy_grad
         force = -grad  # (Na,D)  Unit: Ha/bohr
 
         # Calculate energies for ALL excited states from the sftda object

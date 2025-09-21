@@ -1,0 +1,66 @@
+import numpy as np
+from pyscf import gto, dft
+from pyscf.sftda import uhf_sf as sftda
+
+from pyscf.fssh.fssh_sf import FSSH_SF_NACV
+from tools import extract_state, transition_analyze
+
+# --- 1. 分子和电子结构设置 ---
+mol = gto.Mole()
+mol.atom = '''
+C   0.000000    0.658300    0.000000
+N   0.000000   -0.603300    0.000000
+H   0.930000    1.248300    0.000000
+H  -0.930000    1.248300    0.000000
+H   0.000000   -1.213300    0.000000
+'''
+mol.basis = 'cc-pVDZ'
+mol.spin = 2
+mol.build()
+
+print("--- Running Methanimine Simulation ---")
+
+mf = dft.UKS(mol)
+mf.xc = 'svwn'
+mf.hyb = 0.50
+mf.kernel()
+
+# --- 2. SF-TDDFT 计算 ---
+mftd1 = sftda.TDDFT_SF(mf)
+mftd1.nstates = 10
+mftd1.kernel()
+
+S_states_indices = extract_state(mf, mftd1, Smin=0.0, Smax=0.7)
+if len(S_states_indices) < 2:
+    raise RuntimeError("Could not find at least two singlet states (S0 and S1).")
+target_S0 = S_states_indices[0]
+target_S1 = S_states_indices[1]
+
+print(f"Identified S0 state at index {target_S0} and S1 state at index {target_S1}")
+print("S1 state analysis:")
+transition_analyze(mf, mftd1, mftd1.e[target_S1], mftd1.xy[target_S1])
+
+# --- 3. FSSH 模拟设置 ---
+active_states = [target_S0 + 1, target_S1 + 1]
+
+fssh_simulation = FSSH_SF_NACV(
+    sftda_obj=mftd1,
+    states=active_states,
+    nac_options={'use_etfs': True},
+    dt=0.2,       # 论文使用的时间步长
+    nsteps=200,   # 短时模拟(论文跑了200fs, 1000步)
+    output_dir='methanimine_traj'
+)
+
+# --- 4. 设置初始条件 ---
+initial_pos = mol.atom_coords()
+np.random.seed(456)
+initial_vel = (np.random.rand(*initial_pos.shape) - 0.5) * 0.01
+initial_coeffs = np.array([0.0, 1.0], dtype=complex) # 初始在S1
+
+# --- 5. 运行模拟 ---
+fssh_simulation.kernel(
+    position=initial_pos,
+    velocity=initial_vel,
+    coefficient=initial_coeffs
+)
