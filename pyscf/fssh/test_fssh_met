@@ -48,7 +48,7 @@ fssh_simulation = FSSH_SF_NACV(
     states=active_states,
     nac_options={'use_etfs': True},
     dt=0.2,       # 论文使用的时间步长
-    nsteps=200,   # 短时模拟(论文跑了200fs, 1000步)
+    nsteps=20,   # 短时模拟(论文跑了200fs, 1000步)
     output_dir='methanimine_traj'
 )
 
