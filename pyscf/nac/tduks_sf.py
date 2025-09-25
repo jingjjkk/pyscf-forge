@@ -1068,67 +1068,11 @@ def nac_csf(td_grad, x_y_I,x_y_J, atmlst=None):
             nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_b_IJ[:,p0:p1])*0.5
     return nac_csf
 
-def as_scanner(GradientsClass):
-    '''
-    Convert a NonAdiabaticCouplings class into a geometry scanner.
-
-    The returned Scanner class automatically re-runs SCF and TDDFT when molecular
-    geometry changes, then recomputes NACs — ideal for trajectory or geometry optimization.
-
-    Usage:
-        nac_obj = NonAdiabaticCouplings(td)
-        nac_scanner = nac_obj.as_scanner()
-        nac_vec = nac_scanner(new_mol)  # auto-recalculates if geometry changed
-
-    Args:
-        GradientsClass (class): A PySCF gradient class (must inherit from grad.Gradients).
-
-    Returns:
-        class: A Scanner subclass that supports `__call__(mol)` for automatic recomputation.
-    '''
-    
-    
-    class Scanner(GradientsClass):
-        def __init__(self, td_object):
-            
-            super().__init__(td_object)
-
-        def __call__(self, mol):
-            '''
-            Compute NACs at the given molecular geometry.
-
-            If the geometry differs from the previous one, automatically:
-                1. Updates the SCF object
-                2. Re-runs SCF and TDDFT
-                3. Recomputes NACs
-
-            Args:
-                mol (pyscf.gto.Mole): New molecular geometry.
-
-            Returns:
-                numpy.ndarray: NAC vector in atomic units, shape (natm, 3).
-            '''
-            
-            td_obj = self.base
-            mf_obj = td_obj._scf
-            
-            
-            if np.allclose(mf_obj.mol.atom_coords(), mol.atom_coords()):
-                
-                return self.kernel()       
-           
-            lib.logger.info(self, 'New geometry detected. Recalculating SCF and TDDFT.')
-                   
-            mf_obj.mol = mol         
-            mf_obj.kernel()            
-            td_obj.kernel()
-            return self.kernel()
-
-    return Scanner
 
 
 
-class NonAdiabaticCouplings(grad.tdrhf.Gradients):
+
+class NonAdiabaticCouplings(grad.tduks.Gradients):
     '''
     Non-adiabatic coupling (NAC) calculator for spin-flip TDDFT/TDA excited states.
 
@@ -1312,16 +1256,56 @@ class NonAdiabaticCouplings(grad.tdrhf.Gradients):
         self.x_y_I_prev = None
         self.x_y_J_prev = None
         return self
-    as_scanner=as_scanner
+    def as_scanner(self):
+        """
+        将 NonAdiabaticCouplings 的当前实例转换为一个 scanner 对象。
+        这个方法返回的是一个可以直接使用的 scanner 实例。
+        """
+        
+        # 在方法内部定义 Scanner 类
+        class Scanner(self.__class__):
+            
+            def __init__(self, nac_instance):
+                # 将外部实例的所有属性 (__dict__) 完整地复制到
+                # 新创建的 scanner 实例中。
+                self.__dict__ = nac_instance.__dict__
+
+            def __call__(self, mol):
+                """
+                这是 scanner 的核心，使其可以像函数一样被调用。
+                """
+                # 获取底层的 TDDFT 和 SCF 对象
+                td_obj = self.base
+                mf_obj = td_obj._scf
+                
+                # 检查坐标是否变化，如果没变，直接用缓存结果
+                if (hasattr(mf_obj.mol, 'atom_coords') and
+                        callable(mf_obj.mol.atom_coords) and
+                        np.allclose(mf_obj.mol.atom_coords(), mol.atom_coords())):
+                    return self.kernel()
+               
+                # 如果坐标变了，则重新计算
+                lib.logger.info(self, 'New geometry detected. Recalculating SCF and TDDFT.')
+                
+                td_obj.mol = mol
+                mf_obj.mol = mol         
+                mf_obj.kernel()            
+                td_obj.kernel()
+                return self.kernel()
+
+        # 最关键的一步：返回 Scanner 类的一个实例，
+        # 并用当前的 NonAdiabaticCouplings 实例 (self) 来初始化它。
+        return Scanner(self)
+
+    as_scanner = as_scanner
 
 NAC = NonAdiabaticCouplings
 
 from pyscf import sftda
+from pyscf import lib
 
-sftda.uks_sf.TDA_SF.NAC = sftda.uks_sf.TDDFT_SF.NAC = lib.class_as_method(NonAdiabaticCouplings)
-
-NAC = as_scanner(NonAdiabaticCouplings)
-
+sftda.uks_sf.TDA_SF.nac_method = lib.class_as_method(NonAdiabaticCouplings)
+sftda.uks_sf.TDDFT_SF.nac_method = lib.class_as_method(NonAdiabaticCouplings)
 
 if __name__ == '__main__':
     from pyscf import gto, scf, tdscf

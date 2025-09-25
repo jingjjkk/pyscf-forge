@@ -67,7 +67,7 @@ class FSSH:
     
     def __init__(self, 
                  tddft, 
-                 states:list[int], 
+                 states:List[int], 
                  **kwargs):
         """
         Initialize the FSSH simulation with comprehensive parameter validation.
