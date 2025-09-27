@@ -5,9 +5,9 @@ import time
 import logging
 from typing import Tuple, Optional, List, Dict
 from pathlib import Path
-from pyscf import lib
+from pyscf import lib, dft, gto, sftda
 from pyscf.sftda import uks_sf
-from pyscf.nac import tduks_sf as nac
+from pyscf.nac import tduks_sf as nac_sf
 from pyscf.grad import tduks_sf 
 from pyscf.lib import logger
 # 导入您提供的标准FSSH基类
@@ -17,12 +17,58 @@ logger = logging.getLogger(__name__)
 FS2AUTIME = 41.34137        # Conversion factor: femtoseconds to atomic time units
 A2BOHR = 1.889726           # Conversion factor: Angstrom to Bohr radius
 AMU2AU = 1822.8884858012984  # Conversion factor: amu to atomic mass units
+def _vector_dot(vec1, vec2):
+    '''
+    Compute symplectic inner product between two SF-TDDFT excitation vectors:
+        <vec1 | vec2> = X1^T * X2 - Y1^T * Y2
 
+    Args:
+        vec1, vec2 (tuple): Each is ((X_alpha_beta, X_beta_alpha), (Y_alpha_beta, Y_beta_alpha)),
+    Returns:
+        float: Inner product value.
+    '''
+    x1, y1 = vec1
+    x2, y2 = vec2
+    
+    dot_x = 0.0
+    if isinstance(x1[0], np.ndarray) and isinstance(x2[0], np.ndarray):
+        dot_x += np.dot(x1[0].ravel(), x2[0].ravel())
+    if isinstance(x1[1], np.ndarray) and isinstance(x2[1], np.ndarray):
+        dot_x += np.dot(x1[1].ravel(), x2[1].ravel())
+        
+    dot_y = 0.0
+    if isinstance(y1[0], np.ndarray) and isinstance(y2[0], np.ndarray):
+        dot_y += np.dot(y1[0].ravel(), y2[0].ravel())
+    if isinstance(y1[1], np.ndarray) and isinstance(y2[1], np.ndarray):
+        dot_y += np.dot(y1[1].ravel(), y2[1].ravel())
+        
+    return dot_x - dot_y
+
+def _scale_vector(vec, factor=-1.0):
+    '''
+    Multiply an excitation vector by a scalar factor.
+
+    Args:
+        vec (tuple): ((x_a, x_b), (y_a, y_b))
+        factor (float): Scaling factor.
+
+    Returns:
+        tuple: Scaled vector in same format.
+    '''
+    x, y = vec
+    
+    x_a_new = x[0] * factor if isinstance(x[0], np.ndarray) else 0
+    x_b_new = x[1] * factor if isinstance(x[1], np.ndarray) else 0
+    
+    y_a_new = y[0] * factor if isinstance(y[0], np.ndarray) else 0
+    y_b_new = y[1] * factor if isinstance(y[1], np.ndarray) else 0
+    
+    return ((x_a_new, x_b_new), (y_a_new, y_b_new))
 class FSSH_SF(FSSH):
     """
     一个用于Spin-Flip TDDFT的FSSH实现。
     它继承自通用的FSSH类，并重写了calc_electronic方法以正确处理
-    SF-TDDFT的能量计算和scanner调用。
+    SF-TDDFT的计算。
     """
     def __init__(self, tddft, states:List[int], **kwargs):
         """
@@ -38,19 +84,18 @@ class FSSH_SF(FSSH):
         
         self.tddft = tddft  # 现在 tddft 是一个 sftda.uks_sf.TDDFT_SF 对象
         self.tdgrad = tduks_sf.Gradients(self.tddft)
-        self.tdnac = nac.NAC(self.tddft)
+        self.tdnac = nac_sf.NAC(self.tddft)
         self.tdnac.etfs= True
         self.tdnac.ediff= True
         self.tddft.mol.unit = 'Bohr'
         self.tddft._scf.mol.unit = 'Bohr'
         
-        # 我们可以选择性地在这里为 grad 和 nac scanner 设置默认的 cphf 选项
+            # 2. 检查并设置CPHF选项
         if 'cphf_options' in kwargs:
             cphf_opts = kwargs['cphf_options']
             max_cycle = cphf_opts.get('max_cycle', 100)
             conv_tol = cphf_opts.get('conv_tol', 1e-7)
             
-            # 为两个scanner都设置上
             if hasattr(self.tdgrad, 'cphf_max_cycle'):
                 self.tdgrad.cphf_max_cycle = max_cycle
                 self.tdgrad.cphf_conv_tol = conv_tol
@@ -63,8 +108,8 @@ class FSSH_SF(FSSH):
             raise ValueError("All state indices for FSSH-SF must be 1-based positive integers (e.g., [1, 2])")
         
 
-        self.prev_wavefunctions_flat = None  # 用于态追踪的历史波函数
-        
+        #self.prev_wavefunctions_flat = None  # 用于态追踪的历史波函数
+        self.prev_ci_vectors = None  # 用于相位校正的历史CI向量
         # 3. 基本属性 (Basic Attributes)
         self.states = list(states)
         self.Nstates = len(states)      
@@ -90,7 +135,7 @@ class FSSH_SF(FSSH):
         self.nsteps = 1
         self.output_dir = Path('.')
 
-        # 7. 动力学参数用户覆盖 (Dynamics Param Override) - 这部分至关重要
+        # 7. 动力学参数用户覆盖 (Dynamics Param Override)
         for key, value in kwargs.items():
             if key == 'dt' and isinstance(value, (int, float)):
                 if value <= 0:
@@ -111,126 +156,106 @@ class FSSH_SF(FSSH):
                    f"dt={self.dt/FS2AUTIME:.3f} fs, {self.nsteps} steps")
 
     def calc_electronic(self, position: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        print("\n" + "="*70)
-        print(f"[DEBUG_else] Before conversion: first atom (Bohr) = {position[0]}")
-        print("="*70 + "\n")
-        mf = self.tddft._scf
-       
-        natoms = mf.mol.natm
-
-
-        # 2. 更新几何构型
-        print("BEFORE first set_geom_: mol coords (Bohr) =", mf.mol.atom_coords(unit='Bohr')[0])
-        mf.mol.set_geom_(position.reshape(natoms, 3), unit='Bohr')
-        print("AFTER  second set_geom_: mol coords (Bohr) =", mf.mol.atom_coords(unit='Bohr')[0])
+        """
+        计算给定核位置下的电子能量、力和非绝热耦合向量 (NACV)。
+        Args:
+            position (np.ndarray): 核位置 (Natoms × 3)，单位为Bohr。
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]: 
+                - energy (np.ndarray): 电子能量 (Nstates,)
+                - force (np.ndarray): 力 (Natoms × 3)
+                - Nacv (np.ndarray): 非绝热耦合向量 (Nstates × Nstates × Natoms × 3)
+        """
+        current_mol = self.tddft.mol.copy()
+        current_mol.set_geom_(position.reshape(current_mol.natm, 3), unit='Bohr')
+        
+        # 1. *** 创建一个全新的、纯净的UKS对象 ***
+        #    从self.tddft._scf中获取必要的参数，如泛函和自旋
+        xc_fun = self.tddft._scf.xc
+        mf = dft.UKS(current_mol, xc=xc_fun)
+        mf.spin = 2
+        
+        # 2. 运行SCF。
         mf.kernel()
-        
-        
-        self.tddft.extype = 1  
-        self.tddft.kernel() 
-
-        # 1. 态的特性识别：筛选出所有单重态
-        # 假设 extract_state 返回的是pyscf激发态索引的列表
-        singlet_indices = extract_state(mf, self.tddft, Smin=0.0, Smax=0.7)
-
-        if len(singlet_indices) < self.Nstates:
-            raise RuntimeError(f"Error: Found only {len(singlet_indices)} singlet states, "
-                            f"but the simulation requires {self.Nstates}.")
-
-        # 2. 态的追踪 (State Tracking) - 这是关键的新增部分
-        # 我们需要一个方法来计算波函数重叠。SF-TDDFT的"波函数"是它的激发/去激发向量(X/Y vector)。
-        # 我们需要计算 t 时刻的态 i 的向量与 t+dt 时刻所有候选态 j 的向量的内积 |<Psi_i(t)|Psi_j(t+dt)>|^2
-        def flatten_xy(xy_tuple):
-            # 将xy元组中的所有非零矩阵按固定顺序连接并展开成一维向量
-            # ((xaa, xba), (yab, ybb))
-            xab, xba = xy_tuple[0]
-            yab, yba = xy_tuple[1]
-            #取负来进行辛内积
-            yab = -yab
-            yba = -yba
-            
-            parts = []
-            # 我们检查每个部分是不是一个numpy数组，以避免处理数字0
-            if isinstance(xab, np.ndarray): parts.append(xab.ravel())
-            if isinstance(xba, np.ndarray): parts.append(xba.ravel())
-            if isinstance(yab, np.ndarray): parts.append(yab.ravel())
-            if isinstance(yba, np.ndarray): parts.append(yba.ravel())
-            
-            return np.concatenate(parts)
-        current_wavefunctions_flat = [flatten_xy(self.tddft.xy[i]) for i in singlet_indices]
-
-        # ordered_indices 将会存储 t+dt 时刻的态，使其顺序与 t 时刻的态一一对应
-        # 例如，如果 t 时刻我们追踪的是 (S1, S2)，那么 ordered_indices[0] 就是新的S1态的索引
-        #if self.prev_wavefunctions_flat is None:
-            # 这是第一步，没有历史信息，我们只能相信能量排序
-            # 假设我们关心的是能量最低的 Nstates 个单重态
-            # 我们需要根据能量对 singlet_indices 进行排序
-        energies = self.tddft.e[singlet_indices]
-        sorted_s_indices = [x for _, x in sorted(zip(energies, singlet_indices))]
-        ordered_indices = sorted_s_indices[:self.Nstates]
-        '''else:
-            # 从第二步开始，我们通过波函数重叠来追踪
-            # overlap_matrix[i, j] = |<prev_wfn_i | current_wfn_j>|^2
-            overlap_matrix = np.abs(np.einsum('ic,jc->ij', np.conj(self.prev_wavefunctions_flat), np.array(current_wavefunctions_flat)))
-            
-            # 使用最大重叠原则进行匹配（这是一个简化版本，更稳健的算法是匈牙利算法或代价矩阵）
-            # 对于我们关心的每一个旧的态，找到与它重叠最大的新态
-            ordered_indices = []
-            available_indices = list(range(len(current_wavefunctions_flat)))
-            for i in range(self.Nstates):
-                # 找到与第 i 个旧波函数重叠最大的新波函数的索引
-                best_match_idx = np.argmax(overlap_matrix[i, available_indices])
-                original_idx_in_current = available_indices.pop(best_match_idx)
-                ordered_indices.append(singlet_indices[original_idx_in_current])
-
-        # 更新历史信息，为下一步做准备
-        self.prev_wavefunctions_flat = [current_wavefunctions_flat[singlet_indices.index(i)] for i in ordered_indices]'''
-
-        # --- 到这里，我们已经成功找到了当前几何构型下我们感兴趣的态在pyscf输出中的真实索引 ---
-        # ordered_indices = [index_of_S1, index_of_S2, ...]
-
-        # 3. 计算能量 (Energy)
-        # 这里的 self.states 列表 (如 [0, 1]) 现在仅仅作为抽象的标签
-        # 它与 pyscf 的索引通过 ordered_indices 映射起来
         ref_energy = mf.e_tot
-        # energy数组的顺序必须与self.states的顺序一致
-        energy = np.array([ref_energy + self.tddft.e[idx] for idx in ordered_indices])
 
-        # 4. 计算力 (Force)
-        # 找到当前活动态 self.cur_state 在 self.states 列表中的位置
-        active_state_list_index = self.states.index(self.cur_state)
-        # 从 ordered_indices 中找到对应的 pyscf 索引
-        pyscf_state_index = ordered_indices[active_state_list_index]
-        # 调用梯度计算（注意 pyscf 是 1-based index）
+        # 3. 基于这个全新的mf，创建一个全新的TDA_SF对象
+        mftd = sftda.uks_sf.TDA_SF(mf)
+        mftd.extype = self.tddft.extype
+        mftd.collinear_samples = self.tddft.collinear_samples
+        mftd.max_space = self.tddft.max_space
+        mftd.nstates = self.tddft.nstates
+        mftd.kernel()
+        
+    # 4. 识别单重态 (S1, S2, ...)
+        singlet_indices = extract_state(mf, mftd, Smin=0.0, Smax=0.7)
+        if len(singlet_indices) < len(self.states):
+            raise RuntimeError(f"Not enough singlet states found to track {len(self.states)} states.")
+
+        sorted_singlets_pyscf_indices = sorted(singlet_indices, key=lambda i: mftd.e[i])
+
+        # 5. 建立态标签到pyscf索引的映射
+        state_map = {s: sorted_singlets_pyscf_indices[s-1] for s in self.states}
+        
+        # 6. 提取能量
+        energy = np.array([ref_energy + mftd.e[state_map[s]] for s in self.states])
+        
+        # 7. 获取当前活动态的pyscf索引
+        active_pyscf_idx = state_map[self.cur_state]
        
-        grad = self.tdgrad.kernel(state=pyscf_state_index + 1)
-
+        # 8. 创建全新的Gradients对象并计算梯度
+        mftdg = tduks_sf.Gradients(mftd)
+        mftdg.cphf_max_cycle = self.tdgrad.cphf_max_cycle
+        mftdg.cphf_conv_tol = self.tdgrad.cphf_conv_tol
+        grad = mftdg.kernel(state=active_pyscf_idx + 1)
         force = -grad
+        natoms = current_mol.natm
+        
+        current_ci_vectors = {s: mftd.xy[state_map[s]] for s in self.states}
 
-        # 5. 计算非绝热耦合 (NACV)
-        Nacv = np.zeros((self.Nstates, self.Nstates, natoms, 3))
+        # 2. 如果不是第一步，进行相位校正
+        if self.prev_ci_vectors is not None:
+            for s in self.states:
+                # 使用 _vector_dot 计算重叠积分
+                overlap = _vector_dot(self.prev_ci_vectors[s], current_ci_vectors[s])
+                
+                # 如果重叠为负，说明相位需要翻转
+                if overlap < 0:
+                    # 使用 _scale_vector 进行相位校正
+                    current_ci_vectors[s] = _scale_vector(current_ci_vectors[s], -1.0)
+
+        # 3. 将校正后的CI向量放回mftd对象中，以供NAC计算器使用
+        for s in self.states:
+            pyscf_idx = state_map[s]
+            mftd.xy[pyscf_idx] = current_ci_vectors[s]
+
+        # 4. 创建NAC计算器并计算NACV
+        Nacv = np.zeros((self.Nstates, self.Nstates, current_mol.natm, 3))
+        
+        nac = nac_sf.NAC(mftd)
         # 遍历所有需要计算的态对，例如 (0,1), (0,2), (1,2)...
         for i, j in self.nac_idx:
             # i, j 是 self.states 列表中的索引
             # 找到它们对应的 pyscf 索引
-            pyscf_idx_I = ordered_indices[i]
-            pyscf_idx_J = ordered_indices[j]
             
+            pyscf_idx_I = state_map[self.states[i]]
+            pyscf_idx_J = state_map[self.states[j]]
+            nac.cphf_max_cycle = self.tdnac.cphf_max_cycle
+            nac.cphf_conv_tol = self.tdnac.cphf_conv_tol
             # 设置并计算 NAC
-            self.tdnac.state_I = pyscf_idx_I + 1
-            self.tdnac.state_J = pyscf_idx_J + 1
-            
-            # 你的 nac.NAC 对象可能需要分子坐标，需要确认其API
-            # 假设它会自动从 self.tddft 对象中获取最新坐标
-            #nac_vector = self.tdnac.kernel()
-            #测试，先返回0向量nac_vector
-            nac_vector = np.zeros((natoms, 3))
-            
-            
+            nac.state_I = pyscf_idx_I + 1
+            nac.state_J = pyscf_idx_J + 1
+            nac.etfs= True
+            nac.ediff= True
+           
+            nac_vector = nac.kernel()
+            # 打印nac
+            print(f"NAC vector (a.u.) between states {self.states[i]} and {self.states[j]}:\n{nac_vector}\n")
+                   
             Nacv[i, j] = nac_vector
             Nacv[j, i] = -nac_vector
-            
-        # 函数最后返回 energy, force, Nacv
+        self.prev_ci_vectors = current_ci_vectors    
+
         return energy, force, Nacv
     def exp_propagator(self, c: np.ndarray, Veff: np.ndarray, dt: float) -> np.ndarray:
         """
@@ -586,7 +611,7 @@ class FSSH_SF(FSSH):
             energy, force, nacv = self.calc_electronic(position)
             
             # 4. update the electronic amplitude within a full-time step
-            '''nact = np.einsum('ijnd,nd->ij', nacv, velocity)
+            nact = np.einsum('ijnd,nd->ij', nacv, velocity)
             coefficient = self.update_coefficient(coefficient, energy, nact)
             
             # 5. evaluate the switching probability
@@ -612,7 +637,7 @@ class FSSH_SF(FSSH):
 
                 else:
                     logger.debug(f"Hop to state {self.states[hop_index]} rejected "
-                                 f"due to insufficient kinetic energy")'''
+                                 f"due to insufficient kinetic energy")
             
             # 7. update nuclear velocity within a half time step
             velocity = velocity + 0.5 * self.dt * force / self.mass

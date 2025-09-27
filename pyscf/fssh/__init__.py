@@ -13,4 +13,7 @@
 # limitations under the License.
 
 
-from . import FSSH
+from . import fssh_sf
+from .fssh_sf import FSSH_SF
+from . import fssh
+from .fssh import FSSH
