@@ -250,7 +250,7 @@ class FSSH_SF(FSSH):
            
             nac_vector = nac.kernel()
             # 打印nac
-            print(f"NAC vector (a.u.) between states {self.states[i]} and {self.states[j]}:\n{nac_vector}\n")
+            print(f"NAC vector (a.u.) between states {nac.state_I} and {nac.state_J}:\n{nac_vector}\n")
                    
             Nacv[i, j] = nac_vector
             Nacv[j, i] = -nac_vector
