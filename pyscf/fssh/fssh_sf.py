@@ -7,7 +7,7 @@ from typing import Tuple, Optional, List, Dict
 from pathlib import Path
 from pyscf import lib, dft, gto, sftda
 from pyscf.sftda import uks_sf
-from pyscf.nac import tduks_sf as nac_sf
+from pyscf.tdnac import tduks_sf as nac_sf
 from pyscf.grad import tduks_sf 
 from pyscf.lib import logger
 # 导入您提供的标准FSSH基类
