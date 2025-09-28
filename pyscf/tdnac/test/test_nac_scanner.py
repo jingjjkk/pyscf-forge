@@ -16,7 +16,7 @@
 # Description: Non-adiabatic coupling for spin-flip TDDFT (part of manuscript in preparation)
 from pyscf import gto, dft
 from pyscf.sftda import uks_sf
-from pyscf.nac import tduks_sf
+from pyscf.tdnac import tduks_sf
 import numpy as np
 from pyscf.sftda.tools_td import transition_analyze 
 # ========== 1. Build initial molecule (H2O) ==========

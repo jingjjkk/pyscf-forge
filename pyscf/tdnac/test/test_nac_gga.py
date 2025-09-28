@@ -18,7 +18,7 @@ from pyscf import gto, scf, tdscf
 from pyscf import dft
 from pyscf import sftda, grad
 from pyscf.grad import tduks_sf  # this import is necessary.
-from pyscf.nac import tduks_sf  # this import is necessary.
+from pyscf.tdnac import tduks_sf  # this import is necessary.
 try:
     import mcfun  # mcfun>=0.2.5 must be used.
 except ImportError:
