@@ -1024,48 +1024,64 @@ def nac_csf(td_grad, x_y_I,x_y_J, atmlst=None):
 
     nmoa = nocca + nvira
     nmob = noccb + nvirb
+    (x_ab_I, x_ba_I), (y_ab_I, y_ba_I) = x_y_I
+    (x_ab_J, x_ba_J), (y_ab_J, y_ba_J) = x_y_J
+    if td_grad.base.extype==0:
+        
+        
+        x_ab_I = (x_ab_I).T
+        x_ab_J = (x_ab_J).T
+        #判断y_I是否是int类型
+        if not isinstance(y_ba_I, int):
+            y_ba_I = (y_ba_I).T
+            y_ba_J = (y_ba_J).T
+        else:
+            y_ba_I = np.zeros((orbvb,orboa))
+            y_ba_J = np.zeros((orbvb,orboa))
 
-    if td_grad.base.extype==0 or 1:
+        dvvx_a_IJ = np.einsum('ai,bi->ab', x_ab_I, x_ab_J) + np.einsum('ai,bi->ab', x_ab_I, x_ab_J) # T^{ab \alpha \beta}*2
+        doox_b_IJ = np.einsum('ai,aj->ij', x_ab_I, x_ab_J) + np.einsum('ai,aj->ij', x_ab_I, x_ab_J) # T^{ij \alpha \beta}*2
+        dvvy_b_IJ =-np.einsum('ai,bi->ab',y_ba_I, y_ba_J) - np.einsum('ai,bi->ab', y_ba_I, y_ba_J)
+        dooy_a_IJ =-np.einsum('ai,aj->ij',y_ba_I, y_ba_J) - np.einsum('ai,aj->ij', y_ba_I, y_ba_J) 
+        dmzoo_a_IJ = reduce(np.dot, (orboa, dooy_a_IJ, orboa.T))
+        dmzoo_a_IJ+= reduce(np.dot, (orbva, dvvx_a_IJ, orbva.T))
+        dmzoo_b_IJ = reduce(np.dot, (orbob, doox_b_IJ, orbob.T))
+        dmzoo_b_IJ+= reduce(np.dot, (orbvb, dvvy_b_IJ, orbvb.T))
+    if td_grad.base.extype==1:
         
-        (x_ab_I, x_ba_I), (y_ab_I, y_ba_I) = x_y_I
-        (x_ab_J, x_ba_J), (y_ab_J, y_ba_J) = x_y_J
+        
+        x_ba_I = (x_ba_I).T
+        x_ba_J = (x_ba_J).T
+        #判断y_I是否是int类型
+        if not isinstance(y_ab_I, int):
+            y_ab_I = (y_ab_I).T
+            y_ab_J = (y_ab_J).T
+        else:
+            y_ab_I = np.zeros((orbva,orbob))
+            y_ab_J = np.zeros((orbva,orbob))
 
-        x_ab_I = (x_ab_I+y_ab_I).T
-        x_ba_I = (x_ba_I+y_ba_I).T
-        x_ab_J = (x_ab_J+y_ab_J).T
-        x_ba_J = (x_ba_J+y_ba_J).T
+        dvvx_b_IJ = np.einsum('ai,bi->ab', x_ba_I, x_ba_J) + np.einsum('ai,bi->ab', x_ba_I, x_ba_J) # T^{ab \alpha \beta}*2
+        doox_a_IJ = np.einsum('ai,aj->ij', x_ba_I, x_ba_J) + np.einsum('ai,aj->ij', x_ba_I, x_ba_J) # T^{ij \alpha \beta}*2
+        dvvy_a_IJ =-np.einsum('ai,bi->ab', y_ab_I, y_ab_J) - np.einsum('ai,bi->ab', y_ab_I, y_ab_J)
+        dooy_b_IJ =-np.einsum('ai,aj->ij', y_ab_I, y_ab_J) - np.einsum('ai,aj->ij', y_ab_I, y_ab_J) 
+        dmzoo_a_IJ = reduce(np.dot, (orboa, doox_a_IJ, orboa.T))
+        dmzoo_a_IJ+= reduce(np.dot, (orbva, dvvy_a_IJ, orbva.T))
+        dmzoo_b_IJ = reduce(np.dot, (orbob, dooy_b_IJ, orbob.T))
+        dmzoo_b_IJ+= reduce(np.dot, (orbvb, dvvx_b_IJ, orbvb.T))
 
-        dvv_a_IJ = np.einsum('ai,bi->ab', x_ab_I, x_ab_J) + np.einsum('ai,bi->ab', x_ab_I, x_ab_J) # T^{ab \alpha \beta}*2
         
-        
-        dvv_b_IJ = np.einsum('ai,bi->ab', x_ba_I, x_ba_J) + np.einsum('ai,bi->ab', x_ba_I, x_ba_J) # T^{ab \beta \alpha}*2
-        
-
-        doo_b_IJ = np.einsum('ai,aj->ij', x_ab_I, x_ab_J) + np.einsum('ai,aj->ij', x_ab_I, x_ab_J) # T^{ij \alpha \beta}*2
-        doo_b_JI = np.einsum('ai,aj->ij', x_ab_J, x_ab_I) + np.einsum('ai,aj->ij', x_ab_J, x_ab_I)
-
-        doo_a_IJ = np.einsum('ai,aj->ij', x_ba_I, x_ba_J) + np.einsum('ai,aj->ij', x_ba_I, x_ba_J) # T^{ij \beta \alpha}*2
-
-        dmzoo_a_IJ = reduce(np.dot, (orboa, doo_a_IJ, orboa.T))*0.5 # \sum_{\sigma ab} 2*Tab \sigma C_{au} C_{bu}
-         
-        dmzoo_b_IJ = reduce(np.dot, (orbob, doo_b_IJ, orbob.T))*0.5 # \sum_{\sigma ab} 2*Tij \sigma C_{iu} C_{iu}
-        
-        dmzoo_a_IJ+= reduce(np.dot, (orbva, dvv_a_IJ, orbva.T))*0.5
-        
-        dmzoo_b_IJ+= reduce(np.dot, (orbvb, dvv_b_IJ, orbvb.T))*0.5
-        
-        mf_grad = td_grad.base._scf.nuc_grad_method()    
-        s1 = mf_grad.get_ovlp(mol)
-        if atmlst is None:
-            atmlst = range(mol.natm)
-        offsetdic = mol.offset_nr_by_atom()
-        nac_csf = np.zeros((len(atmlst),3))
-        for k, ia in enumerate(atmlst):
-            shl0, shl1, p0, p1 = offsetdic[ia]
-            nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_a_IJ[p0:p1])*0.5
-            nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_b_IJ[p0:p1])*0.5
-            nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_a_IJ[:,p0:p1])*0.5
-            nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_b_IJ[:,p0:p1])*0.5
+    mf_grad = td_grad.base._scf.nuc_grad_method()    
+    s1 = mf_grad.get_ovlp(mol)
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    offsetdic = mol.offset_nr_by_atom()
+    nac_csf = np.zeros((len(atmlst),3))
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+        nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_a_IJ[p0:p1])*0.25
+        nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_b_IJ[p0:p1])*0.25
+        nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_a_IJ[:,p0:p1])*0.25
+        nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_b_IJ[:,p0:p1])*0.25
     return nac_csf
 
 
