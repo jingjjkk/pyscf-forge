@@ -10,6 +10,9 @@ from pyscf.grad import rks as rks_grad
 from pyscf.grad import tdrhf as tdrhf_grad
 from pyscf.sftda.numint2c_sftd import cache_xc_kernel_sf
 from pyscf import grad
+import time
+
+
 
 def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, verbose=logger.INFO):
     '''
@@ -49,6 +52,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
         - This function assumes the use of spin-flip (SF) excitation vectors, avilable for both TDA and TDDFT.
         - For full NAC, combine this term with the "wavefunction overlap term".
     '''
+    
     log = logger.new_logger(td_grad, verbose)
     time0 = logger.process_clock(), logger.perf_counter()
 
@@ -74,7 +78,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
 
     nmoa = nocca + nvira
     nmob = noccb + nvirb
-
+    
     if td_grad.base.extype==0 or 1:
         
         (x_ab_I, x_ba_I), (y_ab_I, y_ba_I) = x_y_I
@@ -121,6 +125,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
     
         dmzoo_a = (dmzoo_a_IJ + dmzoo_a_JI)*0.5
         dmzoo_b = (dmzoo_b_IJ + dmzoo_b_JI)*0.5
+        
         ni = mf._numint
         ni.libxc.test_deriv_order(mf.xc, 3, raise_error=True)
         omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
@@ -135,7 +140,9 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
         f1vo_J, f1oo_JI, _, _ = \
                 _contract_xc_kernel(td_grad, mf.xc, ((dmxpy_ab_J,dmxpy_ba_J),(dmxmy_ab_J,dmxmy_ba_J)),((dmxpy_ab_I,dmxpy_ba_I),(dmxmy_ab_I,dmxmy_ba_I)),
                                     (dmzoo_a,dmzoo_b), False, False, max_memory)
+        clear_xc_kernel_cache()
         k1ao_xpy, k1ao_xmy = k1ao
+        
 
         # f1vo, (2,2,4,nao,nao), (X+Y) and (X-Y) with fxc_sf
         # f1oo, (2,4,nao,nao), 2T with fxc_sc
@@ -287,7 +294,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
 
             wvoa -= np.einsum('il,al->ai', veff0mom_ab[:nocca,:noccb], xmy_ab_I) 
             wvob -= np.einsum('il,al->ai', veff0mom_ba[:noccb,:nocca], xmy_ba_I)     
-
+    
 
     vresp = mf.gen_response(hermi=1)
 
@@ -312,7 +319,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
                            tol=td_grad.cphf_conv_tol)[0]
 
     time1 = log.timer('Z-vector using UCPHF solver', *time0)
-
+    
     z1ao = np.zeros((2,nao,nao))
     z1ao[0] += reduce(np.dot, (orbva, z1a, orboa.T))
     z1ao[1] += reduce(np.dot, (orbvb, z1b, orbob.T))
@@ -424,7 +431,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
     veff1[:,3] += f1vo_I[1,:,1:]
     veff1a, veff1b = veff1
     time1 = log.timer('2e AO integral derivatives', *time1)
-
+    
     if atmlst is None:
         atmlst = range(mol.natm)
     offsetdic = mol.offset_nr_by_atom()
@@ -478,6 +485,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
             de[k] += np.einsum('xji,ij->x', vk[0,3,:,p0:p1], dmxmy_ab_J[:,p0:p1])/2
            
             de[k] += np.einsum('xji,ij->x', vk[1,3,:,p0:p1], dmxmy_ba_J[:,p0:p1])/2
+    
     if abs(hyb) > 1e-10:
         dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_J+dmxpy_ab_J.T, dmxmy_ba_J-dmxmy_ab_J.T,
               oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_J+dmxpy_ba_J.T, dmxmy_ab_J-dmxmy_ba_J.T)
@@ -512,7 +520,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
     veff1[:,3] += f1vo_J[1,:,1:]
     veff1a, veff1b = veff1
     time1 = log.timer('2e AO integral derivatives', *time1)
-
+    
     if atmlst is None:
         atmlst = range(mol.natm)
     offsetdic = mol.offset_nr_by_atom()
@@ -548,11 +556,19 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
             de[k] += np.einsum('xji,ij->x', vk[0,3,:,p0:p1], dmxmy_ab_I[:,p0:p1])/2
            
             de[k] += np.einsum('xji,ij->x', vk[1,3,:,p0:p1], dmxmy_ba_I[:,p0:p1])/2
+  
     return de
 
+_XC_KERNEL_CACHE = {}
+
+def clear_xc_kernel_cache():
+    """手动清空XC Kernel的缓存。"""
+    print("Clearing XC kernel cache.")
+    _XC_KERNEL_CACHE.clear()
 
 def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=True,
                         with_kxc=True, max_memory=6000):
+    
     mol = td_grad.mol
     mf = td_grad.base._scf
     grids = mf.grids
@@ -589,9 +605,27 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=Tr
     nimc.collinear = 'mcol'
     nimc.collinear_samples=td_grad.base.collinear_samples
 
-    fxc_sf,kxc_sf = cache_xc_kernel_sf(nimc,mol,mf.grids,mf.xc,mo_coeff,mo_occ,deriv=3,spin=1)[2:]
-    p0,p1=0,0
-
+    # precompute xc kernels for spin-flip (from your original helper)
+    geometry_bytes = mol.atom_coords().tobytes()
+    
+    # 2. 创建一个唯一的复合键，包含对象ID和当前几何构型
+    cache_key = (id(mf), geometry_bytes)
+    
+    if cache_key in _XC_KERNEL_CACHE:
+        # 如果键存在，直接从缓存加载
+        # print("从缓存加载XC Kernel (构型匹配)...") # 用于调试
+        fxc_sf, kxc_sf = _XC_KERNEL_CACHE[cache_key]
+    else:
+        # 如果键不存在，执行昂贵的计算
+        # print("计算并缓存当前构型的XC Kernel...") # 用于调试
+        mo_coeff = mf.mo_coeff
+        mo_occ = mf.mo_occ
+        fxc_sf, kxc_sf = cache_xc_kernel_sf(nimc, mol, mf.grids, mf.xc, mo_coeff, mo_occ, deriv=3, spin=1)[2:]
+        # 将结果存入全局缓存
+        _XC_KERNEL_CACHE[cache_key] = (fxc_sf, kxc_sf)
+    p0 = p1 = 0
+    
+    # Helper: LDA accumulate
     if xctype == 'LDA':
         def lda_sum_(vmat, ao, wv, mask):
             aow = numint._scale_ao(ao[0], wv)
@@ -599,122 +633,136 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=Tr
                 vmat[k] += numint._dot_ao_ao(mol, ao[k], aow, mask, shls_slice, ao_loc)
 
         ao_deriv = 1
-        for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+        # iterate blocks; inside each block compute all needed rho once and reuse
+        for ao, mask, weight, coords in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
             p0 = p1
-            p1+= weight.shape[0]
-            s_s = fxc_sf[...,p0:p1] * weight
+            p1 += weight.shape[0]
+            # block slices & weights
+            fxc_block = fxc_sf[..., p0:p1]  # shape depends on fxc_sf
+            w_block = weight  # alias
 
-            rho1_ab = ni.eval_rho(mol, ao[0], dmvo_I[0][0], mask, xctype)
-            rho1_ba = ni.eval_rho(mol, ao[0], dmvo_I[0][1], mask, xctype)
-            lda_sum_(f1vo[0][1], ao, (rho1_ab+rho1_ba)*s_s*2, mask)
-            lda_sum_(f1vo[0][0], ao, (rho1_ba+rho1_ab)*s_s*2, mask)
+            # compute and cache rho for I (real) and J (real)
+            rho1_ab_I = ni.eval_rho(mol, ao[0], dmvo_I[0][0], mask, xctype)
+            rho1_ba_I = ni.eval_rho(mol, ao[0], dmvo_I[0][1], mask, xctype)
+            rho1_ab_I2 = ni.eval_rho(mol, ao[0], dmvo_I[1][0], mask, xctype)
+            rho1_ba_I2 = ni.eval_rho(mol, ao[0], dmvo_I[1][1], mask, xctype)
 
+            # For J if with_kxc required (only compute when needed)
             if with_kxc:
                 rho1_ab_J = ni.eval_rho(mol, ao[0], dmvo_J[0][0], mask, xctype)
                 rho1_ba_J = ni.eval_rho(mol, ao[0], dmvo_J[0][1], mask, xctype)
+                rho1_ab_J2 = ni.eval_rho(mol, ao[0], dmvo_J[1][0], mask, xctype)
+                rho1_ba_J2 = ni.eval_rho(mol, ao[0], dmvo_J[1][1], mask, xctype)
 
-                s_s_n = kxc_sf[:,:,0][...,p0:p1] * weight
-                s_s_s = kxc_sf[:,:,1][...,p0:p1] * weight
-                
-                lda_sum_(k1ao_xpy[0][0], ao, s_s_n*2*rho1_ab*(rho1_ab_J+rho1_ba_J), mask)
-                lda_sum_(k1ao_xpy[0][1], ao, s_s_n*2*rho1_ba*(rho1_ba_J+rho1_ab_J), mask)
-                lda_sum_(k1ao_xpy[1][0], ao, s_s_s*2*rho1_ab*(rho1_ab_J+rho1_ba_J), mask)
-                lda_sum_(k1ao_xpy[1][1], ao, s_s_s*2*rho1_ba*(rho1_ba_J+rho1_ab_J), mask)
+            # compute scaling array once per block
+            s_s = fxc_block * w_block
 
-            rho1_ab = ni.eval_rho(mol, ao[0], dmvo_I[1][0], mask, xctype)
-            rho1_ba = ni.eval_rho(mol, ao[0], dmvo_I[1][1], mask, xctype)
-
-            lda_sum_(f1vo[1][1], ao, (rho1_ab-rho1_ba)*s_s*2, mask)
-            lda_sum_(f1vo[1][0], ao, (rho1_ba-rho1_ab)*s_s*2, mask)
+            # LDA part: keep same algebra but reuse cached rho & s_s
+            lda_sum_(f1vo[0][1], ao, (rho1_ab_I + rho1_ba_I) * s_s * 2, mask)
+            lda_sum_(f1vo[0][0], ao, (rho1_ba_I + rho1_ab_I) * s_s * 2, mask)
 
             if with_kxc:
-                rho1_ab_J = ni.eval_rho(mol, ao[0], dmvo_J[1][0], mask, xctype)
-                rho1_ba_J = ni.eval_rho(mol, ao[0], dmvo_J[1][1], mask, xctype)
-                
-                s_s_n = kxc_sf[:,:,0][...,p0:p1] * weight # Re-slicing for clarity
-                s_s_s = kxc_sf[:,:,1][...,p0:p1] * weight
-                
-                lda_sum_(k1ao_xmy[0][0], ao, s_s_n*2*rho1_ab*(rho1_ab_J-rho1_ba_J), mask)
-                lda_sum_(k1ao_xmy[0][1], ao, s_s_n*2*rho1_ba*(rho1_ba_J-rho1_ab_J), mask)
-                lda_sum_(k1ao_xmy[1][0], ao, s_s_s*2*rho1_ab*(rho1_ab_J-rho1_ba_J), mask)
-                lda_sum_(k1ao_xmy[1][1], ao, s_s_s*2*rho1_ba*(rho1_ba_J-rho1_ab_J), mask)
+                # kxc part: reuse rho1_ab_I, rho1_ba_I and rho1_ab_J/rho1_ba_J
+                s_s_n = kxc_sf[:, :, 0][..., p0:p1] * w_block
+                s_s_s = kxc_sf[:, :, 1][..., p0:p1] * w_block
 
+                # combine factors to avoid repeated broadcast ops
+                lda_sum_(k1ao_xpy[0][0], ao, s_s_n * 2 * rho1_ab_I * (rho1_ab_J + rho1_ba_J), mask)
+                lda_sum_(k1ao_xpy[0][1], ao, s_s_n * 2 * rho1_ba_I * (rho1_ba_J + rho1_ab_J), mask)
+                lda_sum_(k1ao_xpy[1][0], ao, s_s_s * 2 * rho1_ab_I * (rho1_ab_J + rho1_ba_J), mask)
+                lda_sum_(k1ao_xpy[1][1], ao, s_s_s * 2 * rho1_ba_I * (rho1_ba_J + rho1_ab_J), mask)
+
+            lda_sum_(f1vo[1][1], ao, (rho1_ab_I2 - rho1_ba_I2) * s_s * 2, mask)
+            lda_sum_(f1vo[1][0], ao, (rho1_ba_I2 - rho1_ab_I2) * s_s * 2, mask)
+
+            if with_kxc:
+                s_s_n = kxc_sf[:, :, 0][..., p0:p1] * w_block
+                s_s_s = kxc_sf[:, :, 1][..., p0:p1] * w_block
+                lda_sum_(k1ao_xmy[0][0], ao, s_s_n * 2 * rho1_ab_I2 * (rho1_ab_J2 - rho1_ba_J2), mask)
+                lda_sum_(k1ao_xmy[0][1], ao, s_s_n * 2 * rho1_ba_I2 * (rho1_ba_J2 - rho1_ab_J2), mask)
+                lda_sum_(k1ao_xmy[1][0], ao, s_s_s * 2 * rho1_ab_I2 * (rho1_ab_J2 - rho1_ba_J2), mask)
+                lda_sum_(k1ao_xmy[1][1], ao, s_s_s * 2 * rho1_ba_I2 * (rho1_ba_J2 - rho1_ab_J2), mask)
+
+            # vxc / fxc / kxc evaluation for ground state part (unchanged)
             rho = (ni.eval_rho2(mol, ao[0], mo_coeff[0], mo_occ[0], mask, xctype),
                    ni.eval_rho2(mol, ao[0], mo_coeff[1], mo_occ[1], mask, xctype))
             vxc, fxc, kxc = ni.eval_xc(xc_code, rho, 1, deriv=deriv)[1:]
-            u_u, u_d, d_d = fxc[0].T * weight
+            u_u, u_d, d_d = fxc[0].T * w_block
             if dmoo is not None:
                 rho2a = ni.eval_rho(mol, ao[0], dmoo[0], mask, xctype, hermi=1)
                 rho2b = ni.eval_rho(mol, ao[0], dmoo[1], mask, xctype, hermi=1)
-                lda_sum_(f1oo[0], ao, u_u*rho2a+u_d*rho2b, mask)
-                lda_sum_(f1oo[1], ao, u_d*rho2a+d_d*rho2b, mask)
+                lda_sum_(f1oo[0], ao, u_u * rho2a + u_d * rho2b, mask)
+                lda_sum_(f1oo[1], ao, u_d * rho2a + d_d * rho2b, mask)
             if with_vxc:
-                vrho = vxc[0].T * weight
+                vrho = vxc[0].T * w_block
                 lda_sum_(v1ao[0], ao, vrho[0], mask)
                 lda_sum_(v1ao[1], ao, vrho[1], mask)
 
+    # ---------- GGA branch ----------
     elif xctype == 'GGA':
         def gga_sum_(vmat, ao, wv, mask):
             aow = numint._scale_ao(ao[:4], wv[:4])
             tmp = numint._dot_ao_ao(mol, ao[0], aow, mask, shls_slice, ao_loc)
             vmat[0] += tmp + tmp.T
             rks_grad._gga_grad_sum_(vmat[1:], mol, ao, wv, mask, ao_loc)
-
+        
         ao_deriv = 2
-        for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+        for ao, mask, weight, coords in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
             p0 = p1
-            p1+= weight.shape[0]
+            p1 += weight.shape[0]
+            ngrid = weight.shape[-1]
 
+            # cache block slices
+            fxc_block = fxc_sf[..., p0:p1]
+            kxc_block = kxc_sf[..., p0:p1] if with_kxc else None
+            w_block = weight
+
+            # --- State I (real) densities, cached ---
             rho1_ab_I = ni.eval_rho(mol, ao, dmvo_I[0][0], mask, xctype)
             rho1_ba_I = ni.eval_rho(mol, ao, dmvo_I[0][1], mask, xctype)
-            wv_sf = uks_sf_gga_wv1((rho1_ab_I,rho1_ba_I),fxc_sf[...,p0:p1],weight)
-            gga_sum_(f1vo[0][1], ao, wv_sf[0]+wv_sf[1], mask)
-            gga_sum_(f1vo[0][0], ao, wv_sf[1]+wv_sf[0], mask)
-
+            wv_sf = uks_sf_gga_wv1((rho1_ab_I, rho1_ba_I), fxc_block, w_block)
+            gga_sum_(f1vo[0][1], ao, wv_sf[0] + wv_sf[1], mask)
+            gga_sum_(f1vo[0][0], ao, wv_sf[1] + wv_sf[0], mask)
             if with_kxc:
                 rho1_ab_J = ni.eval_rho(mol, ao, dmvo_J[0][0], mask, xctype)
                 rho1_ba_J = ni.eval_rho(mol, ao, dmvo_J[0][1], mask, xctype)
-                
-                # Correcting the logic by direct einsum, as requested:
+                # use direct einsum as before but operate on the pre-sliced kxc_block
                 rho_sum_J = rho1_ab_J + rho1_ba_J
-                kxc_sf_slice = kxc_sf[...,p0:p1]
-                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I, rho_sum_J, kxc_sf_slice, optimize=True)
-                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I, rho_sum_J, kxc_sf_slice, optimize=True)
-                # Apply scaling factors and weight
+                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I, rho_sum_J, kxc_block, optimize=True)
+                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I, rho_sum_J, kxc_block, optimize=True)
                 gv_ab[0,1:] *= 2.0; gv_ab[1,1:] *= 2.0
                 gv_ba[0,1:] *= 2.0; gv_ba[1,1:] *= 2.0
-                gv_ab *= weight; gv_ba *= weight
-                
+                gv_ab *= w_block; gv_ba *= w_block
+                 
                 gga_sum_(k1ao_xpy[0][0], ao, gv_ab[0], mask)
-                gga_sum_(k1ao_xpy[0][1], ao, gv_ba[0], mask) # Bug fix: original was gv_sf[1][0]
-                gga_sum_(k1ao_xpy[1][0], ao, gv_ab[1], mask) # Bug fix: original was gv_sf[0][1]
-                gga_sum_(k1ao_xpy[1][1], ao, gv_ba[1], mask) # Bug fix: original was gv_sf[1][1]
+                gga_sum_(k1ao_xpy[0][1], ao, gv_ba[0], mask)
+                gga_sum_(k1ao_xpy[1][0], ao, gv_ab[1], mask)
+                gga_sum_(k1ao_xpy[1][1], ao, gv_ba[1], mask)
+        
 
-            rho1_ab_I = ni.eval_rho(mol, ao, dmvo_I[1][0], mask, xctype)
-            rho1_ba_I = ni.eval_rho(mol, ao, dmvo_I[1][1], mask, xctype)
-            wv_sf = uks_sf_gga_wv1((rho1_ab_I,rho1_ba_I),fxc_sf[...,p0:p1],weight)
-            gga_sum_(f1vo[1][1], ao, wv_sf[0]-wv_sf[1], mask)
-            gga_sum_(f1vo[1][0], ao, wv_sf[1]-wv_sf[0], mask)
-
+            # --- State I (imag) densities, cached ---
+            rho1_ab_I2 = ni.eval_rho(mol, ao, dmvo_I[1][0], mask, xctype)
+            rho1_ba_I2 = ni.eval_rho(mol, ao, dmvo_I[1][1], mask, xctype)
+            wv_sf = uks_sf_gga_wv1((rho1_ab_I2, rho1_ba_I2), fxc_block, w_block)
+            gga_sum_(f1vo[1][1], ao, wv_sf[0] - wv_sf[1], mask)
+            gga_sum_(f1vo[1][0], ao, wv_sf[1] - wv_sf[0], mask)
+            
             if with_kxc:
-                rho1_ab_J = ni.eval_rho(mol, ao, dmvo_J[1][0], mask, xctype)
-                rho1_ba_J = ni.eval_rho(mol, ao, dmvo_J[1][1], mask, xctype)
-               
-                rho_diff_J = rho1_ab_J - rho1_ba_J
-                kxc_sf_slice = kxc_sf[...,p0:p1]
-                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I, rho_diff_J, kxc_sf_slice, optimize=True)
-                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I, -rho_diff_J, kxc_sf_slice, optimize=True)
-                # Apply scaling factors and weight
+                rho1_ab_J2 = ni.eval_rho(mol, ao, dmvo_J[1][0], mask, xctype)
+                rho1_ba_J2 = ni.eval_rho(mol, ao, dmvo_J[1][1], mask, xctype)
+                rho_diff_J = rho1_ab_J2 - rho1_ba_J2
+                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I2, rho_diff_J, kxc_block, optimize=True)
+                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I2, -rho_diff_J, kxc_block, optimize=True)
                 gv_ab[:,1:] *= 2.0; gv_ba[:,1:] *= 2.0
-                gv_ab *= weight; gv_ba *= weight
-                
+                gv_ab *= w_block; gv_ba *= w_block
+
                 gga_sum_(k1ao_xmy[0][0], ao, gv_ab[0], mask)
                 gga_sum_(k1ao_xmy[0][1], ao, gv_ba[0], mask)
                 gga_sum_(k1ao_xmy[1][0], ao, gv_ab[1], mask)
                 gga_sum_(k1ao_xmy[1][1], ao, gv_ba[1], mask)
+                
 
+            # ground-state vxc/fxc/kxc evaluation (unchanged)
             rho = (ni.eval_rho2(mol, ao, mo_coeff[0], mo_occ[0], mask, xctype),
                    ni.eval_rho2(mol, ao, mo_coeff[1], mo_occ[1], mask, xctype))
             vxc, fxc, kxc = ni.eval_xc(xc_code, rho, 1, deriv=deriv)[1:]
@@ -724,11 +772,14 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=Tr
                 wv = numint._uks_gga_wv1(rho, rho2, vxc, fxc, weight)
                 gga_sum_(f1oo[0], ao, wv[0], mask)
                 gga_sum_(f1oo[1], ao, wv[1], mask)
+                
             if with_vxc:
                 wv = numint._uks_gga_wv0(rho, vxc, weight)
                 gga_sum_(v1ao[0], ao, wv[0], mask)
                 gga_sum_(v1ao[1], ao, wv[1], mask)
-
+                
+      
+    # ---------- MGGA branch ----------
     elif xctype == 'MGGA':
         def mgga_sum_(vmat, ao, wv, mask):
             aow = numint._scale_ao(ao[:4], wv[:4])
@@ -747,84 +798,79 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=Tr
             rks_grad._tau_grad_dot_(vmat[1:], mol, ao, wv[4]*2, mask, ao_loc, True)
 
         ao_deriv = 2
-        for ao, mask, weight, coords \
-                in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
+        for ao, mask, weight, coords in ni.block_loop(mol, grids, nao, ao_deriv, max_memory):
             p0 = p1
-            p1+= weight.shape[0]
-            ngrid=weight.shape[-1]
-            
-            # --- State I Densities ---
+            p1 += weight.shape[0]
+            ngrid = weight.shape[-1]
+
+            fxc_block = fxc_sf[..., p0:p1]
+            kxc_block = kxc_sf[..., p0:p1] if with_kxc else None
+            w_block = weight
+
+            # --- State I densities (real) ---
             rho1_ab_I_tmp = ni.eval_rho(mol, ao, dmvo_I[0][0], mask, xctype)
             rho1_ba_I_tmp = ni.eval_rho(mol, ao, dmvo_I[0][1], mask, xctype)
             rho1_ab_I = np.empty((5, ngrid)); rho1_ba_I = np.empty((5, ngrid))
             rho1_ab_I[:4] = rho1_ab_I_tmp[:4]; rho1_ba_I[:4] = rho1_ba_I_tmp[:4]
             rho1_ab_I[4] = rho1_ab_I_tmp[5]; rho1_ba_I[4] = rho1_ba_I_tmp[5]
-            
-            wv_sf = uks_sf_mgga_wv1((rho1_ab_I,rho1_ba_I), fxc_sf[...,p0:p1],weight)
-            mgga_sum_(f1vo[0][1], ao, wv_sf[0]+wv_sf[1], mask)
-            mgga_sum_(f1vo[0][0], ao, wv_sf[1]+wv_sf[0], mask)
+
+            wv_sf = uks_sf_mgga_wv1((rho1_ab_I, rho1_ba_I), fxc_block, w_block)
+            mgga_sum_(f1vo[0][1], ao, wv_sf[0] + wv_sf[1], mask)
+            mgga_sum_(f1vo[0][0], ao, wv_sf[1] + wv_sf[0], mask)
 
             if with_kxc:
-                # --- State J Densities ---
                 rho1_ab_J_tmp = ni.eval_rho(mol, ao, dmvo_J[0][0], mask, xctype)
                 rho1_ba_J_tmp = ni.eval_rho(mol, ao, dmvo_J[0][1], mask, xctype)
                 rho1_ab_J = np.empty((5, ngrid)); rho1_ba_J = np.empty((5, ngrid))
                 rho1_ab_J[:4] = rho1_ab_J_tmp[:4]; rho1_ba_J[:4] = rho1_ba_J_tmp[:4]
                 rho1_ab_J[4] = rho1_ab_J_tmp[5]; rho1_ba_J[4] = rho1_ba_J_tmp[5]
-                
-                # Direct einsum for NAC
+
                 rho_sum_J = rho1_ab_J + rho1_ba_J
-                kxc_sf_slice = kxc_sf[...,p0:p1]
-                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I, rho_sum_J, kxc_sf_slice, optimize=True)
-                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I, rho_sum_J, kxc_sf_slice, optimize=True)
-                # Apply scaling and weight
+                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I, rho_sum_J, kxc_block, optimize=True)
+                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I, rho_sum_J, kxc_block, optimize=True)
                 gv_ab[:,1:4] *= 2.0; gv_ab[:,4] *= 0.5
                 gv_ba[:,1:4] *= 2.0; gv_ba[:,4] *= 0.5
-                gv_ab *= weight; gv_ba *= weight
-                
+                gv_ab *= w_block; gv_ba *= w_block
+
                 mgga_sum_(k1ao_xpy[0][0], ao, gv_ab[0], mask)
                 mgga_sum_(k1ao_xpy[0][1], ao, gv_ba[0], mask)
                 mgga_sum_(k1ao_xpy[1][0], ao, gv_ab[1], mask)
                 mgga_sum_(k1ao_xpy[1][1], ao, gv_ba[1], mask)
 
-            
+            # --- State I densities (imag) ---
             rho1_ab_I_y_tmp = ni.eval_rho(mol, ao, dmvo_I[1][0], mask, xctype)
             rho1_ba_I_y_tmp = ni.eval_rho(mol, ao, dmvo_I[1][1], mask, xctype)
             rho1_ab_I_y = np.empty((5, ngrid)); rho1_ba_I_y = np.empty((5, ngrid))
             rho1_ab_I_y[:4] = rho1_ab_I_y_tmp[:4]; rho1_ba_I_y[:4] = rho1_ba_I_y_tmp[:4]
             rho1_ab_I_y[4] = rho1_ab_I_y_tmp[5]; rho1_ba_I_y[4] = rho1_ba_I_y_tmp[5]
-            
-            wv_sf = uks_sf_mgga_wv1((rho1_ab_I_y,rho1_ba_I_y), fxc_sf[...,p0:p1],weight)
-            mgga_sum_(f1vo[1][1], ao, wv_sf[0]-wv_sf[1], mask)
-            mgga_sum_(f1vo[1][0], ao, wv_sf[1]-wv_sf[0], mask)
+
+            wv_sf = uks_sf_mgga_wv1((rho1_ab_I_y, rho1_ba_I_y), fxc_block, w_block)
+            mgga_sum_(f1vo[1][1], ao, wv_sf[0] - wv_sf[1], mask)
+            mgga_sum_(f1vo[1][0], ao, wv_sf[1] - wv_sf[0], mask)
 
             if with_kxc:
-                # --- State J Densities (imaginary part) ---
                 rho1_ab_J_y_tmp = ni.eval_rho(mol, ao, dmvo_J[1][0], mask, xctype)
                 rho1_ba_J_y_tmp = ni.eval_rho(mol, ao, dmvo_J[1][1], mask, xctype)
                 rho1_ab_J_y = np.empty((5, ngrid)); rho1_ba_J_y = np.empty((5, ngrid))
                 rho1_ab_J_y[:4] = rho1_ab_J_y_tmp[:4]; rho1_ba_J_y[:4] = rho1_ba_J_y_tmp[:4]
                 rho1_ab_J_y[4] = rho1_ab_J_y_tmp[5]; rho1_ba_J_y[4] = rho1_ba_J_y_tmp[5]
 
-                # Direct einsum for NAC
                 rho_diff_J = rho1_ab_J_y - rho1_ba_J_y
-                kxc_sf_slice = kxc_sf[...,p0:p1]
-                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I_y, rho_diff_J, kxc_sf_slice, optimize=True)
-                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I_y, -rho_diff_J, kxc_sf_slice, optimize=True)
-                # Apply scaling and weight
+                gv_ab = np.einsum('xp,yp,xyvzp->vzp', rho1_ab_I_y, rho_diff_J, kxc_block, optimize=True)
+                gv_ba = np.einsum('xp,yp,xyvzp->vzp', rho1_ba_I_y, -rho_diff_J, kxc_block, optimize=True)
                 gv_ab[:,1:4] *= 2.0; gv_ab[:,4] *= 0.5
                 gv_ba[:,1:4] *= 2.0; gv_ba[:,4] *= 0.5
-                gv_ab *= weight; gv_ba *= weight
+                gv_ab *= w_block; gv_ba *= w_block
 
                 mgga_sum_(k1ao_xmy[0][0], ao, gv_ab[0], mask)
                 mgga_sum_(k1ao_xmy[0][1], ao, gv_ba[0], mask)
                 mgga_sum_(k1ao_xmy[1][0], ao, gv_ab[1], mask)
                 mgga_sum_(k1ao_xmy[1][1], ao, gv_ba[1], mask)
 
+            # ground state vxc/fxc/kxc (unchanged)
             rho = (ni.eval_rho2(mol, ao, mo_coeff[0], mo_occ[0], mask, xctype),
                    ni.eval_rho2(mol, ao, mo_coeff[1], mo_occ[1], mask, xctype))
             vxc, fxc, kxc = ni.eval_xc(xc_code, rho, 1, deriv=deriv)[1:]
-
             if dmoo is not None:
                 rho2 = (ni.eval_rho(mol, ao, dmoo[0], mask, xctype, hermi=1),
                         ni.eval_rho(mol, ao, dmoo[1], mask, xctype, hermi=1))
@@ -844,19 +890,21 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=Tr
                 mgga_sum_(v1ao[1], ao, wv[1], mask)
 
     else:
+        # fallback: zero arrays if functional type not supported
         f1vo = np.zeros((2,2,4,nao,nao))
-        f1oo = np.zeros((2,4,nao,nao))
-        v1ao = np.zeros((2,4,nao,nao))
-        k1ao_xpy = np.zeros((2,2,4,nao,nao))
-        k1ao_xmy = np.zeros((2,2,4,nao,nao))
-        
+        f1oo = np.zeros((2,4,nao,nao)) if dmoo is not None else None
+        v1ao = np.zeros((2,4,nao,nao)) if with_vxc else None
+        k1ao_xpy = np.zeros((2,2,4,nao,nao)) if with_kxc else None
+        k1ao_xmy = np.zeros((2,2,4,nao,nao)) if with_kxc else None
 
+    # same post-processing as original
     f1vo[:,:,1:] *= -1
     if f1oo is not None: f1oo[:,1:] *= -1
     if v1ao is not None: v1ao[:,1:] *= -1
     if with_kxc:
         k1ao_xpy[:,:,1:] *= -1
         k1ao_xmy[:,:,1:] *= -1
+    
     return f1vo, f1oo, v1ao, (k1ao_xpy,k1ao_xmy)
 
 def uks_sf_gga_wv1(rho1, fxc_sf,weight):
@@ -1081,15 +1129,12 @@ def nac_csf(td_grad, x_y_I,x_y_J, atmlst=None):
         
         (x_ab_I, x_ba_I), (y_ab_I, y_ba_I) = x_y_I
         (x_ab_J, x_ba_J), (y_ab_J, y_ba_J) = x_y_J
-        print(y_ab_I)
-        print(y_ba_I)
-        print(x_ab_I)
-        print(x_ba_I)
+
 
         x_ab_I = (x_ab_I-y_ab_I).T
-        print(x_ab_I)
+    
         x_ba_I = (x_ba_I-y_ba_I).T
-        print(x_ba_I)
+    
         x_ab_J = (x_ab_J+y_ab_J).T
         x_ba_J = (x_ba_J+y_ba_J).T
 
@@ -1406,7 +1451,7 @@ if __name__ == '__main__':
     mol.build()
 
     mf = dft.UKS(mol)
-    mf.xc = 'tpss' 
+    mf.xc = 'b3lyp' 
     mf.kernel()
     a, b = get_ab_sf(mf, collinear_samples=100)
     A_baba, A_abab = a
