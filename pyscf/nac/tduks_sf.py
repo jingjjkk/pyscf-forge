@@ -1406,7 +1406,7 @@ if __name__ == '__main__':
     mol.build()
 
     mf = dft.UKS(mol)
-    mf.xc = 'b3lyp' 
+    mf.xc = 'tpss' 
     mf.kernel()
     a, b = get_ab_sf(mf, collinear_samples=100)
     A_baba, A_abab = a
@@ -1464,7 +1464,7 @@ if __name__ == '__main__':
     #mftd1.max_space = 4000 #necessary
     #mftd1.nstates = 4  # the number of excited states
     #mftd1.extype = 1  
-    #mftd1.collinear_samples = 50
+    #mftd1.collinear_samples = 100
     
     #mftd1.kernel()
     
