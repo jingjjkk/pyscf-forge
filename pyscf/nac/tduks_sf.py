@@ -131,10 +131,10 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
 
         f1vo_I, f1oo_IJ, vxc1, k1ao = \
                 _contract_xc_kernel(td_grad, mf.xc, ((dmxpy_ab_I,dmxpy_ba_I),(dmxmy_ab_I,dmxmy_ba_I)),((dmxpy_ab_J,dmxpy_ba_J),(dmxmy_ab_J,dmxmy_ba_J)),
-                                    (dmzoo_a_IJ,dmzoo_b_IJ), True, True, max_memory)
+                                    (dmzoo_a,dmzoo_b), True, True, max_memory)
         f1vo_J, f1oo_JI, _, _ = \
                 _contract_xc_kernel(td_grad, mf.xc, ((dmxpy_ab_J,dmxpy_ba_J),(dmxmy_ab_J,dmxmy_ba_J)),((dmxpy_ab_I,dmxpy_ba_I),(dmxmy_ab_I,dmxmy_ba_I)),
-                                    (dmzoo_a_JI,dmzoo_b_JI), False, False, max_memory)
+                                    (dmzoo_a,dmzoo_b), False, False, max_memory)
         k1ao_xpy, k1ao_xmy = k1ao
 
         # f1vo, (2,2,4,nao,nao), (X+Y) and (X-Y) with fxc_sf
@@ -143,16 +143,16 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
         # k1ao_xpy，(2,2,4,nao,nao), (X+Y)(X+Y) and (X-Y)(X-Y) with gxc
 
         if abs(hyb) > 1e-10:
-            dm = (dmzoo_a, dmxpy_ba_I+dmxpy_ab_I.T,dmxpy_ba_J+dmxpy_ab_J.T, dmxmy_ba_I-dmxmy_ab_I.T,dmxmy_ba_J-dmxmy_ab_J.T,
-                  dmzoo_b, dmxpy_ab_I+dmxpy_ba_I.T,dmxpy_ab_J+dmxpy_ba_J.T, dmxmy_ab_I-dmxmy_ba_I.T, dmxmy_ab_J-dmxmy_ba_J.T) 
+            dm = (dmzoo_a, dmxpy_ba_I+dmxpy_ab_I.T, dmxmy_ba_I-dmxmy_ab_I.T,
+                  dmzoo_b, dmxpy_ab_I+dmxpy_ba_I.T, dmxmy_ab_I-dmxmy_ba_I.T)
             vj, vk = mf.get_jk(mol, dm, hermi=0)
             vk *= hyb
             if abs(omega) > 1e-10:
                 vk += mf.get_k(mol, dm, hermi=0, omega=omega) * (alpha-hyb)
-            vj = vj.reshape(2,5,nao,nao)
-            vk = vk.reshape(2,5,nao,nao)
+            vj = vj.reshape(2,3,nao,nao)
+            vk = vk.reshape(2,3,nao,nao)
 
-            veff0doo = vj[0,0]+vj[1,0] - vk[:,0]+ 0.5*(f1oo_IJ[:,0]+f1oo_JI[:,0])
+            veff0doo = vj[0,0]+vj[1,0] - vk[:,0]+ (f1oo_IJ[:,0]+f1oo_JI[:,0])*0.5
             veff0doo[0] += (k1ao_xpy[0,0,0] + k1ao_xpy[0,1,0] + k1ao_xpy[1,0,0] + k1ao_xpy[1,1,0]
                            +k1ao_xmy[0,0,0] + k1ao_xmy[0,1,0] + k1ao_xmy[1,0,0] + k1ao_xmy[1,1,0])
             veff0doo[1] += (k1ao_xpy[0,0,0] + k1ao_xpy[0,1,0] - k1ao_xpy[1,0,0] - k1ao_xpy[1,1,0]
@@ -161,55 +161,36 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
             wvoa = reduce(np.dot, (orbva.T, veff0doo[0], orboa)) *2
             wvob = reduce(np.dot, (orbvb.T, veff0doo[1], orbob)) *2
 
-            veff_I = - vk[:,1] + f1vo_I[0,:,0]
-            veff_J = - vk[:,2] + f1vo_J[0,:,0]
-            veff0mop_ba_I = reduce(np.dot, (mo_coeff[1].T, veff_I[0], mo_coeff[0]))
-            veff0mop_ab_I = reduce(np.dot, (mo_coeff[0].T, veff_I[1], mo_coeff[1]))
-            veff0mop_ba_J = reduce(np.dot, (mo_coeff[1].T, veff_J[0], mo_coeff[0]))
-            veff0mop_ab_J = reduce(np.dot, (mo_coeff[0].T, veff_J[1], mo_coeff[1]))
-            
+            veff = - vk[:,1] + f1vo_I[0,:,0]
+            veff0mop_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mop_ba_I = veff0mop_ba.copy()
+            veff0mop_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mop_ab_I = veff0mop_ab.copy()
 
-            wvoa += np.einsum('ca,ci->ai', veff0mop_ba_I[noccb:,nocca:], xpy_ba_J)
-            wvoa += np.einsum('ca,ci->ai', veff0mop_ba_J[noccb:,nocca:], xpy_ba_I)
-            wvob += np.einsum('ca,ci->ai', veff0mop_ab_I[nocca:,noccb:], xpy_ab_J)
-            wvob += np.einsum('ca,ci->ai', veff0mop_ab_J[nocca:,noccb:], xpy_ab_I)
-           
+            wvoa += np.einsum('ca,ci->ai', veff0mop_ba[noccb:,nocca:], xpy_ba_J) 
+            wvob += np.einsum('ca,ci->ai', veff0mop_ab[nocca:,noccb:], xpy_ab_J)
 
-            wvoa -= np.einsum('il,al->ai', veff0mop_ab_I[:nocca,:noccb], xpy_ab_J)
-            wvoa -= np.einsum('il,al->ai', veff0mop_ab_J[:nocca,:noccb], xpy_ab_I)
-            wvob -= np.einsum('il,al->ai', veff0mop_ba_I[:noccb,:nocca], xpy_ba_J)
-            wvob -= np.einsum('il,al->ai', veff0mop_ba_J[:noccb,:nocca], xpy_ba_I)
+            wvoa -= np.einsum('il,al->ai', veff0mop_ab[:nocca,:noccb], xpy_ab_J) 
+            wvob -= np.einsum('il,al->ai', veff0mop_ba[:noccb,:nocca], xpy_ba_J) 
 
-            
+            veff = -vk[:,2] + f1vo_I[1,:,0]
+            veff0mom_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mom_ba_I = veff0mom_ba.copy()
+            veff0mom_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mom_ab_I = veff0mom_ab.copy()
 
-            veff_I = -vk[:,3] + f1vo_I[1,:,0]
-            veff_J = -vk[:,4] + f1vo_J[1,:,0]
+            wvoa += np.einsum('ca,ci->ai', veff0mom_ba[noccb:,nocca:], xmy_ba_J)
+            wvob += np.einsum('ca,ci->ai', veff0mom_ab[nocca:,noccb:], xmy_ab_J) 
 
-            veff0mom_ba_I = reduce(np.dot, (mo_coeff[1].T, veff_I[0], mo_coeff[0]))
-            veff0mom_ab_I = reduce(np.dot, (mo_coeff[0].T, veff_I[1], mo_coeff[1]))
-            veff0mom_ba_J = reduce(np.dot, (mo_coeff[1].T, veff_J[0], mo_coeff[0]))
-            veff0mom_ab_J = reduce(np.dot, (mo_coeff[0].T, veff_J[1], mo_coeff[1]))
-
-            wvoa += np.einsum('ca,ci->ai', veff0mom_ba_I[noccb:,nocca:], xmy_ba_J)
-            wvoa += np.einsum('ca,ci->ai', veff0mom_ba_J[noccb:,nocca:], xmy_ba_I)
-            wvob += np.einsum('ca,ci->ai', veff0mom_ab_I[nocca:,noccb:], xmy_ab_J)
-            wvob += np.einsum('ca,ci->ai', veff0mom_ab_J[nocca:,noccb:], xmy_ab_I)
-
-            
-
-            wvoa -= np.einsum('il,al->ai', veff0mom_ab_I[:nocca,:noccb], xmy_ab_J)
-            wvoa -= np.einsum('il,al->ai', veff0mom_ab_J[:nocca,:noccb], xmy_ab_I)
-            wvob -= np.einsum('il,al->ai', veff0mom_ba_I[:noccb,:nocca], xmy_ba_J)
-            wvob -= np.einsum('il,al->ai', veff0mom_ba_J[:noccb,:nocca], xmy_ba_I)
-
-        
+            wvoa -= np.einsum('il,al->ai', veff0mom_ab[:nocca,:noccb], xmy_ab_J)
+            wvob -= np.einsum('il,al->ai', veff0mom_ba[:noccb,:nocca], xmy_ba_J)
 
         else:
-            dm = (dmzoo_a, dmxpy_ba_I+dmxpy_ab_I.T,dmxpy_ba_J+dmxpy_ab_J.T, dmxmy_ba_I-dmxmy_ab_I.T, dmxmy_ba_J-dmxmy_ab_J.T,    
-                  dmzoo_b, dmxpy_ab_I+dmxpy_ba_I.T,dmxpy_ab_J+dmxpy_ba_J.T, dmxmy_ab_I-dmxmy_ba_I.T, dmxmy_ab_J-dmxmy_ba_J.T)
-            vj = mf.get_j(mol, dm, hermi=0).reshape(2,5,nao,nao)
+            dm = (dmzoo_a, dmxpy_ba_I+dmxpy_ab_I.T, dmxmy_ba_I-dmxmy_ab_I.T,
+                  dmzoo_b, dmxpy_ab_I+dmxpy_ba_I.T, dmxmy_ab_I-dmxmy_ba_I.T)
+            vj = mf.get_j(mol, dm, hermi=0).reshape(2,3,nao,nao)
 
-            veff0doo = vj[0,0]+vj[1,0] + 0.5*(f1oo_IJ[:,0]+ f1oo_JI[:,0])
+            veff0doo = vj[0,0]+vj[1,0] + (f1oo_IJ[:,0]+f1oo_JI[:,0])*0.5
             veff0doo[0] += (k1ao_xpy[0,0,0] + k1ao_xpy[0,1,0] + k1ao_xpy[1,0,0] + k1ao_xpy[1,1,0]
                            +k1ao_xmy[0,0,0] + k1ao_xmy[0,1,0] + k1ao_xmy[1,0,0] + k1ao_xmy[1,1,0])
             veff0doo[1] += (k1ao_xpy[0,0,0] + k1ao_xpy[0,1,0] - k1ao_xpy[1,0,0] - k1ao_xpy[1,1,0]
@@ -218,47 +199,97 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
             wvoa = reduce(np.dot, (orbva.T, veff0doo[0], orboa)) *2
             wvob = reduce(np.dot, (orbvb.T, veff0doo[1], orbob)) *2
 
-            veff_I = f1vo_I[0,:,0]
-            veff_J = f1vo_J[0,:,0]
-            veff0mop_ba_I = reduce(np.dot, (mo_coeff[1].T, veff_I[0], mo_coeff[0]))
-            veff0mop_ab_I = reduce(np.dot, (mo_coeff[0].T, veff_I[1], mo_coeff[1]))
-            veff0mop_ba_J = reduce(np.dot, (mo_coeff[1].T, veff_J[0], mo_coeff[0]))
-            veff0mop_ab_J = reduce(np.dot, (mo_coeff[0].T, veff_J[1], mo_coeff[1]))
+            veff = f1vo_I[0,:,0]
+            veff0mop_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mop_ba_I = veff0mop_ba.copy()
+            veff0mop_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mop_ab_I = veff0mop_ab.copy()
 
-            
+            wvoa += np.einsum('ca,ci->ai', veff0mop_ba[noccb:,nocca:], xpy_ba_J) 
+            wvob += np.einsum('ca,ci->ai', veff0mop_ab[nocca:,noccb:], xpy_ab_J) 
 
-            wvoa += np.einsum('ca,ci->ai', veff0mop_ba_I[noccb:,nocca:], xpy_ba_J)
-            wvoa += np.einsum('ca,ci->ai', veff0mop_ba_J[noccb:,nocca:], xpy_ba_I)
-            wvob += np.einsum('ca,ci->ai', veff0mop_ab_I[nocca:,noccb:], xpy_ab_J)
-            wvob += np.einsum('ca,ci->ai', veff0mop_ab_J[nocca:,noccb:], xpy_ab_I)
+            wvoa -= np.einsum('il,al->ai', veff0mop_ab[:nocca,:noccb], xpy_ab_J) 
+            wvob -= np.einsum('il,al->ai', veff0mop_ba[:noccb,:nocca], xpy_ba_J)
 
+            veff = f1vo_I[1,:,0]
+            veff0mom_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mom_ba_I = veff0mom_ba.copy()
+            veff0mom_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mom_ab_I = veff0mom_ab.copy()
 
-            wvoa -= np.einsum('il,al->ai', veff0mop_ab_I[:nocca,:noccb], xpy_ab_J)
-            wvoa -= np.einsum('il,al->ai', veff0mop_ab_J[:nocca,:noccb], xpy_ab_I)
-            wvob -= np.einsum('il,al->ai', veff0mop_ba_I[:noccb,:nocca], xpy_ba_J)
-            wvob -= np.einsum('il,al->ai', veff0mop_ba_J[:noccb,:nocca], xpy_ba_I)
+            wvoa += np.einsum('ca,ci->ai', veff0mom_ba[noccb:,nocca:], xmy_ba_J) 
+            wvob += np.einsum('ca,ci->ai', veff0mom_ab[nocca:,noccb:], xmy_ab_J) 
 
-          
-
-            veff_I = f1vo_I[1,:,0]
-            veff_J = f1vo_J[1,:,0]
-            veff0mom_ba_I = reduce(np.dot, (mo_coeff[1].T, veff_I[0], mo_coeff[0]))
-            veff0mom_ab_I = reduce(np.dot, (mo_coeff[0].T, veff_I[1], mo_coeff[1]))
-            veff0mom_ba_J = reduce(np.dot, (mo_coeff[1].T, veff_J[0], mo_coeff[0]))
-            veff0mom_ab_J = reduce(np.dot, (mo_coeff[0].T, veff_J[1], mo_coeff[1]))
-      
-
-            wvoa += np.einsum('ca,ci->ai', veff0mom_ba_I[noccb:,nocca:], xmy_ba_J) 
-            wvoa += np.einsum('ca,ci->ai', veff0mom_ba_J[noccb:,nocca:], xmy_ba_I)
-            wvob += np.einsum('ca,ci->ai', veff0mom_ab_I[nocca:,noccb:], xmy_ab_J)
-            wvob += np.einsum('ca,ci->ai', veff0mom_ab_J[nocca:,noccb:], xmy_ab_I)
+            wvoa -= np.einsum('il,al->ai', veff0mom_ab[:nocca,:noccb], xmy_ab_J)
+            wvob -= np.einsum('il,al->ai', veff0mom_ba[:noccb,:nocca], xmy_ba_J) 
+        if abs(hyb) > 1e-10:
+            dm = (dmzoo_a, dmxpy_ba_J+dmxpy_ab_J.T, dmxmy_ba_J-dmxmy_ab_J.T,
+                  dmzoo_b, dmxpy_ab_J+dmxpy_ba_J.T, dmxmy_ab_J-dmxmy_ba_J.T)
+            vj, vk = mf.get_jk(mol, dm, hermi=0)
+            vk *= hyb
+            if abs(omega) > 1e-10:
+                vk += mf.get_k(mol, dm, hermi=0, omega=omega) * (alpha-hyb)
+            vj = vj.reshape(2,3,nao,nao)
+            vk = vk.reshape(2,3,nao,nao)
 
 
-            wvoa -= np.einsum('il,al->ai', veff0mom_ab_I[:nocca,:noccb], xmy_ab_J) 
-            wvoa -= np.einsum('il,al->ai', veff0mom_ab_J[:nocca,:noccb], xmy_ab_I)
-            wvob -= np.einsum('il,al->ai', veff0mom_ba_I[:noccb,:nocca], xmy_ba_J)
-            wvob -= np.einsum('il,al->ai', veff0mom_ba_J[:noccb,:nocca], xmy_ba_I)
+            veff = - vk[:,1] + f1vo_J[0,:,0]
+            veff0mop_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mop_ba_J = veff0mop_ba.copy()
+            veff0mop_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mop_ab_J = veff0mop_ab.copy()
 
+            wvoa += np.einsum('ca,ci->ai', veff0mop_ba[noccb:,nocca:], xpy_ba_I) 
+            wvob += np.einsum('ca,ci->ai', veff0mop_ab[nocca:,noccb:], xpy_ab_I) 
+
+            wvoa -= np.einsum('il,al->ai', veff0mop_ab[:nocca,:noccb], xpy_ab_I) 
+            wvob -= np.einsum('il,al->ai', veff0mop_ba[:noccb,:nocca], xpy_ba_I) 
+
+            veff = -vk[:,2] + f1vo_J[1,:,0]
+            veff0mom_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mom_ba_J = veff0mom_ba.copy()
+            veff0mom_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mom_ab_J = veff0mom_ab.copy()
+
+            wvoa += np.einsum('ca,ci->ai', veff0mom_ba[noccb:,nocca:], xmy_ba_I) 
+            wvob += np.einsum('ca,ci->ai', veff0mom_ab[nocca:,noccb:], xmy_ab_I) 
+
+            wvoa -= np.einsum('il,al->ai', veff0mom_ab[:nocca,:noccb], xmy_ab_I) 
+            wvob -= np.einsum('il,al->ai', veff0mom_ba[:noccb,:nocca], xmy_ba_I) 
+
+        else:
+            dm = (dmzoo_a, dmxpy_ba_J+dmxpy_ab_J.T, dmxmy_ba_J-dmxmy_ab_J.T,
+                  dmzoo_b, dmxpy_ab_J+dmxpy_ba_J.T, dmxmy_ab_J-dmxmy_ba_J.T)
+            vj = mf.get_j(mol, dm, hermi=0).reshape(2,3,nao,nao)
+
+           
+
+            veff = f1vo_J[0,:,0]
+            veff0mop_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mop_ba_J = veff0mop_ba.copy()
+            veff0mop_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mop_ab_J = veff0mop_ab.copy()
+
+            wvoa += np.einsum('ca,ci->ai', veff0mop_ba[noccb:,nocca:], xpy_ba_I)
+            wvob += np.einsum('ca,ci->ai', veff0mop_ab[nocca:,noccb:], xpy_ab_I) 
+
+            wvoa -= np.einsum('il,al->ai', veff0mop_ab[:nocca,:noccb], xpy_ab_I) 
+            wvob -= np.einsum('il,al->ai', veff0mop_ba[:noccb,:nocca], xpy_ba_I) 
+
+            veff = f1vo_J[1,:,0]
+            veff0mom_ba = reduce(np.dot, (mo_coeff[1].T, veff[0], mo_coeff[0]))
+            veff0mom_ba_J = veff0mom_ba.copy()
+            veff0mom_ab = reduce(np.dot, (mo_coeff[0].T, veff[1], mo_coeff[1]))
+            veff0mom_ab_J = veff0mom_ab.copy()
+
+            wvoa += np.einsum('ca,ci->ai', veff0mom_ba[noccb:,nocca:], xmy_ba_I) 
+            wvob += np.einsum('ca,ci->ai', veff0mom_ab[nocca:,noccb:], xmy_ab_I) 
+
+            wvoa -= np.einsum('il,al->ai', veff0mom_ab[:nocca,:noccb], xmy_ab_I) 
+            wvob -= np.einsum('il,al->ai', veff0mom_ba[:noccb,:nocca], xmy_ba_I)     
+
+
+    vresp = mf.gen_response(hermi=1)
 
     vresp = mf.gen_response(hermi=1)
 
@@ -276,7 +307,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
         v1b = reduce(np.dot, (orbvb.T, v1[1], orbob))
         return np.hstack((v1a.ravel(), v1b.ravel()))
 
-    z1a, z1b = ucphf.solve(fvind, mo_energy, mo_occ, (wvoa,wvob), #z-vector for UCPHF
+    z1a, z1b = ucphf.solve(fvind, mo_energy, mo_occ, (wvoa,wvob),
                            max_cycle=td_grad.cphf_max_cycle,
                            tol=td_grad.cphf_conv_tol)[0]
 
@@ -291,47 +322,35 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
     im0a = np.zeros((nmoa,nmoa))
     im0b = np.zeros((nmob,nmob))
 
+
     im0a[:nocca,:nocca] = reduce(np.dot, (orboa.T, veff0doo[0]+veff[0], orboa)) *.5
     im0b[:noccb,:noccb] = reduce(np.dot, (orbob.T, veff0doo[1]+veff[1], orbob)) *.5
-
     im0a[:nocca,:nocca] += np.einsum('aj,ai->ij', veff0mop_ba_I[noccb:,:nocca], xpy_ba_J) *0.25
     im0a[:nocca,:nocca] += np.einsum('aj,ai->ij', veff0mop_ba_J[noccb:,:nocca], xpy_ba_I) *0.25
-
     im0b[:noccb,:noccb] += np.einsum('aj,ai->ij', veff0mop_ab_I[nocca:,:noccb], xpy_ab_J) *0.25
     im0b[:noccb,:noccb] += np.einsum('aj,ai->ij', veff0mop_ab_J[nocca:,:noccb], xpy_ab_I) *0.25
-
     im0a[:nocca,:nocca] += np.einsum('aj,ai->ij', veff0mom_ba_I[noccb:,:nocca], xmy_ba_J) *0.25
     im0a[:nocca,:nocca] += np.einsum('aj,ai->ij', veff0mom_ba_J[noccb:,:nocca], xmy_ba_I) *0.25
-
     im0b[:noccb,:noccb] += np.einsum('aj,ai->ij', veff0mom_ab_I[nocca:,:noccb], xmy_ab_J) *0.25
     im0b[:noccb,:noccb] += np.einsum('aj,ai->ij', veff0mom_ab_J[nocca:,:noccb], xmy_ab_I) *0.25
 
-    im0a[nocca:,nocca:]  = np.einsum('bi,ai->ab', veff0mop_ab_I[nocca:,:noccb], xpy_ab_J) *0.25
+    im0a[nocca:,nocca:] += np.einsum('bi,ai->ab', veff0mop_ab_I[nocca:,:noccb], xpy_ab_J) *0.25
     im0a[nocca:,nocca:] += np.einsum('bi,ai->ab', veff0mop_ab_J[nocca:,:noccb], xpy_ab_I) *0.25
-
-    im0b[noccb:,noccb:]  = np.einsum('bi,ai->ab', veff0mop_ba_I[noccb:,:nocca], xpy_ba_J) *0.25
+    im0b[noccb:,noccb:] += np.einsum('bi,ai->ab', veff0mop_ba_I[noccb:,:nocca], xpy_ba_J) *0.25
     im0b[noccb:,noccb:] += np.einsum('bi,ai->ab', veff0mop_ba_J[noccb:,:nocca], xpy_ba_I) *0.25
-
     im0a[nocca:,nocca:] += np.einsum('bi,ai->ab', veff0mom_ab_I[nocca:,:noccb], xmy_ab_J) *0.25
     im0a[nocca:,nocca:] += np.einsum('bi,ai->ab', veff0mom_ab_J[nocca:,:noccb], xmy_ab_I) *0.25
-
     im0b[noccb:,noccb:] += np.einsum('bi,ai->ab', veff0mom_ba_I[noccb:,:nocca], xmy_ba_J) *0.25
     im0b[noccb:,noccb:] += np.einsum('bi,ai->ab', veff0mom_ba_J[noccb:,:nocca], xmy_ba_I) *0.25
 
-    im0a[nocca:,:nocca]  = np.einsum('il,al->ai', veff0mop_ab_I[:nocca,:noccb], xpy_ab_J)*0.5
+    im0a[nocca:,:nocca] += np.einsum('il,al->ai', veff0mop_ab_I[:nocca,:noccb], xpy_ab_J)*0.5
     im0a[nocca:,:nocca] += np.einsum('il,al->ai', veff0mop_ab_J[:nocca,:noccb], xpy_ab_I)*0.5
-
-    im0b[noccb:,:noccb]  = np.einsum('il,al->ai', veff0mop_ba_I[:noccb,:nocca], xpy_ba_J)*0.5
+    im0b[noccb:,:noccb] += np.einsum('il,al->ai', veff0mop_ba_I[:noccb,:nocca], xpy_ba_J)*0.5
     im0b[noccb:,:noccb] += np.einsum('il,al->ai', veff0mop_ba_J[:noccb,:nocca], xpy_ba_I)*0.5
-
     im0a[nocca:,:nocca] += np.einsum('il,al->ai', veff0mom_ab_I[:nocca,:noccb], xmy_ab_J)*0.5
     im0a[nocca:,:nocca] += np.einsum('il,al->ai', veff0mom_ab_J[:nocca,:noccb], xmy_ab_I)*0.5
-
     im0b[noccb:,:noccb] += np.einsum('il,al->ai', veff0mom_ba_I[:noccb,:nocca], xmy_ba_J)*0.5
     im0b[noccb:,:noccb] += np.einsum('il,al->ai', veff0mom_ba_J[:noccb,:nocca], xmy_ba_I)*0.5
-
-
-    
 
     zeta_a = (mo_energy[0][:,None] + mo_energy[0]) * .5
     zeta_b = (mo_energy[1][:,None] + mo_energy[1]) * .5
@@ -342,13 +361,14 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
 
     dm1a = np.zeros((nmoa,nmoa))
     dm1b = np.zeros((nmob,nmob))
-    dm1a[:nocca,:nocca] = (doo_a_IJ+doo_a_JI) * 0.25
-    dm1b[:noccb,:noccb] = (doo_b_IJ+doo_b_JI) * 0.25
-    dm1a[nocca:,nocca:] = (dvv_a_IJ+dvv_a_JI) * 0.25
-    dm1b[noccb:,noccb:] = (dvv_b_IJ+dvv_b_JI) * 0.25
+    dm1a[:nocca,:nocca] = (doo_a_JI+doo_a_IJ) * .25
+    dm1b[:noccb,:noccb] = (doo_b_JI+doo_b_IJ) * .25
+    dm1a[nocca:,nocca:] = (dvv_a_IJ+dvv_a_JI) * .25
+    dm1b[noccb:,noccb:] = (dvv_b_IJ+dvv_b_JI) * .25
 
     dm1a[nocca:,:nocca] = z1a *.5
     dm1b[noccb:,:noccb] = z1b *.5
+
 
 
     im0a = reduce(np.dot, (mo_coeff[0], im0a+zeta_a*dm1a, mo_coeff[0].T))
@@ -371,25 +391,25 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
     as_dm1 =  (dmz1doo_a + dmz1doo_b) * .5
 
     if abs(hyb) > 1e-10:
-        dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_I+dmxpy_ab_I.T, dmxpy_ba_J+dmxpy_ab_J.T , dmxmy_ba_I-dmxmy_ab_I.T, dmxmy_ba_J-dmxmy_ab_J.T,
-              oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_I+dmxpy_ba_I.T, dmxpy_ab_J+dmxpy_ba_J.T,  dmxmy_ab_I-dmxmy_ba_I.T, dmxmy_ab_J-dmxmy_ba_J.T)
+        dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_I+dmxpy_ab_I.T, dmxmy_ba_I-dmxmy_ab_I.T,
+              oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_I+dmxpy_ba_I.T, dmxmy_ab_I-dmxmy_ba_I.T)
         vj, vk = td_grad.get_jk(mol, dm)
-        vj = vj.reshape(2,6,3,nao,nao)
-        vk = vk.reshape(2,6,3,nao,nao) * hyb
-        vj[:,2:6] *= 0.0
+        vj = vj.reshape(2,4,3,nao,nao)
+        vk = vk.reshape(2,4,3,nao,nao) * hyb
+        vj[:,2:4] *= 0.0
         if abs(omega) > 1e-10:
             with mol.with_range_coulomb(omega):
-                vk += td_grad.get_k(mol, dm).reshape(2,6,3,nao,nao) * (alpha-hyb)
+                vk += td_grad.get_k(mol, dm).reshape(2,4,3,nao,nao) * (alpha-hyb)
 
-        veff1 = np.zeros((2,6,3,nao,nao))
+        veff1 = np.zeros((2,4,3,nao,nao))
         veff1[:,:2] = vj[0,:2] + vj[1,:2] - vk[:,:2]
     else:
-        dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_I+dmxpy_ab_I.T,dmxpy_ba_J+dmxpy_ab_J.T, 
-              oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_I+dmxpy_ba_I.T,dmxpy_ab_J+dmxpy_ba_J.T,)
-        vj = td_grad.get_j(mol, dm).reshape(2,4,3,nao,nao)
-        vj[:,2:4] *= 0.0
-        veff1 = np.zeros((2,6,3,nao,nao))
-        veff1[:,:4] = vj[0] + vj[1]
+        dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_I+dmxpy_ab_I.T,
+              oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_I+dmxpy_ba_I.T)
+        vj = td_grad.get_j(mol, dm).reshape(2,3,3,nao,nao)
+        vj[:,2] *= 0.0
+        veff1 = np.zeros((2,4,3,nao,nao))
+        veff1[:,:3] = vj[0] + vj[1]
 
     fxcz1 = _contract_xc_kernel_z(td_grad, mf.xc, z1ao, max_memory)
 
@@ -401,85 +421,134 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
                   +k1ao_xmy[0,0,1:] + k1ao_xmy[0,1,1:] - k1ao_xmy[1,0,1:] - k1ao_xmy[1,1,1:])*2
 
     veff1[:,2] += f1vo_I[0,:,1:]
-    veff1[:,3] += f1vo_J[0,:,1:]
-    veff1[:,4] += f1vo_I[1,:,1:]
-    veff1[:,5] += f1vo_J[1,:,1:]
+    veff1[:,3] += f1vo_I[1,:,1:]
     veff1a, veff1b = veff1
     time1 = log.timer('2e AO integral derivatives', *time1)
 
     if atmlst is None:
         atmlst = range(mol.natm)
     offsetdic = mol.offset_nr_by_atom()
-    nac = np.zeros((len(atmlst),3))
+    de = np.zeros((len(atmlst),3))
 
     for k, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = offsetdic[ia]
 
+        # Ground state gradients
         h1ao = hcore_deriv(ia)
-        nac[k] = np.einsum('xpq,pq->x', h1ao, as_dm1)
-        
+        de[k] = np.einsum('xpq,pq->x', h1ao, as_dm1)
+  
 
-        nac[k] += np.einsum('xpq,pq->x', veff1a[0,:,p0:p1], dmz1doo_a[p0:p1]) *.5
-        nac[k] += np.einsum('xpq,pq->x', veff1b[0,:,p0:p1], dmz1doo_b[p0:p1]) *.5
-        nac[k] += np.einsum('xpq,qp->x', veff1a[0,:,p0:p1], dmz1doo_a[:,p0:p1]) *.5
-        nac[k] += np.einsum('xpq,qp->x', veff1b[0,:,p0:p1], dmz1doo_b[:,p0:p1]) *.5
+        de[k] += np.einsum('xpq,pq->x', veff1a[0,:,p0:p1], dmz1doo_a[p0:p1]) *.5
+        de[k] += np.einsum('xpq,pq->x', veff1b[0,:,p0:p1], dmz1doo_b[p0:p1]) *.5
+        de[k] += np.einsum('xpq,qp->x', veff1a[0,:,p0:p1], dmz1doo_a[:,p0:p1]) *.5
+        de[k] += np.einsum('xpq,qp->x', veff1b[0,:,p0:p1], dmz1doo_b[:,p0:p1]) *.5
 
-        nac[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], im0[p0:p1])
-        nac[k] -= np.einsum('xqp,pq->x', s1[:,p0:p1], im0[:,p0:p1])
+        de[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], im0[p0:p1])
+        de[k] -= np.einsum('xqp,pq->x', s1[:,p0:p1], im0[:,p0:p1])
 
-        nac[k] += np.einsum('xij,ij->x', veff1a[1,:,p0:p1], oo0a[p0:p1])*0.5
-        nac[k] += np.einsum('xij,ij->x', veff1b[1,:,p0:p1], oo0b[p0:p1])*0.5
+        de[k] += np.einsum('xij,ij->x', veff1a[1,:,p0:p1], oo0a[p0:p1]) *0.5
+        de[k] += np.einsum('xij,ij->x', veff1b[1,:,p0:p1], oo0b[p0:p1]) *0.5
 
-        nac[k] += np.einsum('xij,ij->x', veff1b[2,:,p0:p1], dmxpy_ab_J[p0:p1,:])*0.5
-        nac[k] += np.einsum('xij,ij->x', veff1b[3,:,p0:p1], dmxpy_ab_I[p0:p1,:])*0.5
+        de[k] += np.einsum('xij,ij->x', veff1b[2,:,p0:p1], dmxpy_ab_J[p0:p1,:])*0.5
+        de[k] += np.einsum('xij,ij->x', veff1a[2,:,p0:p1], dmxpy_ba_J[p0:p1,:])*0.5
+        de[k] += np.einsum('xji,ij->x', veff1b[2,:,p0:p1], dmxpy_ab_J[:,p0:p1])*0.5
+        de[k] += np.einsum('xji,ij->x', veff1a[2,:,p0:p1], dmxpy_ba_J[:,p0:p1])*0.5
 
-        nac[k] += np.einsum('xij,ij->x', veff1a[2,:,p0:p1], dmxpy_ba_J[p0:p1,:])*0.5
-        nac[k] += np.einsum('xij,ij->x', veff1a[3,:,p0:p1], dmxpy_ba_I[p0:p1,:])*0.5
-
-        nac[k] += np.einsum('xji,ij->x', veff1b[2,:,p0:p1], dmxpy_ab_J[:,p0:p1])*0.5
-        nac[k] += np.einsum('xji,ij->x', veff1b[3,:,p0:p1], dmxpy_ab_I[:,p0:p1])*0.5
-
-        nac[k] += np.einsum('xji,ij->x', veff1a[2,:,p0:p1], dmxpy_ba_J[:,p0:p1])*0.5
-        nac[k] += np.einsum('xji,ij->x', veff1a[3,:,p0:p1], dmxpy_ba_I[:,p0:p1])*0.5
-
-        nac[k] += np.einsum('xij,ij->x', veff1b[4,:,p0:p1], dmxmy_ab_J[p0:p1,:])*0.5
-        nac[k] += np.einsum('xij,ij->x', veff1b[5,:,p0:p1], dmxmy_ab_I[p0:p1,:])*0.5
-
-        nac[k] += np.einsum('xij,ij->x', veff1a[4,:,p0:p1], dmxmy_ba_J[p0:p1,:])*0.5
-        nac[k] += np.einsum('xij,ij->x', veff1a[5,:,p0:p1], dmxmy_ba_I[p0:p1,:])*0.5
-
-        nac[k] += np.einsum('xji,ij->x', veff1b[4,:,p0:p1], dmxmy_ab_J[:,p0:p1])*0.5
-        nac[k] += np.einsum('xji,ij->x', veff1b[5,:,p0:p1], dmxmy_ab_I[:,p0:p1])*0.5
-
-        nac[k] += np.einsum('xji,ij->x', veff1a[4,:,p0:p1], dmxmy_ba_J[:,p0:p1])*0.5
-        nac[k] += np.einsum('xji,ij->x', veff1a[5,:,p0:p1], dmxmy_ba_I[:,p0:p1])*0.5
+        de[k] += np.einsum('xij,ij->x', veff1b[3,:,p0:p1], dmxmy_ab_J[p0:p1,:])*0.5
+        de[k] += np.einsum('xij,ij->x', veff1a[3,:,p0:p1], dmxmy_ba_J[p0:p1,:])*0.5
+        de[k] += np.einsum('xji,ij->x', veff1b[3,:,p0:p1], dmxmy_ab_J[:,p0:p1])*0.5
+        de[k] += np.einsum('xji,ij->x', veff1a[3,:,p0:p1], dmxmy_ba_J[:,p0:p1])*0.5
 
         if abs(hyb) > 1e-10:
-            nac[k] -= np.einsum('xij,ij->x', vk[1,2,:,p0:p1], dmxpy_ab_J[p0:p1,:])*0.5
-            nac[k] -= np.einsum('xij,ij->x', vk[1,3,:,p0:p1], dmxpy_ab_I[p0:p1,:])*0.5
+            de[k] -= np.einsum('xij,ij->x', vk[1,2,:,p0:p1], dmxpy_ab_J[p0:p1,:])*0.5
+         
+            de[k] -= np.einsum('xij,ij->x', vk[0,2,:,p0:p1], dmxpy_ba_J[p0:p1,:])/2
+           
+            de[k] -= np.einsum('xji,ij->x', vk[0,2,:,p0:p1], dmxpy_ab_J[:,p0:p1])/2
+       
+            de[k] -= np.einsum('xji,ij->x', vk[1,2,:,p0:p1], dmxpy_ba_J[:,p0:p1])/2
+          
 
-            nac[k] -= np.einsum('xij,ij->x', vk[0,2,:,p0:p1], dmxpy_ba_J[p0:p1,:])*0.5
-            nac[k] -= np.einsum('xij,ij->x', vk[0,3,:,p0:p1], dmxpy_ba_I[p0:p1,:])*0.5
+            de[k] -= np.einsum('xij,ij->x', vk[1,3,:,p0:p1], dmxmy_ab_J[p0:p1,:])/2
+           
+         
+            de[k] -= np.einsum('xij,ij->x', vk[0,3,:,p0:p1], dmxmy_ba_J[p0:p1,:])/2
+           
 
-            nac[k] -= np.einsum('xji,ij->x', vk[0,2,:,p0:p1], dmxpy_ab_J[:,p0:p1])*0.5
-            nac[k] -= np.einsum('xji,ij->x', vk[0,3,:,p0:p1], dmxpy_ab_I[:,p0:p1])*0.5
-            
-            nac[k] -= np.einsum('xji,ij->x', vk[1,2,:,p0:p1], dmxpy_ba_J[:,p0:p1])*0.5
-            nac[k] -= np.einsum('xji,ij->x', vk[1,3,:,p0:p1], dmxpy_ba_I[:,p0:p1])*0.5
+            de[k] += np.einsum('xji,ij->x', vk[0,3,:,p0:p1], dmxmy_ab_J[:,p0:p1])/2
+           
+            de[k] += np.einsum('xji,ij->x', vk[1,3,:,p0:p1], dmxmy_ba_J[:,p0:p1])/2
+    if abs(hyb) > 1e-10:
+        dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_J+dmxpy_ab_J.T, dmxmy_ba_J-dmxmy_ab_J.T,
+              oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_J+dmxpy_ba_J.T, dmxmy_ab_J-dmxmy_ba_J.T)
+        vj, vk = td_grad.get_jk(mol, dm)
+        vj = vj.reshape(2,4,3,nao,nao)
+        vk = vk.reshape(2,4,3,nao,nao) * hyb
+        vj[:,2:4] *= 0.0
+        if abs(omega) > 1e-10:
+            with mol.with_range_coulomb(omega):
+                vk += td_grad.get_k(mol, dm).reshape(2,4,3,nao,nao) * (alpha-hyb)
 
-            nac[k] -= np.einsum('xij,ij->x', vk[1,4,:,p0:p1], dmxmy_ab_J[p0:p1,:])*0.5
-            nac[k] -= np.einsum('xij,ij->x', vk[1,5,:,p0:p1], dmxmy_ab_I[p0:p1,:])*0.5
+        veff1 = np.zeros((2,4,3,nao,nao))
+        veff1[:,:2] = vj[0,:2] + vj[1,:2] - vk[:,:2]
+    else:
+        dm = (oo0a, dmz1doo_a+dmz1doo_a.T, dmxpy_ba_J+dmxpy_ab_J.T,
+              oo0b, dmz1doo_b+dmz1doo_b.T, dmxpy_ab_J+dmxpy_ba_J.T)
+        vj = td_grad.get_j(mol, dm).reshape(2,3,3,nao,nao)
+        vj[:,2] *= 0.0
+        veff1 = np.zeros((2,4,3,nao,nao))
+        veff1[:,:3] = vj[0] + vj[1]
 
-            nac[k] -= np.einsum('xij,ij->x', vk[0,4,:,p0:p1], dmxmy_ba_J[p0:p1,:])*0.5
-            nac[k] -= np.einsum('xij,ij->x', vk[0,5,:,p0:p1], dmxmy_ba_I[p0:p1,:])*0.5
-            nac[k] += np.einsum('xji,ij->x', vk[0,4,:,p0:p1], dmxmy_ab_J[:,p0:p1])*0.5
-            nac[k] += np.einsum('xji,ij->x', vk[0,5,:,p0:p1], dmxmy_ab_I[:,p0:p1])*0.5
-            nac[k] += np.einsum('xji,ij->x', vk[1,4,:,p0:p1], dmxmy_ba_J[:,p0:p1])*0.5
-            nac[k] += np.einsum('xji,ij->x', vk[1,5,:,p0:p1], dmxmy_ba_I[:,p0:p1])*0.5
+    fxcz1 = _contract_xc_kernel_z(td_grad, mf.xc, z1ao, max_memory)
 
-        
-    log.timer('TDUKS nuclear gradients', *time0)
-    return nac
+    veff1[:,0] += vxc1[:,1:]
+    veff1[:,1] += (f1oo_IJ[:,1:] + fxcz1[:,1:])*2
+    veff1[0,1] += (k1ao_xpy[0,0,1:] + k1ao_xpy[0,1,1:] + k1ao_xpy[1,0,1:] + k1ao_xpy[1,1,1:]
+                  +k1ao_xmy[0,0,1:] + k1ao_xmy[0,1,1:] + k1ao_xmy[1,0,1:] + k1ao_xmy[1,1,1:])*2
+    veff1[1,1] += (k1ao_xpy[0,0,1:] + k1ao_xpy[0,1,1:] - k1ao_xpy[1,0,1:] - k1ao_xpy[1,1,1:]
+                  +k1ao_xmy[0,0,1:] + k1ao_xmy[0,1,1:] - k1ao_xmy[1,0,1:] - k1ao_xmy[1,1,1:])*2
+
+    veff1[:,2] += f1vo_J[0,:,1:]
+    veff1[:,3] += f1vo_J[1,:,1:]
+    veff1a, veff1b = veff1
+    time1 = log.timer('2e AO integral derivatives', *time1)
+
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    offsetdic = mol.offset_nr_by_atom()
+
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+
+
+        de[k] += np.einsum('xij,ij->x', veff1b[2,:,p0:p1], dmxpy_ab_I[p0:p1,:])/2
+        de[k] += np.einsum('xij,ij->x', veff1a[2,:,p0:p1], dmxpy_ba_I[p0:p1,:])/2
+        de[k] += np.einsum('xji,ij->x', veff1b[2,:,p0:p1], dmxpy_ab_I[:,p0:p1])/2
+        de[k] += np.einsum('xji,ij->x', veff1a[2,:,p0:p1], dmxpy_ba_I[:,p0:p1])/2
+
+        de[k] += np.einsum('xij,ij->x', veff1b[3,:,p0:p1], dmxmy_ab_I[p0:p1,:])/2
+        de[k] += np.einsum('xij,ij->x', veff1a[3,:,p0:p1], dmxmy_ba_I[p0:p1,:])/2
+        de[k] += np.einsum('xji,ij->x', veff1b[3,:,p0:p1], dmxmy_ab_I[:,p0:p1])/2
+        de[k] += np.einsum('xji,ij->x', veff1a[3,:,p0:p1], dmxmy_ba_I[:,p0:p1])/2
+
+        if abs(hyb) > 1e-10:
+            de[k] -= np.einsum('xij,ij->x', vk[1,2,:,p0:p1], dmxpy_ab_I[p0:p1,:])/2
+            de[k] -= np.einsum('xij,ij->x', vk[0,2,:,p0:p1], dmxpy_ba_I[p0:p1,:])/2
+           
+            de[k] -= np.einsum('xji,ij->x', vk[0,2,:,p0:p1], dmxpy_ab_I[:,p0:p1])/2
+       
+            de[k] -= np.einsum('xji,ij->x', vk[1,2,:,p0:p1], dmxpy_ba_I[:,p0:p1])/2
+          
+            de[k] -= np.einsum('xij,ij->x', vk[1,3,:,p0:p1], dmxmy_ab_I[p0:p1,:])/2
+           
+         
+            de[k] -= np.einsum('xij,ij->x', vk[0,3,:,p0:p1], dmxmy_ba_I[p0:p1,:])/2
+           
+
+            de[k] += np.einsum('xji,ij->x', vk[0,3,:,p0:p1], dmxmy_ab_I[:,p0:p1])/2
+           
+            de[k] += np.einsum('xji,ij->x', vk[1,3,:,p0:p1], dmxmy_ba_I[:,p0:p1])/2
+    return de
 
 
 def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=True,
@@ -1007,64 +1076,54 @@ def nac_csf(td_grad, x_y_I,x_y_J, atmlst=None):
 
     nmoa = nocca + nvira
     nmob = noccb + nvirb
-    (x_ab_I, x_ba_I), (y_ab_I, y_ba_I) = x_y_I
-    (x_ab_J, x_ba_J), (y_ab_J, y_ba_J) = x_y_J
-    if td_grad.base.extype==0:
-        
-        
-        x_ab_I = (x_ab_I).T
-        x_ab_J = (x_ab_J).T
-        #判断y_I是否是int类型
-        if not isinstance(y_ba_I, int):
-            y_ba_I = (y_ba_I).T
-            y_ba_J = (y_ba_J).T
-        else:
-            y_ba_I = np.zeros((orbvb,orboa))
-            y_ba_J = np.zeros((orbvb,orboa))
 
-        dvvx_a_IJ = np.einsum('ai,bi->ab', x_ab_I, x_ab_J) + np.einsum('ai,bi->ab', x_ab_I, x_ab_J) # T^{ab \alpha \beta}*2
-        doox_b_IJ = np.einsum('ai,aj->ij', x_ab_I, x_ab_J) + np.einsum('ai,aj->ij', x_ab_I, x_ab_J) # T^{ij \alpha \beta}*2
-        dvvy_b_IJ =-np.einsum('ai,bi->ab',y_ba_I, y_ba_J) - np.einsum('ai,bi->ab', y_ba_I, y_ba_J)
-        dooy_a_IJ =-np.einsum('ai,aj->ij',y_ba_I, y_ba_J) - np.einsum('ai,aj->ij', y_ba_I, y_ba_J) 
-        dmzoo_a_IJ = reduce(np.dot, (orboa, dooy_a_IJ, orboa.T))
-        dmzoo_a_IJ+= reduce(np.dot, (orbva, dvvx_a_IJ, orbva.T))
-        dmzoo_b_IJ = reduce(np.dot, (orbob, doox_b_IJ, orbob.T))
-        dmzoo_b_IJ+= reduce(np.dot, (orbvb, dvvy_b_IJ, orbvb.T))
-    if td_grad.base.extype==1:
+    if td_grad.base.extype==0 or 1:
         
-        
-        x_ba_I = (x_ba_I).T
-        x_ba_J = (x_ba_J).T
-        #判断y_I是否是int类型
-        if not isinstance(y_ab_I, int):
-            y_ab_I = (y_ab_I).T
-            y_ab_J = (y_ab_J).T
-        else:
-            y_ab_I = np.zeros((orbva,orbob))
-            y_ab_J = np.zeros((orbva,orbob))
+        (x_ab_I, x_ba_I), (y_ab_I, y_ba_I) = x_y_I
+        (x_ab_J, x_ba_J), (y_ab_J, y_ba_J) = x_y_J
+        print(y_ab_I)
+        print(y_ba_I)
+        print(x_ab_I)
+        print(x_ba_I)
 
-        dvvx_b_IJ = np.einsum('ai,bi->ab', x_ba_I, x_ba_J) + np.einsum('ai,bi->ab', x_ba_I, x_ba_J) # T^{ab \alpha \beta}*2
-        doox_a_IJ = np.einsum('ai,aj->ij', x_ba_I, x_ba_J) + np.einsum('ai,aj->ij', x_ba_I, x_ba_J) # T^{ij \alpha \beta}*2
-        dvvy_a_IJ =-np.einsum('ai,bi->ab', y_ab_I, y_ab_J) - np.einsum('ai,bi->ab', y_ab_I, y_ab_J)
-        dooy_b_IJ =-np.einsum('ai,aj->ij', y_ab_I, y_ab_J) - np.einsum('ai,aj->ij', y_ab_I, y_ab_J) 
-        dmzoo_a_IJ = reduce(np.dot, (orboa, doox_a_IJ, orboa.T))
-        dmzoo_a_IJ+= reduce(np.dot, (orbva, dvvy_a_IJ, orbva.T))
-        dmzoo_b_IJ = reduce(np.dot, (orbob, dooy_b_IJ, orbob.T))
-        dmzoo_b_IJ+= reduce(np.dot, (orbvb, dvvx_b_IJ, orbvb.T))
+        x_ab_I = (x_ab_I-y_ab_I).T
+        print(x_ab_I)
+        x_ba_I = (x_ba_I-y_ba_I).T
+        print(x_ba_I)
+        x_ab_J = (x_ab_J+y_ab_J).T
+        x_ba_J = (x_ba_J+y_ba_J).T
 
+        dvv_a_IJ = np.einsum('ai,bi->ab', x_ab_I, x_ab_J) + np.einsum('ai,bi->ab', x_ab_I, x_ab_J) # T^{ab \alpha \beta}*2
         
-    mf_grad = td_grad.base._scf.nuc_grad_method()    
-    s1 = mf_grad.get_ovlp(mol)
-    if atmlst is None:
-        atmlst = range(mol.natm)
-    offsetdic = mol.offset_nr_by_atom()
-    nac_csf = np.zeros((len(atmlst),3))
-    for k, ia in enumerate(atmlst):
-        shl0, shl1, p0, p1 = offsetdic[ia]
-        nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_a_IJ[p0:p1])*0.25
-        nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_b_IJ[p0:p1])*0.25
-        nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_a_IJ[:,p0:p1])*0.25
-        nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_b_IJ[:,p0:p1])*0.25
+        
+        dvv_b_IJ = np.einsum('ai,bi->ab', x_ba_I, x_ba_J) + np.einsum('ai,bi->ab', x_ba_I, x_ba_J) # T^{ab \beta \alpha}*2
+        
+
+        doo_b_IJ = np.einsum('ai,aj->ij', x_ab_I, x_ab_J) + np.einsum('ai,aj->ij', x_ab_I, x_ab_J) # T^{ij \alpha \beta}*2
+        
+
+        doo_a_IJ = np.einsum('ai,aj->ij', x_ba_I, x_ba_J) + np.einsum('ai,aj->ij', x_ba_I, x_ba_J) # T^{ij \beta \alpha}*2
+
+        dmzoo_a_IJ = reduce(np.dot, (orboa, doo_a_IJ, orboa.T))*0.5 # \sum_{\sigma ab} 2*Tab \sigma C_{au} C_{bu}
+         
+        dmzoo_b_IJ = reduce(np.dot, (orbob, doo_b_IJ, orbob.T))*0.5 # \sum_{\sigma ab} 2*Tij \sigma C_{iu} C_{iu}
+        
+        dmzoo_a_IJ+= reduce(np.dot, (orbva, dvv_a_IJ, orbva.T))*0.5
+        
+        dmzoo_b_IJ+= reduce(np.dot, (orbvb, dvv_b_IJ, orbvb.T))*0.5
+        
+        mf_grad = td_grad.base._scf.nuc_grad_method()    
+        s1 = mf_grad.get_ovlp(mol)
+        if atmlst is None:
+            atmlst = range(mol.natm)
+        offsetdic = mol.offset_nr_by_atom()
+        nac_csf = np.zeros((len(atmlst),3))
+        for k, ia in enumerate(atmlst):
+            shl0, shl1, p0, p1 = offsetdic[ia]
+            nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_a_IJ[p0:p1])*0.5
+            nac_csf[k] -= np.einsum('xpq,pq->x', s1[:,p0:p1], dmzoo_b_IJ[p0:p1])*0.5
+            nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_a_IJ[:,p0:p1])*0.5
+            nac_csf[k] += np.einsum('xqp,pq->x', s1[:,p0:p1], dmzoo_b_IJ[:,p0:p1])*0.5
     return nac_csf
 
 def as_scanner(GradientsClass):
@@ -1333,10 +1392,11 @@ if __name__ == '__main__':
     except ImportError:
         mcfun = None
     from pyscf.sftda.tools_td import transition_analyze 
+    from pyscf.sftda.uhf_sf import get_ab_sf
 
     mol = gto.Mole()
     mol.atom = '''
-       C      -0.6802366140     0.0004402665    -0.0075551364
+        C      -0.6802366140     0.0004402665    -0.0075551364
           O       0.5347611040     0.0002483041    -0.0052081646
           H      -0.0981860873     0.9390148122     0.0436210927
           H      -0.0984830606    -0.9436428442     0.0433750429
@@ -1348,20 +1408,69 @@ if __name__ == '__main__':
     mf = dft.UKS(mol)
     mf.xc = 'b3lyp' 
     mf.kernel()
+    a, b = get_ab_sf(mf, collinear_samples=100)
+    A_baba, A_abab = a
+    B_baab, B_abba = b
 
+    mo_occ = mf.mo_occ
+    n_occ_a = (mo_occ[0] > 0).sum()
+    n_virt_a = (mo_occ[0] == 0).sum()
+    n_occ_b = (mo_occ[1] > 0).sum()
+    n_virt_b = (mo_occ[1] == 0).sum()
+
+    A_abab_2d = A_abab.reshape((n_occ_a*n_virt_b, n_occ_a*n_virt_b))
+    B_abba_2d = B_abba.reshape((n_occ_a*n_virt_b, n_occ_b*n_virt_a))
+    B_baab_2d = B_baab.reshape((n_occ_b*n_virt_a, n_occ_a*n_virt_b))
+    A_baba_2d = A_baba.reshape((n_occ_b*n_virt_a, n_occ_b*n_virt_a))
+    
+    Casida_matrix = np.block([
+        [ A_abab_2d, B_abba_2d],
+        [-B_baab_2d,-A_baba_2d]
+    ])
+
+    eigenvals, eigenvecs = np.linalg.eig(Casida_matrix)
+    
+    idxt = eigenvals.real.argsort()
+    eigenvals = eigenvals[idxt].real
+    eigenvecs = eigenvecs[:, idxt]
+
+    # c. 筛选并归一化物理上有意义的解
+    norms = np.linalg.norm(eigenvecs[:n_occ_a * n_virt_b], axis=0)**2 - \
+            np.linalg.norm(eigenvecs[n_occ_a * n_virt_b:], axis=0)**2
+
+    sfd_eigenvals = eigenvals[norms > 0]
+    sfd_eigenvecs = eigenvecs[:, norms > 0].T
+
+    def norm_xy(z):
+        x_flat = z[:n_occ_a*n_virt_b]
+        y_flat = z[n_occ_a*n_virt_b:]
+        norm_val = np.linalg.norm(x_flat)**2 - np.linalg.norm(y_flat)**2
+        norm_val = np.sqrt(1./norm_val)
+        
+        x = x_flat.reshape(n_occ_a, n_virt_b) * norm_val
+        y = y_flat.reshape(n_occ_b, n_virt_a) * norm_val
+        return ((0, x), (y, 0))
+
+    # d. 创建TDDFT_SF对象并手动填充结果
+    mftd1 = sftda.uks_sf.TDDFT_SF(mf)
+    mftd1.e = sfd_eigenvals
+    mftd1.collinear_samples = 100
+    mftd1.xy = [norm_xy(z) for z in sfd_eigenvecs]
+    mftd1.nstates = len(mftd1.e)
+    mftd1.extype = 1
     # TDA_SF object
-    mftd1 = sftda.uks_sf.TDA_SF(mf)
+    #mftd1 = sftda.uks_sf.TDDFT_SF(mf)
 
-    mftd1.max_space = 4000 #necessary
-    mftd1.nstates = 4  # the number of excited states
-    mftd1.extype = 1  
-    mftd1.collinear_samples = 50
+    #mftd1.max_space = 4000 #necessary
+    #mftd1.nstates = 4  # the number of excited states
+    #mftd1.extype = 1  
+    #mftd1.collinear_samples = 50
     
-    mftd1.kernel()
+    #mftd1.kernel()
     
 
-    print(transition_analyze(mf, mftd1, mftd1.e[0], mftd1.xy[2], tdtype='TDA'))  #spin analysis
-    print(transition_analyze(mf, mftd1, mftd1.e[2], mftd1.xy[2], tdtype='TDA'))
+    print(transition_analyze(mf, mftd1, mftd1.e[0], mftd1.xy[0], tdtype='TDDFT'))  #spin analysis
+    print(transition_analyze(mf, mftd1, mftd1.e[2], mftd1.xy[2], tdtype='TDDFT'))
 
     # nac object
     nac_grad = NAC(mftd1)
@@ -1385,5 +1494,6 @@ if __name__ == '__main__':
     print("\nNon-Adiabatic Coupling (NAC)without ETF between S0 and S1:")
     for i, atom in enumerate(mol._atom):
         print(f"Atom {i + 1} ({atom[0]}): {nac[i]}")
+
     
     
