@@ -1451,7 +1451,7 @@ if __name__ == '__main__':
     mol.build()
 
     mf = dft.UKS(mol)
-    mf.xc = 'b3lyp' 
+    mf.xc = 'pbe' 
     mf.kernel()
     a, b = get_ab_sf(mf, collinear_samples=100)
     A_baba, A_abab = a
