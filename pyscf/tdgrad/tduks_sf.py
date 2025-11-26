@@ -23,8 +23,9 @@ from pyscf.dft import numint2c
 from pyscf.grad import rks as rks_grad
 from pyscf.grad import tdrhf as tdrhf_grad
 from pyscf.sftda.numint2c_sftd import cache_xc_kernel_sf
-
-def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO):
+from .gradient_nac_cache import get_cache_manager
+def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO,
+              state_id=None, use_cache=True):
     ''' Spin flip TDDFT gradient in UKS framework. Note: This function supports
     both TDA or TDDFT results.
 
@@ -95,8 +96,23 @@ def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO):
 
         f1vo, f1oo, vxc1, k1ao = \
                 _contract_xc_kernel(td_grad, mf.xc, ((dmxpy_ab,dmxpy_ba),(dmxmy_ab,dmxmy_ba)),
-                                    (dmzoo_a,dmzoo_b), True, True, max_memory)
+                                    (dmzoo_a,dmzoo_b), True, True, max_memory, use_cache=use_cache)
         k1ao_xpy, k1ao_xmy = k1ao
+        
+        # 存储梯度数据供NAC使用
+        # 注意: k1ao不被缓存,因为NAC中k1ao的定义不同(涉及两态交叉项)
+        if use_cache and state_id is not None:
+            cache_mgr = get_cache_manager()
+            cache_mgr.store_gradient_data(
+                mf, mol, state_id,
+                dmvo=((dmxpy_ab, dmxpy_ba), (dmxmy_ab, dmxmy_ba)),
+                dmoo=(dmzoo_a, dmzoo_b),
+                f1vo=f1vo,
+                f1oo=f1oo,
+                vxc1=vxc1
+                # k1ao故意不缓存 - NAC中定义不同
+            )
+            log.debug(f'Stored gradient intermediate data for state {state_id} (excluding k1ao)')
 
         # f1vo, (2,2,4,nao,nao), (X+Y) and (X-Y) with fxc_sf
         # f1oo, (2,4,nao,nao), 2T with fxc_sc
@@ -195,6 +211,7 @@ def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO):
     z1a, z1b = ucphf.solve(fvind, mo_energy, mo_occ, (wvoa,wvob),
                            max_cycle=td_grad.cphf_max_cycle,
                            tol=td_grad.cphf_conv_tol)[0]
+
 
     time1 = log.timer('Z-vector using UCPHF solver', *time0)
 
@@ -351,7 +368,8 @@ def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO):
     return de
 
 def _contract_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True,
-                        with_kxc=True, max_memory=2000):
+                        with_kxc=True, max_memory=2000, use_cache=True):
+
     mol = td_grad.mol
     mf = td_grad.base._scf
     grids = mf.grids
@@ -389,8 +407,23 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True,
     nimc.collinear = 'mcol'
     nimc.collinear_samples=td_grad.base.collinear_samples
 
-    # calculate the derivatives.
-    fxc_sf,kxc_sf = cache_xc_kernel_sf(nimc,mol,mf.grids,mf.xc,mo_coeff,mo_occ,deriv=3,spin=1)[2:]
+    # 尝试从缓存获取XC核,如果缓存未命中则计算
+    cache_mgr = get_cache_manager() if use_cache else None
+    
+    if use_cache:
+        cached_xc_kernel = cache_mgr.get_xc_kernel(mf, mol)
+        if cached_xc_kernel is not None:
+            fxc_sf, kxc_sf = cached_xc_kernel
+        else:
+            # 缓存未命中,需要计算
+            fxc_sf, kxc_sf = cache_xc_kernel_sf(nimc,mol,mf.grids,mf.xc,mo_coeff,mo_occ,deriv=3,spin=1)[2:]
+            cache_mgr.store_xc_kernel(mf, mol, fxc_sf, kxc_sf)
+    else:
+        # 不使用缓存,直接计算
+        fxc_sf, kxc_sf = cache_xc_kernel_sf(nimc,mol,mf.grids,mf.xc,mo_coeff,mo_occ,deriv=3,spin=1)[2:]
+    
+    # === 插入测试代码 ===
+
     p0,p1=0,0 # the two parameters are used for counts the batch of grids.
 
     if xctype == 'LDA':
@@ -598,6 +631,8 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True,
 
                 mgga_sum_(v1ao[0], ao, wv[0], mask)
                 mgga_sum_(v1ao[1], ao, wv[1], mask)
+    elif xctype == 'HF':
+        pass
 
     else:
         raise NotImplementedError(f'td-uks for functional {xc_code}')
@@ -608,6 +643,8 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True,
     if with_kxc:
         k1ao_xpy[:,:,1:] *= -1
         k1ao_xmy[:,:,1:] *= -1
+
+
     return f1vo, f1oo, v1ao, (k1ao_xpy,k1ao_xmy)
 
 def uks_sf_gga_wv1(rho1, fxc_sf,weight):
@@ -806,12 +843,36 @@ def _contract_xc_kernel_z(td_grad, xc_code, dmvo, max_memory=2000):
         raise NotImplementedError(f'td-uks for functional {xc_code}')
 
     f1vo[:,1:] *= -1
+    
     return f1vo
 
 class Gradients(tdrhf_grad.Gradients):
+    cphf_max_cycle = tdrhf_grad.Gradients.cphf_max_cycle + 20
+
     @lib.with_doc(grad_elec.__doc__)
-    def grad_elec(self, xy, singlet=None, atmlst=None):
-        return grad_elec(self, xy, atmlst, self.max_memory, self.verbose)
+    def grad_elec(self, xy, singlet=None, atmlst=None, state_id=None, use_cache=True):
+        return grad_elec(self, xy, atmlst, self.max_memory, self.verbose,
+                        state_id=state_id, use_cache=use_cache)
+    
+    def kernel(self, state=None, atmlst=None, use_cache=True):
+        """
+        计算指定激发态的梯度 (修复版)
+        """
+        if state is None:
+            state = 1
+        
+        # 1. 获取激发态系数
+        xy = self.base.xy[state - 1]
+        
+        # 2. 计算电子部分梯度 (传递 cache 参数)
+        de = self.grad_elec(xy, atmlst=atmlst, state_id=state, use_cache=use_cache)
+        
+        # 3. 【关键修复】计算核排斥梯度
+        # 这一步绝对不能少！
+        dnuc = self.grad_nuc(atmlst=atmlst)
+        
+        # 4. 返回总梯度
+        return de + dnuc
 
 Grad = Gradients
 

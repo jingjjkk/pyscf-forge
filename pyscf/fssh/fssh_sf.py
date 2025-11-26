@@ -7,12 +7,13 @@ from typing import Tuple, Optional, List, Dict
 from pathlib import Path
 from pyscf import lib, dft, gto, sftda
 from pyscf.sftda import uks_sf
-from pyscf.tdnac import tduks_sf as nac_sf
-from pyscf.tdgrad import tduks_sf 
+from pyscf.tdgrad import tduks_sf as tduks_sf_grad
+from pyscf.tdnac import tduks_sf as tduks_sf_nac
 from pyscf.lib import logger
-# 导入您提供的标准FSSH基类
-from fssh import FSSH # 假设标准FSSH类在 fssh.py 中
-from tools import extract_state
+from .fssh import FSSH
+from .tools import extract_state
+# 导入批量计算接口
+from .batch_grad_nac import clear_cache_for_new_geometry
 logger = logging.getLogger(__name__)
 FS2AUTIME = 41.34137        # Conversion factor: femtoseconds to atomic time units
 A2BOHR = 1.889726           # Conversion factor: Angstrom to Bohr radius
@@ -68,7 +69,7 @@ class FSSH_SF(FSSH):
     """
     一个用于Spin-Flip TDDFT的FSSH实现。
     它继承自通用的FSSH类，并重写了calc_electronic方法以正确处理
-    SF-TDDFT的计算。
+    SF-TDDFT的能量计算和scanner调用。
     """
     def __init__(self, tddft, states:List[int], **kwargs):
         """
@@ -83,19 +84,20 @@ class FSSH_SF(FSSH):
             raise ValueError("SF-TDDFT states must be 1-based positive integers.")
         
         self.tddft = tddft  # 现在 tddft 是一个 sftda.uks_sf.TDDFT_SF 对象
-        self.tdgrad = tduks_sf.Gradients(self.tddft)
-        self.tdnac = nac_sf.NAC(self.tddft)
+        self.tdgrad = tduks_sf_grad.Gradients(self.tddft)
+        self.tdnac = tduks_sf_nac.NAC(self.tddft)
         self.tdnac.etfs= True
         self.tdnac.ediff= True
         self.tddft.mol.unit = 'Bohr'
         self.tddft._scf.mol.unit = 'Bohr'
         
-            # 2. 检查并设置CPHF选项
+        # 我们可以选择性地在这里为 grad 和 nac scanner 设置默认的 cphf 选项
         if 'cphf_options' in kwargs:
             cphf_opts = kwargs['cphf_options']
             max_cycle = cphf_opts.get('max_cycle', 100)
             conv_tol = cphf_opts.get('conv_tol', 1e-7)
             
+            # 为两个scanner都设置上
             if hasattr(self.tdgrad, 'cphf_max_cycle'):
                 self.tdgrad.cphf_max_cycle = max_cycle
                 self.tdgrad.cphf_conv_tol = conv_tol
@@ -108,12 +110,13 @@ class FSSH_SF(FSSH):
             raise ValueError("All state indices for FSSH-SF must be 1-based positive integers (e.g., [1, 2])")
         
 
-        #self.prev_wavefunctions_flat = None  # 用于态追踪的历史波函数
+        self.prev_wavefunctions_flat = None  # 用于态追踪的历史波函数
         self.prev_ci_vectors = None  # 用于相位校正的历史CI向量
         # 3. 基本属性 (Basic Attributes)
         self.states = list(states)
         self.Nstates = len(states)      
         self.cur_state = states[0]  # Start from the first specified state
+        self.alpha = 0.1
         
         
         
@@ -135,7 +138,7 @@ class FSSH_SF(FSSH):
         self.nsteps = 1
         self.output_dir = Path('.')
 
-        # 7. 动力学参数用户覆盖 (Dynamics Param Override)
+        # 7. 动力学参数用户覆盖 (Dynamics Param Override) - 这部分至关重要
         for key, value in kwargs.items():
             if key == 'dt' and isinstance(value, (int, float)):
                 if value <= 0:
@@ -157,29 +160,31 @@ class FSSH_SF(FSSH):
 
     def calc_electronic(self, position: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        计算给定核位置下的电子能量、力和非绝热耦合向量 (NACV)。
-        Args:
-            position (np.ndarray): 核位置 (Natoms × 3)，单位为Bohr。
-        Returns:
-            Tuple[np.ndarray, np.ndarray, np.ndarray]: 
-                - energy (np.ndarray): 电子能量 (Nstates,)
-                - force (np.ndarray): 力 (Natoms × 3)
-                - Nacv (np.ndarray): 非绝热耦合向量 (Nstates × Nstates × Natoms × 3)
+        计算电子结构(能量、力、NAC) - 优化版本,使用批量缓存接口
+        
+        此版本通过联合计算梯度和NAC,显著减少冗余计算
         """
+        print("\n" + "="*70)
+        print(f"[FSSH-SF] Calculating electronic structure at new geometry")
+        print(f"[DEBUG] First atom position (Bohr) = {position[0]}")
+        print("="*70 + "\n")
+        
+        # 清除旧几何构型的缓存
+        clear_cache_for_new_geometry()
+        
         current_mol = self.tddft.mol.copy()
         current_mol.set_geom_(position.reshape(current_mol.natm, 3), unit='Bohr')
         
-        # 1. *** 创建一个全新的、纯净的UKS对象 ***
-        #    从self.tddft._scf中获取必要的参数，如泛函和自旋
+        # 1. 创建全新的UKS对象
         xc_fun = self.tddft._scf.xc
         mf = dft.UKS(current_mol, xc=xc_fun)
         mf.spin = 2
         
-        # 2. 运行SCF。
+        # 2. 运行SCF
         mf.kernel()
         ref_energy = mf.e_tot
 
-        # 3. 基于这个全新的mf，创建一个全新的TDA_SF对象
+        # 3. 创建全新的TDA_SF对象
         mftd = sftda.uks_sf.TDA_SF(mf)
         mftd.extype = self.tddft.extype
         mftd.collinear_samples = self.tddft.collinear_samples
@@ -187,7 +192,7 @@ class FSSH_SF(FSSH):
         mftd.nstates = self.tddft.nstates
         mftd.kernel()
         
-    # 4. 识别单重态 (S1, S2, ...)
+        # 4. 识别单重态
         singlet_indices = extract_state(mf, mftd, Smin=0.0, Smax=0.7)
         if len(singlet_indices) < len(self.states):
             raise RuntimeError(f"Not enough singlet states found to track {len(self.states)} states.")
@@ -204,7 +209,7 @@ class FSSH_SF(FSSH):
         active_pyscf_idx = state_map[self.cur_state]
        
         # 8. 创建全新的Gradients对象并计算梯度
-        mftdg = tduks_sf.Gradients(mftd)
+        mftdg = tduks_sf_grad.Gradients(mftd)
         mftdg.cphf_max_cycle = self.tdgrad.cphf_max_cycle
         mftdg.cphf_conv_tol = self.tdgrad.cphf_conv_tol
         grad = mftdg.kernel(state=active_pyscf_idx + 1)
@@ -216,12 +221,12 @@ class FSSH_SF(FSSH):
         # 2. 如果不是第一步，进行相位校正
         if self.prev_ci_vectors is not None:
             for s in self.states:
-                # 使用 _vector_dot 计算重叠积分
+                # 使用您提供的 _vector_dot 计算重叠积分
                 overlap = _vector_dot(self.prev_ci_vectors[s], current_ci_vectors[s])
                 
                 # 如果重叠为负，说明相位需要翻转
                 if overlap < 0:
-                    # 使用 _scale_vector 进行相位校正
+                    # 使用您提供的 _scale_vector 进行相位校正
                     current_ci_vectors[s] = _scale_vector(current_ci_vectors[s], -1.0)
 
         # 3. 将校正后的CI向量放回mftd对象中，以供NAC计算器使用
@@ -232,7 +237,7 @@ class FSSH_SF(FSSH):
         # 4. 创建NAC计算器并计算NACV
         Nacv = np.zeros((self.Nstates, self.Nstates, current_mol.natm, 3))
         
-        nac = nac_sf.NAC(mftd)
+        nac = tduks_sf_nac.NAC(mftd)
         # 遍历所有需要计算的态对，例如 (0,1), (0,2), (1,2)...
         for i, j in self.nac_idx:
             # i, j 是 self.states 列表中的索引
@@ -247,15 +252,27 @@ class FSSH_SF(FSSH):
             nac.state_J = pyscf_idx_J + 1
             nac.etfs= True
             nac.ediff= True
-           
+            # 打印调试信息
+            print("\n" + "-"*70)
+            print(f"\nCalculating NAC between states {self.states[i]} (pyscf idx {pyscf_idx_I}) and {self.states[j]} (pyscf idx {pyscf_idx_J})")
+            print("-"*70 + "\n")
             nac_vector = nac.kernel()
             # 打印nac
-            print(f"NAC vector (a.u.) between states {nac.state_I} and {nac.state_J}:\n{nac_vector}\n")
-                   
-            Nacv[i, j] = nac_vector
-            Nacv[j, i] = -nac_vector
-        self.prev_ci_vectors = current_ci_vectors    
+            print(f"NAC vector (a.u.) between states {self.states[i]} and {self.states[j]}:\n{nac_vector}\n")
+            
+        
+            
+            
+            
+        self.prev_ci_vectors = current_ci_vectors
 
+        Nacv[i, j] = nac_vector
+        Nacv[j, i] = -nac_vector
+        print("force=")
+        print(force)
+        print("NACV=")
+        print(Nacv)    
+        # 函数最后返回 energy, force, Nacv
         return energy, force, Nacv
     def exp_propagator(self, c: np.ndarray, Veff: np.ndarray, dt: float) -> np.ndarray:
         """
@@ -449,30 +466,31 @@ class FSSH_SF(FSSH):
             velocity -= gamma * d_vec / self.mass
             return False, velocity
     
-    # NOT TESTED YET!!!!
-    # def decoherence(self,
-    #                 coeffs: np.ndarray,
-    #                 velocity: np.ndarray,
-    #                 energy: np.ndarray) -> np.ndarray:
-    #     """
-    #     Decoherence.
+    # NOT TESTED YET!!!!(去相干校正，未测试，不想用的话注释掉就行)
+    def decoherence(self,
+                    coeffs: np.ndarray,
+                    velocity: np.ndarray,
+                    energy: np.ndarray) -> np.ndarray:
+        """
+        Decoherence.
 
-    #     c_j = c_j * exp(-dt / tau_ji)
-    #     c_i = c_i * sqrt((1 - sum_j(j!=i) |c_j|**2) / |c_i|**2)
-    #     tau_ji = ħ / |E_jj - E_ii| * (1 + a / E_kin)
-    #     """
+        c_j = c_j * exp(-dt / tau_ji)
+        c_i = c_i * sqrt((1 - sum_j(j!=i) |c_j|**2) / |c_i|**2)
+        tau_ji = ħ / |E_jj - E_ii| * (1 + a / E_kin)
+        """
 
-    #     E_kin = 0.5 * self.mass * np.sum(velocity ** 2)
-    #     cumu_sum = 0
+        E_kin = (0.5 * self.mass * np.sum(velocity ** 2)).sum()
+        cumu_sum = 0
+        cur_idx = self.states.index(self.cur_state)
         
-    #     for i in range(len(coeffs)):
-    #         if i != self.cur_state:
-    #             tau_ji = 1 / np.abs(energy[i] - energy[self.cur_state]) * (1 + self.alpha / E_kin)
-    #             coeffs[i] = coeffs[i] * np.exp(-self.dt / tau_ji)
-    #             cumu_sum += np.abs(coeffs[i]) ** 2
+        for i in range(len(coeffs)):
+            if i != cur_idx:
+                tau_ji = 1 / np.abs(energy[i] - energy[cur_idx]) * (1 + self.alpha / E_kin)
+                coeffs[i] = coeffs[i] * np.exp(-self.dt / tau_ji)
+                cumu_sum += np.abs(coeffs[i]) ** 2
         
-    #     coeffs[self.cur_state] = np.sqrt((1 - cumu_sum) / np.abs(coeffs[self.cur_state]) ** 2) * coeffs[self.cur_state]
-    #     return coeffs
+        coeffs[cur_idx] = np.sqrt((1 - cumu_sum) / np.abs(coeffs[cur_idx]) ** 2) * coeffs[cur_idx]
+        return coeffs
 
     def write_trajectory(self, 
                          step: int, 
