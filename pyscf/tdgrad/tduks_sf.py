@@ -23,7 +23,7 @@ from pyscf.dft import numint2c
 from pyscf.grad import rks as rks_grad
 from pyscf.grad import tdrhf as tdrhf_grad
 from pyscf.sftda.numint2c_sftd import cache_xc_kernel_sf
-from .gradient_nac_cache import get_cache_manager
+from pyscf.tools.gradient_nac_cache import get_cache_manager
 def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO,
               state_id=None, use_cache=True):
     ''' Spin flip TDDFT gradient in UKS framework. Note: This function supports

@@ -13,7 +13,7 @@ from pyscf.lib import logger
 from .fssh import FSSH
 from .tools import extract_state
 # 导入批量计算接口
-from .batch_grad_nac import clear_cache_for_new_geometry
+from pyscf.tools.batch_grad_nac import clear_cache_for_new_geometry
 logger = logging.getLogger(__name__)
 FS2AUTIME = 41.34137        # Conversion factor: femtoseconds to atomic time units
 A2BOHR = 1.889726           # Conversion factor: Angstrom to Bohr radius

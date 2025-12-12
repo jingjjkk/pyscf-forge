@@ -11,7 +11,7 @@ from pyscf.grad import tdrhf as tdrhf_grad
 from pyscf.sftda.numint2c_sftd import cache_xc_kernel_sf
 from pyscf import grad
 import time
-from .gradient_nac_cache import get_cache_manager
+from pyscf.tools.gradient_nac_cache import get_cache_manager
 
 
 
