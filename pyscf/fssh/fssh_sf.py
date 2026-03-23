@@ -86,7 +86,7 @@ class FSSH_SF(FSSH):
         self.tddft = tddft  # 现在 tddft 是一个 sftda.uks_sf.TDDFT_SF 对象
         self.tdgrad = tduks_sf_grad.Gradients(self.tddft)
         self.tdnac = tduks_sf_nac.NAC(self.tddft)
-        self.tdnac.etfs= True
+        self.tdnac.use_etfs= True
         self.tdnac.ediff= True
         self.tddft.mol.unit = 'Bohr'
         self.tddft._scf.mol.unit = 'Bohr'
