@@ -29,7 +29,7 @@ def generate_velocities(masses, temperature=300.0):
     velocities *= scaling_factor
     
     # Convert from m/s to Angstrom/fs
-    velocities = velocities * (FS / 1e-10)
+    velocities = velocities * 0.01)
     return velocities
 
 
