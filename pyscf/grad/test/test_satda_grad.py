@@ -113,6 +113,23 @@ class KnownValues(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             td.Gradients().set(verbose=0).kernel(state=1, method='analytic')
 
+    def test_analytic_experimental_deltaS_minus1_hf_matches_finite_diff(self):
+        td = self.make_td(deltaS=-1, nstates=4)
+        state = 2
+        grad_analytic = td.Gradients().set(
+            verbose=0, root_overlap_tol=0.2).kernel(
+                state=state, method='analytic_experimental')
+        grad_fd = td.Gradients().set(
+            verbose=0, root_overlap_tol=0.2).kernel(
+                state=state, step=2e-4, method='finite_diff')
+        self.assertAlmostEqual(abs(grad_analytic - grad_fd).max(), 0, 3)
+
+    def test_analytic_experimental_deltaS_0_not_implemented(self):
+        td = self.make_td(deltaS=0, nstates=3)
+        with self.assertRaises(NotImplementedError):
+            td.Gradients().set(verbose=0).kernel(
+                state=1, method='analytic_experimental')
+
     def test_finite_diff_total_gradient_matches_independent_reference(self):
         td = self.make_td(deltaS=-1, nstates=4)
         state = 4

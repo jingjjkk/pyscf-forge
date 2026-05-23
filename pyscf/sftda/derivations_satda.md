@@ -1240,3 +1240,834 @@ $$
 ---
 
 *推导完成。代码对应: `pyscf-forge/pyscf/sftda/satda.py` (SATDA 类及其响应函数)。*
+
+## 推导：SATDA deltaS=-1 HF 解析梯度 — HF 等价分解 — 2026-05-23
+
+**目标：** 从 SATDA 的 ROKS-native Fock 构造推导其在 HF 极限下的等价 Rayleigh 商分解，并建立 `tdsatda.py` 解析梯度的理论入口。
+
+**假设：**
+- 只处理 HF 或 `xc='HF'`，没有 XC kernel 的核导数项。
+- $\Delta S=-1$，振幅块为 $X_{co}, X_{cv}, X_{oo}, X_{ov}$。
+- 轨道实数，TDA 中 $Y=0$。
+- 使用空间轨道 ROKS/ROHF 参考态。
+
+**符号声明：**
+- $i,j \in C$（闭壳轨道），$u,v,w \in O$（开壳轨道），$a,b \in V$（虚轨道）。
+- $S = (n_{os})/2$ 为参考态总自旋。
+- $\mathbf{F}_{\mathrm{z}}$ 是 ROKS/ROHF 的耦合 Fock 矩阵（`fockz`），定义见 Li 等 ROKS 梯度论文。
+- $\mathbf{F}^{0} = \mathbf{F}^{\alpha} - \mathbf{F}_{\mathrm{z}}$ 是去耦合后的有效 Fock 矩阵。
+- $\mathbf{A}_{\mathrm{SATDA}}^{\mathrm{HF}}$ 是 HF 下 SATDA 的 ROKS-native A 矩阵。
+- $\mathbf{A}_{\mathrm{SF}}^{\mathrm{HF}}$ 是普通 SF-TDA 在 HF 下的 A 矩阵。
+
+### Step 1: ROKS-native Fock 矩阵的分块定义
+
+`gen_vind_sf()`（`satda.py` L503-617）使用 ROKS-native 的 Fock 分块构造 sigma 向量。关键 Fock 矩阵（L530-552）为：
+
+$$
+\begin{aligned}
+\mathbf{F}_{\mathrm{coco}}^{0} &= \mathbf{C}_{o}^{T}(\mathbf{F}^{0} - \mathbf{F}_{\mathrm{z}})\mathbf{C}_{o}, &
+\mathbf{F}_{\mathrm{coco}}^{1} &= \mathbf{C}_{c}^{T}(\mathbf{F}^{0} + \mathbf{F}_{\mathrm{z}})\mathbf{C}_{c}, &
+\mathbf{F}_{\mathrm{coco}}^{2} &= \mathbf{C}_{c}^{T}\mathbf{F}_{\mathrm{z}}\mathbf{C}_{c}, \\
+\mathbf{F}_{\mathrm{cvcv}}^{0} &= \mathbf{C}_{v}^{T}(\mathbf{F}^{0} - \mathbf{F}_{\mathrm{z}})\mathbf{C}_{v}, &
+\mathbf{F}_{\mathrm{cvcv}}^{2} &= \mathbf{C}_{v}^{T}\mathbf{F}_{\mathrm{z}}\mathbf{C}_{v}, &
+\mathbf{F}_{\mathrm{cvoo}} &= \mathbf{C}_{v}^{T}\mathbf{F}_{\mathrm{z}}\mathbf{C}_{c}, \\
+\mathbf{F}_{\mathrm{cocv}} &= \mathbf{C}_{o}^{T}(\mathbf{F}^{0} - \mathbf{F}_{\mathrm{z}})\mathbf{C}_{v}, &
+\mathbf{F}_{\mathrm{cooo}}^{0} &= \mathbf{C}_{o}^{T}(\mathbf{F}^{0} + \mathbf{F}_{\mathrm{z}})\mathbf{C}_{c}, &
+\mathbf{F}_{\mathrm{cooo}}^{1} &= \mathbf{C}_{o}^{T}(\mathbf{F}^{0} - \mathbf{F}_{\mathrm{z}})\mathbf{C}_{c}.
+\end{aligned}
+$$
+
+→ **解释：** 这些是 `gen_vind_sf` 中构造 Fock 项 sigma 的全部 MO 子块。它们完全由 ROKS 的 $\mathbf{F}_{\mathrm{z}}$ 和 $\mathbf{F}^{0}$ 决定。
+
+### Step 2: HF 极限下的等价分解
+
+在 HF 极限下（无 XC kernel），SATDA 的 ROKS-native sigma 向量与普通 SF-TDA + 自旋适配修正给出相同的 Rayleigh quotient。即对任意 SATDA 本征矢 $\mathbf{X}$：
+
+$$
+\boxed{
+\omega_{\mathrm{SATDA}}^{\mathrm{HF}}
+= \mathbf{X}^{T}\mathbf{A}_{\mathrm{SF}}^{\mathrm{HF}}\mathbf{X}
++ \mathbf{X}^{T}\Delta\mathbf{A}_{\mathrm{SA}}^{\mathrm{HF}}\mathbf{X}.
+}
+$$
+
+→ **解释：** 第一项是普通 SF-TDA 的 HF A 矩阵（Fock 差 + exact exchange），第二项是自旋适配修正（Fock-like + HF exchange-like）。这个等价性是代码使用 SF-base 分解路径的理论依据，由 `_satda_hf_energy_for_orbs()` 在每次梯度计算前验证。
+
+自旋适配修正按 Fock-like 和 HF exchange-like 拆分为：
+
+$$
+\Delta\mathbf{A}_{\mathrm{SA}}^{\mathrm{HF}}
+= \Delta\mathbf{A}^{F} + \Delta\mathbf{A}^{\mathrm{eri}}.
+$$
+
+→ **解释：** 纯 HF 下没有 XC kernel 修正，只有这两类。代码中 `satda_delta_fock_q()` 和 `satda_delta_hf_exchange_q()` 分别处理。
+
+**代码对应：** `pyscf-forge/pyscf/sftda/satda.py:gen_vind_sf()` L503-617；`pyscf-forge/pyscf/grad/tdsatda.py:_satda_hf_energy_for_orbs()` L549-659。
+
+
+## 推导：Fock-like 项的 coefficient matrices 构造 — 2026-05-23
+
+**目标：** 从振幅 $\mathbf{X}$ 的分块和自旋适配系数，构造 7 类 coefficient matrix $T^{s}_{CC}, T^{s}_{VV}, T^{s}_{CV}, T^{\beta}_{VO}, T^{\beta}_{CO}, T^{\alpha}_{OC}, T^{\alpha}_{VO}$。这些矩阵是 $\mathbf{X}^{T}\Delta\mathbf{A}^{F}\mathbf{X}$ 对 Fock 矩阵元的缩合系数。
+
+**符号声明：**
+- $\mathbf{X}_{co} \in \mathbb{R}^{n_{cs} \times n_{os}}$，$\mathbf{X}_{cv} \in \mathbb{R}^{n_{cs} \times n_{vs}}$，
+  $\mathbf{X}_{oo} \in \mathbb{R}^{n_{os} \times n_{os}}$，$\mathbf{X}_{ov} \in \mathbb{R}^{n_{os} \times n_{vs}}$。
+- $\mathrm{tr}_{oo} = \sum_{u} X_{uu}^{oo}$ 为 OO 块的迹。
+- $\mathbf{F}^{s} = \frac{1}{2}(\mathbf{F}^{\beta} - \mathbf{F}^{\alpha})$。
+
+**自旋适配系数：**
+
+$$
+\eta = \sqrt{\frac{2S+1}{2S}} - 1,\qquad
+\gamma = \sqrt{\frac{2S+1}{2S-1}},\qquad
+\zeta = \sqrt{\frac{2S}{2S-1}} - 1,\qquad
+\chi = \frac{1}{\sqrt{2S(2S-1)}}.
+$$
+
+→ **解释：** 这 4 个系数与 SASF 的 `tdsasf.py` 完全相同。它们在 `satda_fock_coefficients()`（L137-182）中计算。
+
+### Step 1: $F^{s}_{CC}$ 的 coefficient — $T^{s}_{CC}$
+
+来自 $CV,CV$ 和 $CO,CO$ 两个对角块对 $F^{s}_{CC}$ 的缩并：
+
+$$
+T^{s}_{CC,ji}
+= \frac{1}{S}\sum_{a} X^{CV}_{ia} X^{CV}_{ja}
++ \frac{2}{2S-1}\sum_{u} X^{CO}_{iu} X^{CO}_{ju}.
+$$
+
+→ **解释：** 第一项来自 $CVCV$ 的 $F^{s}_{ji}$ 项（系数 $1/S$），第二项来自 $COCO$ 的 $F^{s}_{ji}$ 项（系数 $2/(2S-1)$）。
+
+### Step 2: $F^{s}_{VV}$ 的 coefficient — $T^{s}_{VV}$
+
+来自 $CV,CV$ 和 $OV,OV$ 两个对角块：
+
+$$
+T^{s}_{VV,ab}
+= \frac{1}{S}\sum_{i} X^{CV}_{ia} X^{CV}_{ib}
++ \frac{2}{2S-1}\sum_{u} X^{OV}_{ua} X^{OV}_{ub}.
+$$
+
+### Step 3: $F^{s}_{CV}$ 的 coefficient — $T^{s}_{CV}$
+
+仅来自非对角块 $CV,OO$ 及转置块 $OO,CV$：
+
+$$
+T^{s}_{CV,ia}
+= \frac{\gamma}{S}\left(1 + \frac{1}{S}\right) \mathrm{tr}_{oo} \, X^{CV}_{ia}.
+$$
+
+→ **解释：** 这里的系数 $\gamma(1+1/S)$ 来自 `TDA_SASF.gen_vind` 的非对称 CV/OO Fock 耦合约定，与 code 中 `t_s_cv` 一致。因子 2 来自 $CV,OO$ 与转置块的合并。
+
+### Step 4: $F^{\beta}_{VO}$ 的 coefficient — $T^{\beta}_{VO}$
+
+来自 $CV,CO$ 和 $OV,OO$ 块：
+
+$$
+T^{\beta}_{VO,av}
+= 2\eta \sum_{i} X^{CV}_{ia} X^{CO}_{iv}
++ 2\zeta \sum_{u} X^{OV}_{ua} X^{OO}_{uv}.
+$$
+
+### Step 5: $F^{\beta}_{CO}$ 的 coefficient — $T^{\beta}_{CO}$
+
+仅来自 $CO,OO$ 块：
+
+$$
+T^{\beta}_{CO,iu}
+= 2\chi \, \mathrm{tr}_{oo} \, X^{CO}_{iu}.
+$$
+
+### Step 6: $F^{\alpha}_{OC}$ 的 coefficient — $T^{\alpha}_{OC}$
+
+来自 $CV,OV$ 和 $CO,OO$ 块：
+
+$$
+T^{\alpha}_{OC,vi}
+= -2\eta \sum_{a} X^{CV}_{ia} X^{OV}_{va}
+- 2\zeta \sum_{u} X^{CO}_{iu} X^{OO}_{vu}.
+$$
+
+### Step 7: $F^{\alpha}_{VO}$ 的 coefficient — $T^{\alpha}_{VO}$
+
+仅来自 $OV,OO$ 块：
+
+$$
+T^{\alpha}_{VO,au}
+= -2\chi \, \mathrm{tr}_{oo} \, X^{OV}_{ua}.
+$$
+
+### Step 8: AO probe density 构造
+
+将 7 类 $T$ 转换为 AO probe density，用于后续的 Fock response 和 skeleton derivative：
+
+$$
+\begin{aligned}
+\mathbf{P}_{s} &= \mathbf{C}_{c} \mathbf{T}^{s}_{CC} \mathbf{C}_{c}^{T}
++ \mathbf{C}_{v} \mathbf{T}^{s}_{VV} \mathbf{C}_{v}^{T}
++ \mathbf{C}_{c} \mathbf{T}^{s}_{CV} \mathbf{C}_{v}^{T}, \\
+\mathbf{P}_{\beta} &= \mathbf{C}_{v} \mathbf{T}^{\beta}_{VO} \mathbf{C}_{o}^{T}
++ \mathbf{C}_{c} \mathbf{T}^{\beta}_{CO} \mathbf{C}_{o}^{T}, \\
+\mathbf{P}_{\alpha} &= \mathbf{C}_{o} \mathbf{T}^{\alpha}_{OC} \mathbf{C}_{c}^{T}
++ \mathbf{C}_{v} \mathbf{T}^{\alpha}_{VO} \mathbf{C}_{o}^{T}.
+\end{aligned}
+$$
+
+由于 $F^{s} = \frac{1}{2}(F^{\beta} - F^{\alpha})$，最终自旋分辨的 probe density 为：
+
+$$
+\boxed{
+\mathbf{P}^{\alpha}_{\mathrm{probe}} = \mathbf{P}_{\alpha} - \frac{1}{2}\mathbf{P}_{s},
+\qquad
+\mathbf{P}^{\beta}_{\mathrm{probe}} = \mathbf{P}_{\beta} + \frac{1}{2}\mathbf{P}_{s}.
+}
+$$
+
+→ **解释：** 这使标量收缩满足 $\mathrm{Tr}[\mathbf{P}_{\alpha}^{\mathrm{probe}} \mathbf{F}^{\alpha}] + \mathrm{Tr}[\mathbf{P}_{\beta}^{\mathrm{probe}} \mathbf{F}^{\beta}] = \sum T^{s} F^{s} + \sum T^{\beta} F^{\beta} + \sum T^{\alpha} F^{\alpha}$。
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:satda_fock_coefficients()` L137-182；`satda_fock_probe_densities()` L185-203。
+
+
+## 推导：Fock-like RHS 的 projection + response 分解 — 2026-05-23
+
+**目标：** 从 7 类 coefficient matrix 构造未约束 MO 系数导数 $\mathbf{Q}^{\alpha}$、$\mathbf{Q}^{\beta}$，并分解为 MO projection 项和 Fock-density response 项。
+
+**符号声明：**
+- $\mathbf{Q}^{\sigma}_{rs} = C_{\lambda r} \, \partial E^{\Delta,F} / \partial C_{\lambda s}$ 是激发能中 Fock-like 修正对 MO 系数 $C_{\lambda s}$ 的缩合导数。
+- $\mathbf{F}^{\sigma}_{\mathrm{MO}} = \mathbf{C}^{T} \mathbf{F}^{\sigma}_{\mathrm{AO}} \mathbf{C}$ 是全 MO 空间的 Fock 矩阵。
+- $\theta^{\tau}_{s}$ 表示空间轨道 $s$ 是否属于自旋 $\tau$ 的占据空间：$\theta^{\alpha}_{s}=1$ 若 $s \in C \cup O$，$\theta^{\beta}_{s}=1$ 若 $s \in C$。
+
+### Step 1: 通用单自旋 contraction 的 Q 公式
+
+对任意单自旋 coefficient matrix $\mathbf{T}^{\sigma}_{pq}$ 和一电子收缩 $E = \sum_{pq} T^{\sigma}_{pq} F^{\sigma}_{pq}$，其对 MO 系数的缩合导数为：
+
+$$
+\boxed{
+Q^{(T,\sigma)}_{rs}
+= \sum_{q} T^{\sigma}_{sq} F^{\sigma,\mathrm{MO}}_{rq}
++ \sum_{p} T^{\sigma}_{ps} F^{\sigma,\mathrm{MO}}_{pr}
++ \sum_{\tau\in\{\alpha,\beta\}} \theta^{\tau}_{s}
+\sum_{pq} T^{\sigma}_{pq} K^{S,\sigma\tau}_{pq,rs}.
+}
+$$
+
+→ **解释：** 前两项是 projection 贡献（来自 $C_{\mu p}$ 和 $C_{\nu q}$ 的显式导数），第三项是 Fock response 贡献（来自 AO Fock 对密度矩阵的依赖）。$K^{S,\sigma\tau}_{pq,rs} = K^{\sigma\tau}_{pq,rs} + K^{\sigma\tau}_{pq,sr}$ 是对称化的 MO 表象 Fock kernel。
+
+### Step 2: $F^{s}$ contraction 的 Q 公式
+
+对 $F^{s} = \frac{1}{2}(F^{\beta} - F^{\alpha})$ 的收缩，用线性组合得到：
+
+$$
+Q^{(T,s)}_{rs}
+= \sum_{q} T^{s}_{sq} F^{s,\mathrm{MO}}_{rq}
++ \sum_{p} T^{s}_{ps} F^{s,\mathrm{MO}}_{pr}
++ \frac{1}{2}\sum_{\tau} \theta^{\tau}_{s}
+\sum_{pq} T^{s}_{pq}
+\left(K^{S,\beta\tau}_{pq,rs} - K^{S,\alpha\tau}_{pq,rs}\right).
+$$
+
+→ **解释：** projection 项使用 $F^{s,\mathrm{MO}} = \frac{1}{2}(F^{\beta,\mathrm{MO}} - F^{\alpha,\mathrm{MO}})$。response 项中 $F^{s}$ 对 $\alpha$ 和 $\beta$ 密度的依赖符号相反。
+
+### Step 3: 按 $s$ 所在轨道空间分类
+
+根据 $s$ 的占据情况，response 项简化为：
+
+$$
+\begin{aligned}
+s \in C &: \theta^{\alpha}_{s}=1,\; \theta^{\beta}_{s}=1, \\
+s \in O &: \theta^{\alpha}_{s}=1,\; \theta^{\beta}_{s}=0, \\
+s \in V &: \theta^{\alpha}_{s}=0,\; \theta^{\beta}_{s}=0.
+\end{aligned}
+$$
+
+→ **解释：** virtual 轨道不在参考态密度中，因此没有 Fock response 贡献（$\theta^{s}_{V}=0$），只保留 projection 项。
+
+### Step 4: 代码实现路径
+
+代码中 `_add_fock_term()` 对每个 $T$ 矩阵同时累加 projection 和 probe density：
+
+```python
+# projection 部分：
+q[:, left_idx] += (fock_mo[:, right_idx] @ coeff_mat.T) * scale
+q[:, right_idx] += (fock_mo[:, left_idx] @ coeff_mat) * scale
+
+# probe density 累积（供后续 response）：
+p += c_left @ coeff_mat @ c_right.T
+```
+
+7 类 $T$ 按 spin 标签分别调用 `_add_fock_term`：
+
+| $T$ 矩阵 | spin 标签 | 作用 |
+|-----------|-----------|------|
+| $T^{s}_{CC}$ | `'spin'` | $\frac{1}{2}$ 加到 $\beta$ 的 Q，$-\frac{1}{2}$ 加到 $\alpha$ 的 Q |
+| $T^{s}_{VV}$ | `'spin'` | 同上 |
+| $T^{s}_{CV}$ | `'spin'` | 同上 |
+| $T^{\beta}_{VO}$ | `'beta'` | 直接加到 $\beta$ 的 Q |
+| $T^{\beta}_{CO}$ | `'beta'` | 同上 |
+| $T^{\alpha}_{OC}$ | `'alpha'` | 直接加到 $\alpha$ 的 Q |
+| $T^{\alpha}_{VO}$ | `'alpha'` | 同上 |
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:satda_delta_fock_q()` L258-298；`_add_fock_term()` L206-236；`_add_fock_response_q()` L239-255。
+
+
+## 推导：HF exchange-like $\Delta A$ 的 8 个独立块 — 2026-05-23
+
+**目标：** 列出 HF exchange-like 修正 $\Delta\mathbf{A}^{\mathrm{eri}}$ 的 8 个非零独立块矩阵表达式。对应 `_satda_hf_exchange_energy_with_coeff()` 中每个 ERI 收缩。
+
+**符号声明：**
+- $(pq|tu)$ 表示化学记号的 MO 两电子积分。
+- $c_{\mathrm{x}}$ 为 exact-exchange 系数（纯 HF 时为 1，hybrid 时为 `hyb`，RSH 时需要额外加 $k_{\omega} = \alpha - c_{\mathrm{x}}$ 的 range-separated 项）。
+
+### Step 1: 对角块 $CO,CO$
+
+$$
+\Delta A^{\mathrm{eri}}_{CO,CO}(iu, jv)
+= -\frac{1}{2S-1} \, (ui|jv).
+$$
+
+→ **解释：** 指标空间为 $O,C,C,O$。该积分有一个 $CO$ 振幅指标与外积对调。
+
+### Step 2: 对角块 $OV,OV$
+
+$$
+\Delta A^{\mathrm{eri}}_{OV,OV}(ua, vb)
+= -\frac{1}{2S-1} \, (au|vb).
+$$
+
+→ **解释：** 指标空间为 $V,O,O,V$。
+
+### Step 3: 非对角块 $CV,CO$（含转置）
+
+$$
+\Delta A^{\mathrm{eri}}_{CV,CO}(ia, jv)
+= -\eta \, (av|ji).
+$$
+
+→ **解释：** 指标空间为 $V,O,C,C$。转置块 $CO,CV$ 在二次型中贡献等量，故后续 RHS 和 skeleton 中出现因子 2。
+
+### Step 4: 非对角块 $CV,OV$（含转置）
+
+$$
+\Delta A^{\mathrm{eri}}_{CV,OV}(ia, vb)
+= -\eta \, (ab|vi).
+$$
+
+→ **解释：** 指标空间为 $V,V,O,C$。
+
+### Step 5: 非对角块 $CO,OV$（含转置）— 两项
+
+$$
+\Delta A^{\mathrm{eri}}_{CO,OV}(iu, vb)
+= \frac{1}{2S-1}(ui|vb)
+- \frac{1}{2S-1}(ub|vi).
+$$
+
+→ **解释：** 第一项指标为 $O,C,O,V$，第二项为 $O,V,O,C$。两项符号相反。
+
+### Step 6: 非对角块 $CV,OO$（含转置）
+
+$$
+\Delta A^{\mathrm{eri}}_{CV,OO}(ia, wv)
+= -(\gamma - 1)(av|wi).
+$$
+
+→ **解释：** 指标空间为 $V,O,O,C$。注意系数为 $\gamma - 1$（不是 $\gamma/S$，与 Fock-like 同块不同）。
+
+### Step 7: 非对角块 $CO,OO$（含转置）
+
+$$
+\Delta A^{\mathrm{eri}}_{CO,OO}(iu, wv)
+= -\zeta \, (uv|wi).
+$$
+
+→ **解释：** 指标空间为 $O,O,O,C$。
+
+### Step 8: 非对角块 $OV,OO$（含转置）
+
+$$
+\Delta A^{\mathrm{eri}}_{OV,OO}(ua, wv)
+= -\zeta \, (av|wu).
+$$
+
+→ **解释：** 指标空间为 $V,O,O,O$。
+
+### Step 9: 零块
+
+$$
+\Delta A^{\mathrm{eri}}_{CV,CV} = 0,\qquad
+\Delta A^{\mathrm{eri}}_{OO,OO} = 0.
+$$
+
+### 最终结果
+
+所有非零独立块汇总：
+
+$$
+\boxed{
+\Delta\mathbf{A}^{\mathrm{eri}} = \Delta A^{\mathrm{eri}}_{CO,CO}
++ \Delta A^{\mathrm{eri}}_{OV,OV}
++ \Delta A^{\mathrm{eri}}_{CV,CO}
++ \Delta A^{\mathrm{eri}}_{CV,OV}
++ \Delta A^{\mathrm{eri}}_{CO,OV}
++ \Delta A^{\mathrm{eri}}_{CV,OO}
++ \Delta A^{\mathrm{eri}}_{CO,OO}
++ \Delta A^{\mathrm{eri}}_{OV,OO}.
+}
+$$
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:_satda_hf_exchange_energy_with_coeff()` L301-364。
+
+
+## 推导：HF exchange-like RHS 的 4-projection 展开 — 2026-05-23
+
+**目标：** 对每个 HF exchange-like 独立块，构造其 orbital RHS contribution。将 ERIs 对 MO 系数的缩合导数（4-projection 项）铺到 $\mathbf{Q}^{\alpha}$ 和 $\mathbf{Q}^{\beta}$。
+
+**符号声明：**
+- $\mathcal{I}_{pq|tu} = c_{\mathrm{x}}(pq|tu) + k_{\omega}(pq|tu)_{\omega}$ 包含 hybrid 和 RSH 系数。
+- $\mathcal{D}_{pq|tu;rs} = C_{\lambda r} \, \partial \mathcal{I}_{pq|tu} / \partial C_{\lambda s}$。
+
+### Step 1: ERI 的 4 项 projection 导数
+
+对固定 MO 系数（暂不涉及 AO Fock response）的 ERI，缩合导数为：
+
+$$
+\boxed{
+\mathcal{D}_{pq|tu;rs}
+= \delta_{ps}\mathcal{I}_{rq|tu}
++ \delta_{qs}\mathcal{I}_{pr|tu}
++ \delta_{ts}\mathcal{I}_{pq|ru}
++ \delta_{us}\mathcal{I}_{pq|tr}.
+}
+$$
+
+→ **解释：** 四项分别来自 ERI 的四个 MO 指标 $p,q,t,u$ 中每个对 $C_{\lambda s}$ 的导数。$r$ 是左乘的 MO 指标。
+
+### Step 2: 代码化 — `_add_eri_term_q`
+
+对于系数张量 $T_{pqtu}$ 和指标空间 $(P,Q,R,S)$（各自属于 $C,O,V$ 中某块），代码逐条处理四个 projection：
+
+对 `pos=0`（替换第一指标 $p$）：
+$$
+Q_{rp} \leftarrow \mathrm{scale} \times \sum_{qtu} T_{pqtu} \, \mathcal{I}_{rq|tu}.
+$$
+
+其余三个位置类似。`spin_sets` 决定每个 projection contribution 加到 $\mathbf{Q}^{\alpha}$ 还是 $\mathbf{Q}^{\beta}$。
+
+### Step 3: 各块的指标空间和 spin_sets
+
+| 块 | ERI 指标空间 | spin_sets | 系数 |
+|---|---|---|---|
+| $CO,CO$ | $(O,C,C,O)$ | $(\beta,\alpha,\alpha,\beta)$ | $-\frac{1}{2S-1}$ |
+| $OV,OV$ | $(V,O,O,V)$ | $(\beta,\beta,\beta,\beta)$ | $-\frac{1}{2S-1}$ |
+| $CV,CO$ | $(V,O,C,C)$ | $(\beta,\beta,\alpha,\alpha)$ | $-2\eta$ |
+| $CV,OV$ | $(V,V,O,C)$ | $(\beta,\beta,\beta,\alpha)$ | $-2\eta$ |
+| $CO,OV$ (1) | $(O,C,O,V)$ | $(\beta,\alpha,\beta,\beta)$ | $+\frac{2}{2S-1}$ |
+| $CO,OV$ (2) | $(O,V,O,C)$ | $(\beta,\beta,\beta,\alpha)$ | $-\frac{2}{2S-1}$ |
+| $CV,OO$ | $(V,O,O,C)$ | $(\beta,\beta,\beta,\alpha)$ | $-2(\gamma-1)$ |
+| $CO,OO$ | $(O,O,O,C)$ | $(\beta,\beta,\beta,\alpha)$ | $-2\zeta$ |
+| $OV,OO$ | $(V,O,O,O)$ | $(\beta,\beta,\beta,\beta)$ | $-2\zeta$ |
+
+→ **解释：** `spin_sets` 决定投影项的去向：`'alpha'` → $\mathbf{Q}^{\alpha}$，`'beta'` → $\mathbf{Q}^{\beta}$。注意各块的系数已含非对角与转置块合并的因子 2。
+
+### Step 4: RHS 反对称化
+
+得到 $\mathbf{Q}^{\alpha,\Delta,\mathrm{eri}}$ 和 $\mathbf{Q}^{\beta,\Delta,\mathrm{eri}}$ 后，取反对称部分：
+
+$$
+\mathbf{R}^{\sigma,\Delta,\mathrm{eri}} = \mathbf{Q}^{\sigma,\Delta,\mathrm{eri}} - \left(\mathbf{Q}^{\sigma,\Delta,\mathrm{eri}}\right)^{T}.
+$$
+
+再投影到 UCPHF 布局：
+
+$$
+W^{\sigma}_{ai} = R^{\sigma}_{ai}, \quad a \in \mathrm{vir}_{\sigma},\; i \in \mathrm{occ}_{\sigma}.
+$$
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:_add_eri_term_q()` L380-413；`_satda_delta_hf_exchange_q_with_coeff()` L416-489；`satda_delta_hf_exchange_q()` L492-511。
+
+
+## 推导：直接 AO 骨架导数 — Fock-like 项 — 2026-05-23
+
+**目标：** 固定 MO 系数和 overlap metric 后，Fock-like skeleton derivative 的计算。将 7 类 $T$ 矩阵收缩的 $\mathbf{P}^{\alpha}_{\mathrm{probe}}$ 和 $\mathbf{P}^{\beta}_{\mathrm{probe}}$ 接入 AO 积分导数。
+
+**上标约定：** $[x]$ 表示 skeleton/direct nuclear derivative — 只对 AO 积分显式求导，不含 MO response 和 overlap metric 项。
+
+### Step 1: AO Fock 的 skeleton derivative
+
+固定 MO 系数时：
+
+$$
+F^{\sigma,[x]}_{pq}
+= \sum_{\mu\nu} C_{\mu p} F^{\sigma,[x]}_{\mu\nu} C_{\nu q}.
+$$
+
+HF 下 AO Fock skeleton derivative 展开为：
+
+$$
+F^{\sigma,[x]}_{\mu\nu}
+= h^{[x]}_{\mu\nu}
++ \sum_{\lambda\kappa} D_{\lambda\kappa} (\mu\nu|\lambda\kappa)^{[x]}
+- c_{\mathrm{x}} \sum_{\lambda\kappa} D^{\sigma}_{\lambda\kappa} (\mu\lambda|\nu\kappa)^{[x]},
+$$
+
+其中 $D = D^{\alpha} + D^{\beta}$ 是总密度矩阵。
+
+### Step 2: 将 probe density 合并到 relaxed density
+
+代码中，普通 SF 部分的 relaxed density 为 `dmz1dooa` 和 `dmz1doob`（在 Z-vector 解出后）。SATDA Fock-like probe density 线性叠加到其上：
+
+```python
+dmz1dooa_direct = dmz1dooa + 2 * dm_probe_a
+dmz1doob_direct = dmz1doob + 2 * dm_probe_b
+```
+
+→ **解释：** 因子 2 来自 PySCF 的 `get_jk` 密度约定（`dmz1doo` 在收缩 `h1ao` 和 `veff1` 时已有特定的 Hermitian 对称处理）。合并后的密度传给 `td_grad.get_jk`，自动在 atom loop 中产生正确的 Coulomb + exchange skeleton 贡献。
+
+### Step 3: 一电子项
+
+SATDA Fock-like 修正对一电子积分导数的贡献通过 `as_dm1` 实现：
+
+```python
+as_dm1 = oo0a + oo0b + (dmz1dooa_direct + dmz1doob_direct) * 0.5
+# atom loop:
+de += einsum('xpq,pq->x', h1ao, as_dm1)
+```
+
+数学上：
+
+$$
+\boxed{
+\Omega_{\mathrm{Fock},h}^{[x]}
+= \sum_{\mu\nu} \left[
+P^{\alpha,\mathrm{probe}}_{\mu\nu} + P^{\beta,\mathrm{probe}}_{\mu\nu}
+\right] h^{[x]}_{\mu\nu}.
+}
+$$
+
+### Step 4: Coulomb 和 exchange 项
+
+通过 `td_grad.get_jk` 产生的 `veff1` 在 atom loop 中与 `dmz1dooa_direct`/`dmz1doob_direct` 收缩，等价于：
+
+$$
+\boxed{
+\Omega_{\mathrm{Fock},J}^{[x]}
+= \sum_{\mu\nu\lambda\kappa}
+\left(P^{\alpha,\mathrm{probe}}_{\mu\nu} + P^{\beta,\mathrm{probe}}_{\mu\nu}\right)
+D^{\mathrm{tot}}_{\lambda\kappa}
+(\mu\nu|\lambda\kappa)^{[x]},
+}
+$$
+
+$$
+\boxed{
+\Omega_{\mathrm{Fock},K}^{[x]}
+= -c_{\mathrm{x}} \sum_{\mu\nu\lambda\kappa}
+\left(
+P^{\alpha,\mathrm{probe}}_{\mu\lambda} D^{\alpha}_{\nu\kappa}
++ P^{\beta,\mathrm{probe}}_{\mu\lambda} D^{\beta}_{\nu\kappa}
+\right)
+(\mu\nu|\lambda\kappa)^{[x]}.
+}
+$$
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:grad_elec_hf_experimental()` L997-1011（`dmz1dooa_direct`、`dmz1doob_direct`、`as_dm1` 和 `veff1` 构造），L1023-1043（atom loop 中的收缩）。
+
+
+## 推导：直接 AO 骨架导数 — HF exchange-like 项 — 2026-05-23
+
+**目标：** 对每个 HF exchange-like 独立块，通过 bilinear AO density → `get_j` → 原子切片的路径计算 ERI skeleton derivative。
+
+### Step 1: Bilinear ERI 收缩原理
+
+对形如 $E = \sum_{pqtu} L_{pq} R_{tu} (pq|tu)$ 的标量，固定 MO 系数后的 skeleton derivative 可写成 AO 双线性形式：
+
+$$
+E^{[x]}
+= \sum_{\mu\nu\lambda\kappa}
+L^{\mathrm{AO}}_{\mu\nu} R^{\mathrm{AO}}_{\lambda\kappa}
+(\mu\nu|\lambda\kappa)^{[x]},
+$$
+
+其中 $L^{\mathrm{AO}}_{\mu\nu} = \sum_{pq} C_{\mu p} L_{pq} C_{\nu q}$，$R^{\mathrm{AO}}_{\lambda\kappa} = \sum_{tu} C_{\lambda t} R_{tu} C_{\kappa u}$。
+
+→ **解释：** 这避免了显式构造 MO 四中心积分导数，从而利用 PySCF 的 `get_j` 核导数 API。
+
+### Step 2: `_add_j_bilinear_ip1` 的双线性收缩
+
+该 helper 对给定 $(\mathbf{L}, \mathbf{R})$ 对，调用 `td_grad.get_j` 得到 Coulomb 型导数势，再在原子循环中收缩：
+
+```python
+vj_r = td_grad.get_j(mol, dm_r, hermi=0)  # V_{mu,nu}^x = sum_{lk} R_{lk} (mu nu|lk)^x
+vj_l = td_grad.get_j(mol, dm_l, hermi=0)  # V_{lk}^x = sum_{mu,nu} L_{mu,nu} (mu nu|lk)^x
+```
+
+→ **解释：** `get_j` 对非对称密度 (`hermi=0`) 返回的导数势有方向性（`(mu nu|lk)^x` 不是对称的），因此需要 row/column 分别收缩 $\mathbf{L}$ 和 $\mathbf{R}$。
+
+### Step 3: 各块的 pair density 构造
+
+| 块 | $\mathbf{L}$ 构造 | $\mathbf{R}$ 构造 | 系数 |
+|---|---|---|---|
+| $CO,CO$ | $\mathbf{C}_{o} \mathbf{X}_{co}^{T} \mathbf{C}_{c}^{T}$ | $\mathbf{C}_{c} \mathbf{X}_{co} \mathbf{C}_{o}^{T}$ | $-\frac{1}{2S-1}$ |
+| $OV,OV$ | $\mathbf{C}_{v} \mathbf{X}_{ov}^{T} \mathbf{C}_{o}^{T}$ | $\mathbf{C}_{o} \mathbf{X}_{ov} \mathbf{C}_{v}^{T}$ | $-\frac{1}{2S-1}$ |
+| $CV,CO$ | batch: $\mathbf{C}_{v} (\mathbf{x}_{cv}^{i} \otimes \mathbf{x}_{co}^{j}) \mathbf{C}_{o}^{T}$ | batch: $\mathbf{c}_{c}^{j} \otimes \mathbf{c}_{c}^{i}$ | $-2\eta$ |
+| $CV,OV$ | batch: $\mathbf{C}_{v} (\mathbf{x}_{cv}^{i} \otimes \mathbf{x}_{ov}^{v}) \mathbf{C}_{v}^{T}$ | batch: $\mathbf{c}_{o}^{v} \otimes \mathbf{c}_{c}^{i}$ | $-2\eta$ |
+| $CO,OV$ (1) | $\mathbf{C}_{o} \mathbf{X}_{co}^{T} \mathbf{C}_{c}^{T}$ | $\mathbf{C}_{o} \mathbf{X}_{ov} \mathbf{C}_{v}^{T}$ | $+\frac{2}{2S-1}$ |
+| $CO,OV$ (2) | batch: $\mathbf{C}_{o} (\mathbf{x}_{co}^{i} \otimes \mathbf{x}_{ov}^{v}) \mathbf{C}_{v}^{T}$ | batch: $\mathbf{c}_{o}^{v} \otimes \mathbf{c}_{c}^{i}$ | $-\frac{2}{2S-1}$ |
+| $CV,OO$ | batch: $\mathbf{C}_{v} (\mathbf{x}_{cv}^{i} \otimes \mathbf{x}_{oo}^{w}) \mathbf{C}_{o}^{T}$ | batch: $\mathbf{c}_{o}^{w} \otimes \mathbf{c}_{c}^{i}$ | $-2(\gamma-1)$ |
+| $CO,OO$ | batch: $\mathbf{C}_{o} (\mathbf{x}_{co}^{i} \otimes \mathbf{x}_{oo}^{w}) \mathbf{C}_{o}^{T}$ | batch: $\mathbf{c}_{o}^{w} \otimes \mathbf{c}_{c}^{i}$ | $-2\zeta$ |
+| $OV,OO$ | batch: $\mathbf{C}_{v} (\mathbf{x}_{ov}^{u} \otimes \mathbf{x}_{oo}^{w}) \mathbf{C}_{o}^{T}$ | batch: $\mathbf{c}_{o}^{w} \otimes \mathbf{c}_{o}^{u}$ | $-2\zeta$ |
+
+→ **解释：** `batch` 标记的块不能写成简单的 MO 空间外积（因系数张量 $T_{pqtu}$ 不可分解），故对 shared indices 做循环，每对生成一个 $(\mathbf{L}_m, \mathbf{R}_m)$ 送入 `_add_j_bilinear_ip1_batches`。`blksize=64` 控制每批最多 64 个 density pair。
+
+### Step 4: RSH 处理
+
+若 $\omega \neq 0$，再以系数 $\alpha - c_{\mathrm{x}}$ 和 `omega=omega` 调用同一套 builder：
+
+```python
+_satda_delta_hf_exchange_direct_with_coeff(de, td_grad, tdobj, xy, ..., coeff=hyb)
+if omega != 0:
+    _satda_delta_hf_exchange_direct_with_coeff(de, ..., coeff=alpha-hyb, omega=omega)
+```
+
+→ **解释：** RSH 的 range-separated ERI 导数 $(pq|tu)_{\omega}^{[x]}$ 与普通 $(pq|tu)^{[x]}$ 结构相同，只是 Coulomb 算符换成 $\mathrm{erfc}(\omega r_{12})/r_{12}$。PySCF 的 `get_j(omega=omega)` 自动处理。
+
+### 最终结果
+
+总 HF exchange-like skeleton derivative 为：
+
+$$
+\boxed{
+\Omega_{\mathrm{eri}}^{[x]}
+= \sum_{\mathrm{block}\; B} c_B
+\sum_{\mu\nu\lambda\kappa}
+L^{(B)}_{\mu\nu} R^{(B)}_{\lambda\kappa}
+(\mu\nu|\lambda\kappa)^{[x]}.
+}
+$$
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:_add_j_bilinear_ip1()` L716-738；`_add_j_bilinear_ip1_batches()` L741-752；`_satda_delta_hf_exchange_direct_with_coeff()` L755-843；`satda_delta_hf_exchange_direct_de()` L845-861。
+
+
+## 推导：Z-vector 方程与 overlap metric 系数 — 2026-05-23
+
+**目标：** 构造总 RHS、解 Z-vector、从收敛的 Z 回填 overlap metric coefficient $B^{S}_{pq}$。
+
+### Step 1: 总 orbital RHS 构造
+
+代码中的 UCPHF RHS 由两部分组成：
+
+$$
+\mathbf{W}^{\sigma}_{ai}
+= \mathbf{W}^{\sigma,\mathrm{SF}}_{ai}
++ \mathbf{R}^{\sigma,\Delta}_{ai},
+\qquad
+\mathbf{R}^{\sigma,\Delta} = \left(\mathbf{Q}^{\sigma,\Delta} - (\mathbf{Q}^{\sigma,\Delta})^{T}\right)_{\mathrm{vir}_{\sigma} \times \mathrm{occ}_{\sigma}}.
+$$
+
+其中 $\mathbf{Q}^{\sigma,\Delta} = \mathbf{Q}^{\sigma,\Delta,F} + \mathbf{Q}^{\sigma,\Delta,\mathrm{eri}}$ 是 Fock-like 和 HF exchange-like 的总 Q。
+
+→ **解释：** $\mathbf{W}^{\sigma,\mathrm{SF}}$ 是普通 SF-TDA 的 UCPHF RHS（来自 `dmzooa/dmzoob`、`dmt`、`get_jk`、`get_k` 等），与 `tduks_sf.py` 完全相同。SATDA 修正通过加上 $\mathbf{R}^{\sigma,\Delta}$ 完成。
+
+### Step 2: Z-vector 方程
+
+总 Z-vector 方程写为：
+
+$$
+\boxed{
+\mathcal{H}_{\mathrm{SCF}} \mathbf{Z} = -\mathbf{W}^{\mathrm{total}}.
+}
+$$
+
+→ **解释：** $\mathcal{H}_{\mathrm{SCF}}$ 是 SCF orbital Hessian（由 `mf.gen_response(hermi=1)` 提供）。所有 SATDA 修正只改变 RHS $\mathbf{W}$，不改变左端 Hessian。因此只需解一次 UCPHF。
+
+代码使用 `ucphf.solve` 求解（L946-950）：
+
+```python
+def fvind(z):
+    za = z[:nvira*nocca].reshape(nvira, nocca)
+    zb = z[nvira*nocca:].reshape(nvirb, noccb)
+    dma = orbva @ za @ orboa.T
+    dmb = orbvb @ zb @ orbob.T
+    dm1 = np.stack((dma + dma.T, dmb + dmb.T))
+    v1 = vresp(dm1)
+    return np.hstack((orbva.T @ v1[0] @ orboa).ravel(),
+                      (orbvb.T @ v1[1] @ orbob).ravel())
+
+z1a, z1b = ucphf.solve(fvind, mo_energy, mo_occ, (wvoa, wvob), ...)[0]
+```
+
+**注意：** 代码用 `_as_spin_unrestricted_reference(mf)` 将 ROKS/ROHF 转为 UKS/UHF 以适配 PySCF 的 UCPHF solver。ROKS→UKS 的 Hessian 等价性在 Li 等的 ROKS 梯度文献中已有论证。
+
+### Step 3: Z-density 和 relaxed potential
+
+Z-vector 解出后，构造 Z-density 并通过 response kernel 得到 relaxed potential：
+
+```python
+z1ao[0] = orbva @ z1a @ orboa.T
+z1ao[1] = orbvb @ z1b @ orbob.T
+veff = vresp(z1ao + z1ao.transpose(0,2,1))
+```
+
+→ **解释：** `veff` 是 Z-vector 诱导的 AO Fock response，将在 `im0` 和 `dmz1doo` 中使用。
+
+### Step 4: Overlap metric coefficient $B^{S}$
+
+定义总 MO coefficient derivative $\mathbf{M}$：
+
+$$
+M_{pq}
+= Q^{\mathrm{SF}}_{pq}
++ Q^{\Delta}_{pq}
++ Q^{Z}_{pq}.
+$$
+
+→ **解释：** $Q^{\mathrm{SF}}$ 由普通 SF 的 Fock + exchange 项给出（即 `veff0doo`、`veff0mo` 在 `im0` 中的贡献）；$Q^{\Delta} = Q^{\Delta,F} + Q^{\Delta,\mathrm{eri}}$ 是 SATDA 修正；$Q^{Z}$ 是 Z-vector Lagrangian 的 MO 系数导数（即 `veff` 和 `zeta` 项）。
+
+Z-vector 方程保证 $\mathbf{M}$ 在独立旋转空间中的反对称部分被消去。重叠导数的系数取对称部分：
+
+$$
+\boxed{
+B^{S}_{pq}
+= -\frac{1}{2}\left(M_{pq} + M_{qp}\right).
+}
+$$
+
+在 PySCF 的约定中，overlap metric 项以 `de -= s1 * im0` 实现，其中 `im0 = -B^{S}` 的 AO 表示。代码中（L958-989）：
+
+```python
+im0a[:nocca,:nocca]  = orboa.T @ (veff0doo[0] + veff[0]) @ orboa  + ...  # SF Fock
+im0a += (q_delta_a + q_delta_a.T) * 0.5                                     # SATDA Fock + ERI
+...
+im0a = mo_coeff[0] @ (im0a + zeta_a * dm1a) @ mo_coeff[0].T                # AO 转换
+im0 = im0a + im0b
+```
+
+→ **解释：** 关键行是 `im0a += (q_delta_a + q_delta_a.T) * 0.5` — 它直接把 SATDA 总 $\mathbf{Q}^{\Delta}$ 的对称部分加入 overlap coefficient。`zeta_a * dm1a` 项来自占据数和轨道能量的规范化修正。
+
+### Step 5: 总 overlap metric 贡献
+
+$$
+\boxed{
+\Omega_{S}^{[x]}
+= -\sum_{\mu\nu} I_{\mu\nu} S^{[x]}_{\mu\nu},
+\qquad
+I_{\mu\nu} = \sum_{pq} C_{\mu p} \, I^{\mathrm{MO}}_{pq} \, C_{\nu q},
+\qquad
+I^{\mathrm{MO}} = -B^{S}.
+}
+$$
+
+在 atom loop 中对应：
+
+```python
+de -= einsum('xpq,pq->x', s1[:,p0:p1], im0[p0:p1])
+de -= einsum('xqp,pq->x', s1[:,p0:p1], im0[:,p0:p1])
+```
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:grad_elec_hf_experimental()` L920-931（RHS 构造）、L935-950（Z-vector 求解）、L953-989（im0/overlap coefficient 构造）、L1031-1032（s1 收缩）。
+
+
+## 推导：最终梯度组合公式 — 2026-05-23
+
+**目标：** 将以上所有项汇总为 SATDA deltaS=-1 HF 解析梯度的最终公式。
+
+### Step 1: 总激发态能量
+
+$$
+E_{n} = E_{\mathrm{ref}} + \omega_{n},
+\qquad
+\omega_{n} = \mathbf{X}^{T}\mathbf{A}_{\mathrm{SATDA}}^{\mathrm{HF}}\mathbf{X}.
+$$
+
+### Step 2: 总 Lagrangian
+
+$$
+\mathcal{L}
+= E_{\mathrm{ref}}
++ \mathbf{X}^{T}\mathbf{A}_{\mathrm{SATDA}}^{\mathrm{HF}}\mathbf{X}
+- \omega(\mathbf{X}^{T}\mathbf{X} - 1)
++ \mathbf{Z}^{T}\mathbf{g}_{\mathrm{SCF}}
++ \sum_{pq} W_{pq}(S_{pq} - \delta_{pq}).
+$$
+
+### Step 3: 核坐标导数
+
+总能量对核坐标 $x$ 的导数分解为四项：
+
+$$
+\boxed{
+E_{n}^{[x]}
+= E_{\mathrm{ref}}^{[x]}
++ \Omega_{\mathrm{dir}}^{[x]}
++ \Omega_{Z}^{[x]}
++ \Omega_{S}^{[x]}.
+}
+$$
+
+各项展开为：
+
+**（A）参考态梯度：**
+
+$E_{\mathrm{ref}}^{[x]}$ 由 `mf.nuc_grad_method().grad_nuc(atmlst)` 计算（PySCF 的 ROHF/ROKS 解析梯度）。
+
+**（B）直接 skeleton derivative：**
+
+$$
+\Omega_{\mathrm{dir}}^{[x]}
+= \Omega_{\mathrm{Fock},h}^{[x]}
++ \Omega_{\mathrm{Fock},J}^{[x]}
++ \Omega_{\mathrm{Fock},K}^{[x]}
++ \Omega_{\mathrm{eri}}^{[x]}.
+$$
+
+其中前三项包含普通 SF Fock 和 SATDA Fock-like 修正，第四项包含普通 SF exchange 和 SATDA exchange-like 修正。
+
+**（C）Z-vector 直接项：**
+
+$$
+\Omega_{Z}^{[x]}
+= \mathbf{Z}^{T}\mathbf{g}_{\mathrm{SCF}}^{[x]}.
+$$
+
+→ **解释：** 该项由 `z1ao` 和 `veff` 参与 `im0` 和 `dmz1doo` 构造隐式地体现在 atom loop 中，不需要显式调用。
+
+**（D）Overlap metric 项：**
+
+$$
+\Omega_{S}^{[x]}
+= -\sum_{\mu\nu} I_{\mu\nu} S^{[x]}_{\mu\nu}.
+$$
+
+### Step 4: 代码入口
+
+```python
+def _kernel_analytic_experimental(self, xy, atmlst):
+    # 1. 内部能量检查
+    e_probe = _satda_hf_energy_for_orbs(self.base, xy, mf.mo_coeff, mf.mo_coeff)
+    # 2. 解析电子梯度（覆盖 direct + Z + overlap 三项）
+    de = grad_elec_hf_experimental(self, xy, atmlst=atmlst, ...)
+    # 3. 加核排斥梯度
+    de += self.base._scf.nuc_grad_method().grad_nuc(atmlst=atmlst)
+    return de
+```
+
+### Step 5: 总计算图
+
+```
+X_co, X_cv, X_oo, X_ov
+  │
+  ├─→ satda_fock_coefficients() ──→ 7 类 T 矩阵
+  │     ├─→ _add_fock_term() ──→ Q_F (projection)
+  │     ├─→ satda_fock_probe_densities() ──→ dm_probe_a/b (skeleton)
+  │     └─→ _add_fock_response_q() ──→ Q_F,resp
+  │
+  ├─→ _add_eri_term_q() × 9 ──→ Q_eri (4-projection)
+  │
+  └─→ _satda_delta_hf_exchange_direct_with_coeff() ──→ bilinear ERI [x]
+  
+  Q_F + Q_eri ──→ Q_delta ──→ Q - Q^T ──→ W_total ──→ UCPHF ──→ Z
+  Q_delta ──→ (Q + Q^T)/2 ──→ im0 (overlap)
+  dm_probe_a/b ──→ dmz1doo_direct ──→ skeleton
+```
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:grad_elec_hf_experimental()` L864-1046；`Gradients._kernel_analytic_experimental()` L1168-1194。

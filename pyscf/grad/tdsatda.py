@@ -14,21 +14,27 @@
 # limitations under the License.
 
 '''
-Finite-difference nuclear gradients for SA-SF-TDA.
+Nuclear gradients for SA-SF-TDA.
 
 This module provides the PySCF-style gradient interface for
-``pyscf.sftda.satda.SATDA``.  The analytical SA-SF-TDA gradient is not
-implemented here; the finite-difference backend is intended as a reference
-interface and validation tool.
+``pyscf.sftda.satda.SATDA``.  The finite-difference backend is kept as a
+reference interface and validation tool.  The HF ``deltaS=-1`` analytical path
+is a development implementation checked against finite differences in the
+regression tests.
 '''
+
+from dataclasses import dataclass
+from functools import reduce
 
 import numpy as np
 
+from pyscf import ao2mo
 from pyscf import dft
 from pyscf import lib
 from pyscf import scf
 from pyscf.grad import rhf as rhf_grad
 from pyscf.lib import logger
+from pyscf.scf import ucphf
 
 
 def _normalized_x(tdobj, root):
@@ -42,6 +48,615 @@ def _normalized_x(tdobj, root):
 def _amplitude_overlap(x_ref, tdobj, root):
     x = _normalized_x(tdobj, root)
     return abs(np.vdot(x_ref, x))
+
+
+@dataclass
+class SATDASFBlocks:
+    csidx: np.ndarray
+    osidx: np.ndarray
+    vsidx: np.ndarray
+    x_co: np.ndarray
+    x_cv: np.ndarray
+    x_oo: np.ndarray
+    x_ov: np.ndarray
+    si: float
+
+
+@dataclass
+class SATDAFockCoefficients:
+    '''Coefficient matrices for the HF-equivalent SATDA Fock-like terms.'''
+
+    t_s_cc: np.ndarray
+    t_s_vv: np.ndarray
+    t_s_cv: np.ndarray
+    t_b_vo: np.ndarray
+    t_b_co: np.ndarray
+    t_a_oc: np.ndarray
+    t_a_vo: np.ndarray
+    trace_oo: float
+    si: float
+
+
+def make_satda_sf_blocks(tdobj, xy):
+    if getattr(tdobj, 'deltaS', None) != -1:
+        raise NotImplementedError(
+            'The analytical SATDA gradient currently supports only deltaS=-1'
+        )
+
+    mf = tdobj._scf
+    mo_occ = mf.mo_occ
+    csidx = np.where(mo_occ == 2)[0]
+    osidx = np.where(mo_occ == 1)[0]
+    vsidx = np.where(mo_occ == 0)[0]
+    ncs = len(csidx)
+    nos = len(osidx)
+    x = np.asarray(xy[0])
+    if x.shape != (ncs + nos, nos + len(vsidx)):
+        raise ValueError(
+            'SATDA X amplitude shape %s incompatible with C/O/V dimensions '
+            '(%d, %d)' % (x.shape, ncs + nos, nos + len(vsidx))
+        )
+    return SATDASFBlocks(
+        csidx=csidx,
+        osidx=osidx,
+        vsidx=vsidx,
+        x_co=x[:ncs, :nos],
+        x_cv=x[:ncs, nos:],
+        x_oo=x[ncs:, :nos],
+        x_ov=x[ncs:, nos:],
+        si=(mf.mol.nelec[0] - mf.mol.nelec[1]) * 0.5,
+    )
+
+
+def _satda_orbitals(tdobj):
+    mf = tdobj._scf
+    mo_coeff = mf.mo_coeff
+    mo_occ = mf.mo_occ
+    csidx = np.where(mo_occ == 2)[0]
+    osidx = np.where(mo_occ == 1)[0]
+    vsidx = np.where(mo_occ == 0)[0]
+    orbcs = mo_coeff[:, csidx]
+    orbos = mo_coeff[:, osidx]
+    orbvs = mo_coeff[:, vsidx]
+    return csidx, osidx, vsidx, orbcs, orbos, orbvs
+
+
+def _mo_pair_dm(c_left, mat, c_right):
+    '''AO matrix for a general MO pair coefficient matrix.'''
+    return c_left @ mat @ c_right.conj().T
+
+
+def _hybrid_coefficients(mf):
+    if isinstance(mf, dft.KohnShamDFT):
+        omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, mf.mol.spin)
+        hybrid = mf._numint.libxc.is_hybrid_xc(mf.xc)
+        return hybrid, hyb, omega, alpha
+    return True, 1.0, 0.0, 0.0
+
+
+def satda_fock_coefficients(tdobj, xy):
+    '''Build coefficient matrices for the HF-equivalent SATDA Fock terms.'''
+    b = make_satda_sf_blocks(tdobj, xy)
+    si = b.si
+    if si <= 0.5:
+        raise NotImplementedError('SATDA spin adaptation requires Si > 1/2')
+
+    tr_oo = float(np.trace(b.x_oo))
+    eta = np.sqrt((2 * si + 1) / (2 * si)) - 1
+    gamma = np.sqrt((2 * si + 1) / (2 * si - 1))
+    zeta = np.sqrt(2 * si / (2 * si - 1)) - 1
+    chi = 1.0 / np.sqrt(2 * si * (2 * si - 1))
+
+    t_s_cc = (
+        lib.einsum('ia,ja->ji', b.x_cv, b.x_cv) / si
+        + lib.einsum('iu,ju->ji', b.x_co, b.x_co) * 2 / (2 * si - 1)
+    )
+    t_s_vv = (
+        lib.einsum('ia,ib->ab', b.x_cv, b.x_cv) / si
+        + lib.einsum('ua,ub->ab', b.x_ov, b.x_ov) * 2 / (2 * si - 1)
+    )
+    t_s_cv = (gamma * (1 + 1 / si)) * tr_oo * b.x_cv
+
+    t_b_vo = (
+        2 * eta * lib.einsum('ia,iv->av', b.x_cv, b.x_co)
+        + 2 * zeta * lib.einsum('ua,uv->av', b.x_ov, b.x_oo)
+    )
+    t_b_co = 2 * chi * tr_oo * b.x_co
+
+    t_a_oc = (
+        -2 * eta * lib.einsum('ia,va->vi', b.x_cv, b.x_ov)
+        - 2 * zeta * lib.einsum('iu,vu->vi', b.x_co, b.x_oo)
+    )
+    t_a_vo = -2 * chi * tr_oo * b.x_ov.T
+
+    return SATDAFockCoefficients(
+        t_s_cc=t_s_cc,
+        t_s_vv=t_s_vv,
+        t_s_cv=t_s_cv,
+        t_b_vo=t_b_vo,
+        t_b_co=t_b_co,
+        t_a_oc=t_a_oc,
+        t_a_vo=t_a_vo,
+        trace_oo=tr_oo,
+        si=si,
+    )
+
+
+def satda_fock_probe_densities(tdobj, xy):
+    '''Return AO probe densities for the HF-equivalent Fock-like terms.'''
+    coeff = satda_fock_coefficients(tdobj, xy)
+    _, _, _, orbcs, orbos, orbvs = _satda_orbitals(tdobj)
+
+    dm_s = np.zeros((tdobj.mol.nao, tdobj.mol.nao))
+    dm_s += _mo_pair_dm(orbcs, coeff.t_s_cc, orbcs)
+    dm_s += _mo_pair_dm(orbvs, coeff.t_s_vv, orbvs)
+    dm_s += _mo_pair_dm(orbcs, coeff.t_s_cv, orbvs)
+
+    dm_b = np.zeros_like(dm_s)
+    dm_b += _mo_pair_dm(orbvs, coeff.t_b_vo, orbos)
+    dm_b += _mo_pair_dm(orbcs, coeff.t_b_co, orbos)
+
+    dm_a = np.zeros_like(dm_s)
+    dm_a += _mo_pair_dm(orbos, coeff.t_a_oc, orbcs)
+    dm_a += _mo_pair_dm(orbvs, coeff.t_a_vo, orbos)
+
+    return dm_a - 0.5 * dm_s, dm_b + 0.5 * dm_s
+
+
+def _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, left_idx, right_idx, coeff_mat, spin):
+    coeff_mat = np.asarray(coeff_mat)
+    if coeff_mat.size == 0:
+        return
+
+    left_idx = np.asarray(left_idx)
+    right_idx = np.asarray(right_idx)
+    c_left = mo_coeff[:, left_idx]
+    c_right = mo_coeff[:, right_idx]
+    dm = _mo_pair_dm(c_left, coeff_mat, c_right)
+
+    def add_projection(q, fock_mo, scale):
+        if scale == 0:
+            return
+        q[:, left_idx] += scale * (fock_mo[:, right_idx] @ coeff_mat.T)
+        q[:, right_idx] += scale * (fock_mo[:, left_idx] @ coeff_mat)
+
+    if spin == 'alpha':
+        add_projection(q_alpha, focka_mo, 1.0)
+        p_alpha += dm
+    elif spin == 'beta':
+        add_projection(q_beta, fockb_mo, 1.0)
+        p_beta += dm
+    elif spin == 'spin':
+        add_projection(q_beta, fockb_mo, 0.5)
+        add_projection(q_alpha, focka_mo, -0.5)
+        p_beta += 0.5 * dm
+        p_alpha -= 0.5 * dm
+    else:
+        raise ValueError('Unknown Fock term spin label %s' % spin)
+
+
+def _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta):
+    '''Add HF Fock-density response contribution to Q_alpha/Q_beta.'''
+    mf = tdobj._scf
+    mol = mf.mol
+    mo_coeff = mf.mo_coeff
+    mo_occ = mf.mo_occ
+    occidxa = np.where(mo_occ > 0)[0]
+    occidxb = np.where(mo_occ == 2)[0]
+
+    p_tot = p_alpha + p_beta
+    vj = mf.get_j(mol, p_tot.T, hermi=0)
+    vk_a = mf.get_k(mol, p_alpha.T, hermi=0)
+    vk_b = mf.get_k(mol, p_beta.T, hermi=0)
+    va = vj - vk_a
+    vb = vj - vk_b
+    q_alpha[:, occidxa] += mo_coeff.conj().T @ (va + va.T) @ mo_coeff[:, occidxa]
+    q_beta[:, occidxb] += mo_coeff.conj().T @ (vb + vb.T) @ mo_coeff[:, occidxb]
+
+
+def satda_delta_fock_q(tdobj, xy, with_response=True):
+    '''Unconstrained MO coefficient derivative Q for Fock-like terms.'''
+    mf = tdobj._scf
+    mo_coeff = mf.mo_coeff
+    nmo = mo_coeff.shape[1]
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+    p_alpha = np.zeros((mf.mol.nao, mf.mol.nao))
+    p_beta = np.zeros_like(p_alpha)
+
+    coeff = satda_fock_coefficients(tdobj, xy)
+    csidx, osidx, vsidx, _, _, _ = _satda_orbitals(tdobj)
+    fock = mf.get_fock()
+    focka_mo = mo_coeff.conj().T @ fock.focka @ mo_coeff
+    fockb_mo = mo_coeff.conj().T @ fock.fockb @ mo_coeff
+
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, csidx, csidx,
+                   coeff.t_s_cc, 'spin')
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, vsidx, vsidx,
+                   coeff.t_s_vv, 'spin')
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, csidx, vsidx,
+                   coeff.t_s_cv, 'spin')
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, vsidx, osidx,
+                   coeff.t_b_vo, 'beta')
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, csidx, osidx,
+                   coeff.t_b_co, 'beta')
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, osidx, csidx,
+                   coeff.t_a_oc, 'alpha')
+    _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
+                   focka_mo, fockb_mo, vsidx, osidx,
+                   coeff.t_a_vo, 'alpha')
+
+    if with_response:
+        _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta)
+    return q_alpha, q_beta
+
+
+def _satda_hf_exchange_energy_with_coeff(tdobj, xy, coeff, omega=None):
+    mf = tdobj._scf
+    mol = mf.mol
+    b = make_satda_sf_blocks(tdobj, xy)
+    si = b.si
+    if si <= 0.5:
+        raise NotImplementedError('SATDA spin adaptation requires Si > 1/2')
+    _, _, _, orbcs, orbos, orbvs = _satda_orbitals(tdobj)
+
+    eta = np.sqrt((2 * si + 1) / (2 * si)) - 1
+    gamma = np.sqrt((2 * si + 1) / (2 * si - 1))
+    zeta = np.sqrt(2 * si / (2 * si - 1)) - 1
+
+    def general(orbs):
+        if omega is None or omega == 0:
+            return ao2mo.general(mol, orbs, compact=False)
+        with mol.with_range_coulomb(omega):
+            return ao2mo.general(mol, orbs, compact=False)
+
+    e = 0.0
+    eri = general([orbos, orbcs, orbcs, orbos]).reshape(
+        len(b.osidx), len(b.csidx), len(b.csidx), len(b.osidx)
+    )
+    e -= lib.einsum('iu,jv,uijv', b.x_co, b.x_co, eri) * coeff / (2 * si - 1)
+
+    eri = general([orbvs, orbos, orbos, orbvs]).reshape(
+        len(b.vsidx), len(b.osidx), len(b.osidx), len(b.vsidx)
+    )
+    e -= lib.einsum('ua,vb,auvb', b.x_ov, b.x_ov, eri) * coeff / (2 * si - 1)
+
+    eri = general([orbvs, orbos, orbcs, orbcs]).reshape(
+        len(b.vsidx), len(b.osidx), len(b.csidx), len(b.csidx)
+    )
+    e -= 2 * coeff * eta * lib.einsum('ia,jv,avji', b.x_cv, b.x_co, eri)
+
+    eri = general([orbvs, orbvs, orbos, orbcs]).reshape(
+        len(b.vsidx), len(b.vsidx), len(b.osidx), len(b.csidx)
+    )
+    e -= 2 * coeff * eta * lib.einsum('ia,vb,abvi', b.x_cv, b.x_ov, eri)
+
+    eri1 = general([orbos, orbcs, orbos, orbvs]).reshape(
+        len(b.osidx), len(b.csidx), len(b.osidx), len(b.vsidx)
+    )
+    eri2 = general([orbos, orbvs, orbos, orbcs]).reshape(
+        len(b.osidx), len(b.vsidx), len(b.osidx), len(b.csidx)
+    )
+    e += 2 * coeff * lib.einsum('iu,vb,uivb', b.x_co, b.x_ov, eri1) / (2 * si - 1)
+    e -= 2 * coeff * lib.einsum('iu,vb,ubvi', b.x_co, b.x_ov, eri2) / (2 * si - 1)
+
+    eri = general([orbvs, orbos, orbos, orbcs]).reshape(
+        len(b.vsidx), len(b.osidx), len(b.osidx), len(b.csidx)
+    )
+    e -= 2 * coeff * (gamma - 1) * lib.einsum('ia,wv,avwi', b.x_cv, b.x_oo, eri)
+
+    eri = general([orbos, orbos, orbos, orbcs]).reshape(
+        len(b.osidx), len(b.osidx), len(b.osidx), len(b.csidx)
+    )
+    e -= 2 * coeff * zeta * lib.einsum('iu,wv,uvwi', b.x_co, b.x_oo, eri)
+
+    eri = general([orbvs, orbos, orbos, orbos]).reshape(
+        len(b.vsidx), len(b.osidx), len(b.osidx), len(b.osidx)
+    )
+    e -= 2 * coeff * zeta * lib.einsum('ua,wv,avwu', b.x_ov, b.x_oo, eri)
+    return float(e)
+
+
+def satda_hf_exchange_coefficient_energy(tdobj, xy):
+    mf = tdobj._scf
+    hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
+    if not hybrid:
+        return 0.0
+    e = _satda_hf_exchange_energy_with_coeff(tdobj, xy, hyb)
+    if omega != 0:
+        e += _satda_hf_exchange_energy_with_coeff(
+            tdobj, xy, alpha - hyb, omega=omega
+        )
+    return e
+
+
+def _add_eri_term_q(tdobj, q_alpha, q_beta, orb_sets, idx_sets,
+                    spin_sets, coeff_tensor, scale=1.0, omega=None):
+    coeff_tensor = np.asarray(coeff_tensor)
+    if coeff_tensor.size == 0 or scale == 0:
+        return
+
+    mol = tdobj._scf.mol
+    mo_coeff = tdobj._scf.mo_coeff
+    nmo = mo_coeff.shape[1]
+    dims = coeff_tensor.shape
+
+    def general(orbs):
+        if omega is None or omega == 0:
+            return ao2mo.general(mol, orbs, compact=False)
+        with mol.with_range_coulomb(omega):
+            return ao2mo.general(mol, orbs, compact=False)
+
+    for pos in range(4):
+        orbs = list(orb_sets)
+        orbs[pos] = mo_coeff
+        eri = general(orbs).reshape(
+            *(dims[:pos] + (nmo,) + dims[pos + 1:])
+        )
+        if pos == 0:
+            contrib = lib.einsum('pqtu,rqtu->rp', coeff_tensor, eri) * scale
+        elif pos == 1:
+            contrib = lib.einsum('pqtu,prtu->rq', coeff_tensor, eri) * scale
+        elif pos == 2:
+            contrib = lib.einsum('pqtu,pqru->rt', coeff_tensor, eri) * scale
+        else:
+            contrib = lib.einsum('pqtu,pqtr->ru', coeff_tensor, eri) * scale
+
+        target = q_alpha if spin_sets[pos] == 'alpha' else q_beta
+        target[:, idx_sets[pos]] += contrib
+
+
+def _satda_delta_hf_exchange_q_with_coeff(tdobj, xy, coeff=1.0, omega=None):
+    mf = tdobj._scf
+    b = make_satda_sf_blocks(tdobj, xy)
+    si = b.si
+    if si <= 0.5:
+        raise NotImplementedError('SATDA spin adaptation requires Si > 1/2')
+
+    csidx, osidx, vsidx, orbcs, orbos, orbvs = _satda_orbitals(tdobj)
+    nmo = mf.mo_coeff.shape[1]
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+
+    eta = np.sqrt((2 * si + 1) / (2 * si)) - 1
+    gamma = np.sqrt((2 * si + 1) / (2 * si - 1))
+    zeta = np.sqrt(2 * si / (2 * si - 1)) - 1
+
+    def add(orb_sets, idx_sets, spin_sets, tensor, scale):
+        _add_eri_term_q(tdobj, q_alpha, q_beta, orb_sets, idx_sets,
+                        spin_sets, tensor, scale=coeff * scale, omega=omega)
+
+    add((orbos, orbcs, orbcs, orbos),
+        (osidx, csidx, csidx, osidx),
+        ('beta', 'alpha', 'alpha', 'beta'),
+        lib.einsum('iu,jv->uijv', b.x_co, b.x_co),
+        -1.0 / (2 * si - 1))
+
+    add((orbvs, orbos, orbos, orbvs),
+        (vsidx, osidx, osidx, vsidx),
+        ('beta', 'beta', 'beta', 'beta'),
+        lib.einsum('ua,vb->auvb', b.x_ov, b.x_ov),
+        -1.0 / (2 * si - 1))
+
+    add((orbvs, orbos, orbcs, orbcs),
+        (vsidx, osidx, csidx, csidx),
+        ('beta', 'beta', 'alpha', 'alpha'),
+        lib.einsum('ia,jv->avji', b.x_cv, b.x_co),
+        -2 * eta)
+
+    add((orbvs, orbvs, orbos, orbcs),
+        (vsidx, vsidx, osidx, csidx),
+        ('beta', 'beta', 'beta', 'alpha'),
+        lib.einsum('ia,vb->abvi', b.x_cv, b.x_ov),
+        -2 * eta)
+
+    add((orbos, orbcs, orbos, orbvs),
+        (osidx, csidx, osidx, vsidx),
+        ('beta', 'alpha', 'beta', 'beta'),
+        lib.einsum('iu,vb->uivb', b.x_co, b.x_ov),
+        2.0 / (2 * si - 1))
+
+    add((orbos, orbvs, orbos, orbcs),
+        (osidx, vsidx, osidx, csidx),
+        ('beta', 'beta', 'beta', 'alpha'),
+        lib.einsum('iu,vb->ubvi', b.x_co, b.x_ov),
+        -2.0 / (2 * si - 1))
+
+    add((orbvs, orbos, orbos, orbcs),
+        (vsidx, osidx, osidx, csidx),
+        ('beta', 'beta', 'beta', 'alpha'),
+        lib.einsum('ia,wv->avwi', b.x_cv, b.x_oo),
+        -2 * (gamma - 1))
+
+    add((orbos, orbos, orbos, orbcs),
+        (osidx, osidx, osidx, csidx),
+        ('beta', 'beta', 'beta', 'alpha'),
+        lib.einsum('iu,wv->uvwi', b.x_co, b.x_oo),
+        -2 * zeta)
+
+    add((orbvs, orbos, orbos, orbos),
+        (vsidx, osidx, osidx, osidx),
+        ('beta', 'beta', 'beta', 'beta'),
+        lib.einsum('ua,wv->avwu', b.x_ov, b.x_oo),
+        -2 * zeta)
+    return q_alpha, q_beta
+
+
+def satda_delta_hf_exchange_q(tdobj, xy):
+    '''Unconstrained MO coefficient derivative Q for HF exchange-like terms.'''
+    mf = tdobj._scf
+    hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
+    nmo = mf.mo_coeff.shape[1]
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+    if not hybrid:
+        return q_alpha, q_beta
+
+    qa, qb = _satda_delta_hf_exchange_q_with_coeff(tdobj, xy, hyb)
+    q_alpha += qa
+    q_beta += qb
+    if omega != 0:
+        qa, qb = _satda_delta_hf_exchange_q_with_coeff(
+            tdobj, xy, alpha - hyb, omega=omega
+        )
+        q_alpha += qa
+        q_beta += qb
+    return q_alpha, q_beta
+
+
+def satda_delta_q(tdobj, xy, include_fock=True, include_hf=True,
+                  fock_response=True):
+    '''Full unconstrained MO derivative Q for the HF-equivalent SATDA terms.'''
+    mf = tdobj._scf
+    nmo = mf.mo_coeff.shape[1]
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+
+    if include_fock:
+        qa, qb = satda_delta_fock_q(tdobj, xy, with_response=fock_response)
+        q_alpha += qa
+        q_beta += qb
+    if include_hf:
+        qa, qb = satda_delta_hf_exchange_q(tdobj, xy)
+        q_alpha += qa
+        q_beta += qb
+    return q_alpha, q_beta
+
+
+def _satda_hf_fock_for_orbs(tdobj, mo_coeff_alpha, mo_coeff_beta):
+    '''HF alpha/beta Fock matrices for spin-separated orbital probes.'''
+    mf = tdobj._scf
+    mol = mf.mol
+    mo_occ = mf.mo_occ
+    occa = mo_occ > 0
+    occb = mo_occ == 2
+    dm_a = mo_coeff_alpha[:, occa] @ mo_coeff_alpha[:, occa].conj().T
+    dm_b = mo_coeff_beta[:, occb] @ mo_coeff_beta[:, occb].conj().T
+    hcore = mf.get_hcore()
+    vj, vk = mf.get_jk(mol, (dm_a, dm_b), hermi=0)
+    focka = hcore + vj[0] + vj[1] - vk[0]
+    fockb = hcore + vj[0] + vj[1] - vk[1]
+    return focka, fockb
+
+
+def _satda_hf_energy_for_orbs(tdobj, xy, mo_coeff_alpha, mo_coeff_beta,
+                              include_delta=True):
+    '''HF Rayleigh quotient in the SF-base plus spin-adaptation form.'''
+    mf = tdobj._scf
+    mol = mf.mol
+    mo_occ = mf.mo_occ
+    b = make_satda_sf_blocks(tdobj, xy)
+    si = b.si
+    if si <= 0.5:
+        raise NotImplementedError('SATDA spin adaptation requires Si > 1/2')
+
+    csidx = b.csidx
+    osidx = b.osidx
+    vsidx = b.vsidx
+    ncs = len(csidx)
+    nos = len(osidx)
+    nvs = len(vsidx)
+
+    ca_c = mo_coeff_alpha[:, csidx]
+    ca_o = mo_coeff_alpha[:, osidx]
+    ca_v = mo_coeff_alpha[:, vsidx]
+    cb_c = mo_coeff_beta[:, csidx]
+    cb_o = mo_coeff_beta[:, osidx]
+    cb_v = mo_coeff_beta[:, vsidx]
+    orboa = np.hstack((ca_c, ca_o))
+    orbvb = np.hstack((cb_o, cb_v))
+
+    focka, fockb = _satda_hf_fock_for_orbs(
+        tdobj, mo_coeff_alpha, mo_coeff_beta
+    )
+    x = np.asarray(xy[0])
+
+    fockv = orbvb.conj().T @ fockb @ orbvb
+    focko = orboa.conj().T @ focka @ orboa
+    e = lib.einsum('ia,ab,ib', x, fockv, x)
+    e -= lib.einsum('ia,ji,ja', x, focko, x)
+
+    eri = ao2mo.general(mol, [orboa, orboa, orbvb, orbvb], compact=False)
+    eri = eri.reshape(ncs + nos, ncs + nos, nos + nvs, nos + nvs)
+    e -= lib.einsum('ia,jb,ijba', x, x, eri)
+    if not include_delta:
+        return float(e)
+
+    x_co = b.x_co
+    x_cv = b.x_cv
+    x_oo = b.x_oo
+    x_ov = b.x_ov
+    tr_oo = np.trace(x_oo)
+    eta = np.sqrt((2 * si + 1) / (2 * si)) - 1
+    gamma = np.sqrt((2 * si + 1) / (2 * si - 1))
+    zeta = np.sqrt(2 * si / (2 * si - 1)) - 1
+    chi = 1.0 / np.sqrt(2 * si * (2 * si - 1))
+
+    focks_cc = 0.5 * (cb_c.conj().T @ fockb @ cb_c
+                      - ca_c.conj().T @ focka @ ca_c)
+    focks_vv = 0.5 * (cb_v.conj().T @ fockb @ cb_v
+                      - ca_v.conj().T @ focka @ ca_v)
+    focks_cv = 0.5 * (cb_c.conj().T @ fockb @ cb_v
+                      - ca_c.conj().T @ focka @ ca_v)
+    fockb_vo = cb_v.conj().T @ fockb @ cb_o
+    fockb_co = cb_c.conj().T @ fockb @ cb_o
+    focka_oc = ca_o.conj().T @ focka @ ca_c
+    focka_vo = ca_v.conj().T @ focka @ ca_o
+
+    e += lib.einsum('ia,ja,ji', x_cv, x_cv, focks_cc) / si
+    e += lib.einsum('ia,ib,ab', x_cv, x_cv, focks_vv) / si
+    e += lib.einsum('iu,ju,ji', x_co, x_co, focks_cc) * 2 / (2 * si - 1)
+    e += lib.einsum('ua,ub,ab', x_ov, x_ov, focks_vv) * 2 / (2 * si - 1)
+    e += 2 * eta * lib.einsum('ia,iv,av', x_cv, x_co, fockb_vo)
+    e -= 2 * eta * lib.einsum('ia,va,vi', x_cv, x_ov, focka_oc)
+    e += gamma * (1 + 1 / si) * tr_oo * lib.einsum('ia,ia', x_cv, focks_cv)
+    e += 2 * chi * tr_oo * lib.einsum('iu,iu', x_co, fockb_co)
+    e -= 2 * zeta * lib.einsum('iu,vu,vi', x_co, x_oo, focka_oc)
+    e -= 2 * chi * tr_oo * lib.einsum('ua,au', x_ov, focka_vo)
+    e += 2 * zeta * lib.einsum('ua,uv,av', x_ov, x_oo, fockb_vo)
+
+    eri = ao2mo.general(mol, [cb_o, ca_c, ca_c, cb_o], compact=False)
+    eri = eri.reshape(nos, ncs, ncs, nos)
+    e -= lib.einsum('iu,jv,uijv', x_co, x_co, eri) / (2 * si - 1)
+
+    eri = ao2mo.general(mol, [cb_v, cb_o, cb_o, cb_v], compact=False)
+    eri = eri.reshape(nvs, nos, nos, nvs)
+    e -= lib.einsum('ua,vb,auvb', x_ov, x_ov, eri) / (2 * si - 1)
+
+    eri = ao2mo.general(mol, [cb_v, cb_o, ca_c, ca_c], compact=False)
+    eri = eri.reshape(nvs, nos, ncs, ncs)
+    e -= 2 * eta * lib.einsum('ia,jv,avji', x_cv, x_co, eri)
+
+    eri = ao2mo.general(mol, [cb_v, cb_v, cb_o, ca_c], compact=False)
+    eri = eri.reshape(nvs, nvs, nos, ncs)
+    e -= 2 * eta * lib.einsum('ia,vb,abvi', x_cv, x_ov, eri)
+
+    eri1 = ao2mo.general(mol, [cb_o, ca_c, cb_o, cb_v], compact=False)
+    eri1 = eri1.reshape(nos, ncs, nos, nvs)
+    eri2 = ao2mo.general(mol, [cb_o, cb_v, cb_o, ca_c], compact=False)
+    eri2 = eri2.reshape(nos, nvs, nos, ncs)
+    e += 2 * lib.einsum('iu,vb,uivb', x_co, x_ov, eri1) / (2 * si - 1)
+    e -= 2 * lib.einsum('iu,vb,ubvi', x_co, x_ov, eri2) / (2 * si - 1)
+
+    eri = ao2mo.general(mol, [cb_v, cb_o, cb_o, ca_c], compact=False)
+    eri = eri.reshape(nvs, nos, nos, ncs)
+    e -= 2 * (gamma - 1) * lib.einsum('ia,wv,avwi', x_cv, x_oo, eri)
+
+    eri = ao2mo.general(mol, [cb_o, cb_o, cb_o, ca_c], compact=False)
+    eri = eri.reshape(nos, nos, nos, ncs)
+    e -= 2 * zeta * lib.einsum('iu,wv,uvwi', x_co, x_oo, eri)
+
+    eri = ao2mo.general(mol, [cb_v, cb_o, cb_o, cb_o], compact=False)
+    eri = eri.reshape(nvs, nos, nos, nos)
+    e -= 2 * zeta * lib.einsum('ua,wv,avwu', x_ov, x_oo, eri)
+    return float(e)
 
 
 def _copy_scf_settings(mf_ref, mf):
@@ -75,8 +690,364 @@ def _make_displaced_mf(mf_ref, mol):
     return _copy_scf_settings(mf_ref, mf)
 
 
+def _as_spin_unrestricted_reference(mf_ref):
+    if isinstance(mf_ref, dft.KohnShamDFT):
+        mf = mf_ref.to_uks()
+    else:
+        mf = mf_ref.to_uhf()
+    mf.verbose = 0
+    return mf
+
+
+def _as_dm_stack(dm):
+    dm = np.asarray(dm)
+    if dm.ndim == 2:
+        dm = dm.reshape(1, *dm.shape)
+    return dm
+
+
+def _as_v1_stack(v1):
+    v1 = np.asarray(v1)
+    if v1.ndim == 3:
+        v1 = v1.reshape(1, *v1.shape)
+    return v1
+
+
+def _add_j_bilinear_ip1(de, td_grad, mol, dm_l, dm_r, atmlst, offsetdic,
+                        scale=1.0, omega=None):
+    '''Add direct ERI derivative for scale * sum L[pq] R[tu] (pq|tu).'''
+    if scale == 0:
+        return
+
+    dm_l = _as_dm_stack(dm_l)
+    dm_r = _as_dm_stack(dm_r)
+    if len(dm_l) != len(dm_r):
+        raise ValueError('Bilinear density stacks have different lengths')
+    if len(dm_l) == 0 or not np.any(dm_l) or not np.any(dm_r):
+        return
+
+    vj_r = _as_v1_stack(td_grad.get_j(mol, dm_r, hermi=0, omega=omega))
+    vj_l = _as_v1_stack(td_grad.get_j(mol, dm_l, hermi=0, omega=omega))
+
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+        term = lib.einsum('nxpq,npq->x', vj_r[:, :, p0:p1], dm_l[:, p0:p1])
+        term += lib.einsum('nxpq,nqp->x', vj_r[:, :, p0:p1], dm_l[:, :, p0:p1])
+        term += lib.einsum('nxpq,npq->x', vj_l[:, :, p0:p1], dm_r[:, p0:p1])
+        term += lib.einsum('nxpq,nqp->x', vj_l[:, :, p0:p1], dm_r[:, :, p0:p1])
+        de[k] += scale * term
+
+
+def _add_j_bilinear_ip1_batches(de, td_grad, mol, dm_l, dm_r, atmlst,
+                                offsetdic, scale=1.0, omega=None,
+                                blksize=64):
+    if not dm_l:
+        return
+    for p0 in range(0, len(dm_l), blksize):
+        p1 = min(p0 + blksize, len(dm_l))
+        _add_j_bilinear_ip1(
+            de, td_grad, mol, np.asarray(dm_l[p0:p1]),
+            np.asarray(dm_r[p0:p1]), atmlst, offsetdic,
+            scale=scale, omega=omega,
+        )
+
+
+def _satda_delta_hf_exchange_direct_with_coeff(
+        de, td_grad, tdobj, xy, atmlst, offsetdic, coeff=1.0, omega=None):
+    '''Direct AO ERI derivative for the HF exchange-like SATDA terms.'''
+    b = make_satda_sf_blocks(tdobj, xy)
+    si = b.si
+    if si <= 0.5:
+        raise NotImplementedError('SATDA spin adaptation requires Si > 1/2')
+
+    mol = td_grad.mol
+    _, _, _, orbcs, orbos, orbvs = _satda_orbitals(tdobj)
+    ncs = len(b.csidx)
+    nos = len(b.osidx)
+
+    eta = np.sqrt((2 * si + 1) / (2 * si)) - 1
+    gamma = np.sqrt((2 * si + 1) / (2 * si - 1))
+    zeta = np.sqrt(2 * si / (2 * si - 1)) - 1
+
+    def add(dm_l, dm_r, scale):
+        _add_j_bilinear_ip1(
+            de, td_grad, mol, dm_l, dm_r, atmlst, offsetdic,
+            scale=coeff * scale, omega=omega,
+        )
+
+    def add_batches(dm_l, dm_r, scale):
+        _add_j_bilinear_ip1_batches(
+            de, td_grad, mol, dm_l, dm_r, atmlst, offsetdic,
+            scale=coeff * scale, omega=omega,
+        )
+
+    add(_mo_pair_dm(orbos, b.x_co.T, orbcs),
+        _mo_pair_dm(orbcs, b.x_co, orbos),
+        -1.0 / (2 * si - 1))
+
+    add(_mo_pair_dm(orbvs, b.x_ov.T, orbos),
+        _mo_pair_dm(orbos, b.x_ov, orbvs),
+        -1.0 / (2 * si - 1))
+
+    dm_l = []
+    dm_r = []
+    for i in range(ncs):
+        for j in range(ncs):
+            dm_l.append(_mo_pair_dm(orbvs, np.outer(b.x_cv[i], b.x_co[j]), orbos))
+            dm_r.append(np.outer(orbcs[:, j], orbcs[:, i].conj()))
+    add_batches(dm_l, dm_r, -2 * eta)
+
+    dm_l = []
+    dm_r = []
+    for i in range(ncs):
+        for v in range(nos):
+            dm_l.append(_mo_pair_dm(orbvs, np.outer(b.x_cv[i], b.x_ov[v]), orbvs))
+            dm_r.append(np.outer(orbos[:, v], orbcs[:, i].conj()))
+    add_batches(dm_l, dm_r, -2 * eta)
+
+    add(_mo_pair_dm(orbos, b.x_co.T, orbcs),
+        _mo_pair_dm(orbos, b.x_ov, orbvs),
+        2.0 / (2 * si - 1))
+
+    dm_l = []
+    dm_r = []
+    for i in range(ncs):
+        for v in range(nos):
+            dm_l.append(_mo_pair_dm(orbos, np.outer(b.x_co[i], b.x_ov[v]), orbvs))
+            dm_r.append(np.outer(orbos[:, v], orbcs[:, i].conj()))
+    add_batches(dm_l, dm_r, -2.0 / (2 * si - 1))
+
+    dm_l = []
+    dm_r = []
+    for i in range(ncs):
+        for w in range(nos):
+            dm_l.append(_mo_pair_dm(orbvs, np.outer(b.x_cv[i], b.x_oo[w]), orbos))
+            dm_r.append(np.outer(orbos[:, w], orbcs[:, i].conj()))
+    add_batches(dm_l, dm_r, -2 * (gamma - 1))
+
+    dm_l = []
+    dm_r = []
+    for i in range(ncs):
+        for w in range(nos):
+            dm_l.append(_mo_pair_dm(orbos, np.outer(b.x_co[i], b.x_oo[w]), orbos))
+            dm_r.append(np.outer(orbos[:, w], orbcs[:, i].conj()))
+    add_batches(dm_l, dm_r, -2 * zeta)
+
+    dm_l = []
+    dm_r = []
+    for u in range(nos):
+        for w in range(nos):
+            dm_l.append(_mo_pair_dm(orbvs, np.outer(b.x_ov[u], b.x_oo[w]), orbos))
+            dm_r.append(np.outer(orbos[:, w], orbos[:, u].conj()))
+    add_batches(dm_l, dm_r, -2 * zeta)
+
+
+def satda_delta_hf_exchange_direct_de(td_grad, tdobj, xy, atmlst, offsetdic):
+    '''Direct AO ERI derivative for all HF exchange-like SATDA blocks.'''
+    mf = tdobj._scf
+    hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
+    de = np.zeros((len(tuple(atmlst)), 3))
+    if not hybrid:
+        return de
+
+    _satda_delta_hf_exchange_direct_with_coeff(
+        de, td_grad, tdobj, xy, atmlst, offsetdic, coeff=hyb
+    )
+    if omega != 0:
+        _satda_delta_hf_exchange_direct_with_coeff(
+            de, td_grad, tdobj, xy, atmlst, offsetdic,
+            coeff=alpha - hyb, omega=omega,
+        )
+    return de
+
+
+def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
+                              max_memory=2000, verbose=logger.INFO):
+    '''HF-only electronic gradient for SATDA deltaS=-1.
+
+    The implementation uses the HF equivalence between the new ROKS-native
+    SATDA sigma vector and the older SF-base plus spin-adaptation decomposition.
+    The orbital response is solved once in a spin-unrestricted CPHF layout.
+    '''
+    log = logger.new_logger(td_grad, verbose)
+    time0 = logger.process_clock(), logger.perf_counter()
+
+    mol = td_grad.mol
+    tdobj = td_grad.base
+    mf = _as_spin_unrestricted_reference(tdobj._scf)
+
+    mo_coeff = mf.mo_coeff
+    mo_energy = mf.mo_energy
+    mo_occ = mf.mo_occ
+    occidxa = np.where(mo_occ[0] > 0)[0]
+    occidxb = np.where(mo_occ[1] > 0)[0]
+    viridxa = np.where(mo_occ[0] == 0)[0]
+    viridxb = np.where(mo_occ[1] == 0)[0]
+    nocca = len(occidxa)
+    noccb = len(occidxb)
+    nvira = len(viridxa)
+    nvirb = len(viridxb)
+    orboa = mo_coeff[0][:, occidxa]
+    orbob = mo_coeff[1][:, occidxb]
+    orbva = mo_coeff[0][:, viridxa]
+    orbvb = mo_coeff[1][:, viridxb]
+    nao = mo_coeff[0].shape[0]
+    nmoa = nocca + nvira
+    nmob = noccb + nvirb
+
+    x = np.asarray(x_y[0])
+    y = np.zeros((noccb, nvira))
+
+    dvva = lib.einsum('ia,ib->ab', y, y)
+    dvvb = lib.einsum('ia,ib->ab', x, x)
+    dooa = -lib.einsum('ia,ja->ij', x, x)
+    doob = -lib.einsum('ia,ja->ij', y, y)
+
+    dmzooa = reduce(np.dot, (orboa, dooa, orboa.T))
+    dmzooa += reduce(np.dot, (orbva, dvva, orbva.T))
+    dmzoob = reduce(np.dot, (orbob, doob, orbob.T))
+    dmzoob += reduce(np.dot, (orbvb, dvvb, orbvb.T))
+
+    dmx = reduce(np.dot, (orbvb, x.T, orboa.T))
+    dmy = reduce(np.dot, (orbob, y, orbva.T))
+    dmt = dmx + dmy
+
+    vj0, vk0 = mf.get_jk(mol, (dmzooa, dmzoob), hermi=1)
+    vk1 = mf.get_k(mol, dmt, hermi=0)
+    veff0doo = vj0[0] + vj0[1] - vk0
+    veff0mo = reduce(np.dot, (mo_coeff[1].T, -vk1, mo_coeff[0]))
+
+    wvoa = reduce(np.dot, (orbva.T, veff0doo[0], orboa))
+    wvob = reduce(np.dot, (orbvb.T, veff0doo[1], orbob))
+    wvoa += lib.einsum('ac,ka->ck', veff0mo[noccb:, nocca:], x)
+    wvoa -= lib.einsum('jk,jc->ck', veff0mo[:noccb, :nocca], y)
+    wvob += lib.einsum('ac,ka->ck', veff0mo.T[nocca:, noccb:], y)
+    wvob -= lib.einsum('jk,jc->ck', veff0mo.T[:nocca, :noccb], x)
+
+    q_delta_a, q_delta_b = satda_delta_q(tdobj, x_y)
+    r_delta_a = q_delta_a - q_delta_a.T
+    r_delta_b = q_delta_b - q_delta_b.T
+    wvoa += r_delta_a[np.ix_(viridxa, occidxa)]
+    wvob += r_delta_b[np.ix_(viridxb, occidxb)]
+
+    vresp = mf.gen_response(hermi=1)
+
+    def fvind(z):
+        za = z[0, :nvira * nocca].reshape(nvira, nocca)
+        zb = z[0, nvira * nocca:].reshape(nvirb, noccb)
+        dma = reduce(np.dot, (orbva, za, orboa.T))
+        dmb = reduce(np.dot, (orbvb, zb, orbob.T))
+        dm1 = np.stack((dma + dma.T, dmb + dmb.T))
+        v1 = vresp(dm1)
+        v1a = reduce(np.dot, (orbva.T, v1[0], orboa))
+        v1b = reduce(np.dot, (orbvb.T, v1[1], orbob))
+        return np.hstack((v1a.ravel(), v1b.ravel()))
+
+    z1a, z1b = ucphf.solve(
+        fvind, mo_energy, mo_occ, (wvoa, wvob),
+        max_cycle=td_grad.cphf_max_cycle,
+        tol=td_grad.cphf_conv_tol,
+    )[0]
+    time1 = log.timer('SATDA/HF Z-vector using UCPHF solver', *time0)
+
+    z1ao = np.empty((2, nao, nao))
+    z1ao[0] = reduce(np.dot, (orbva, z1a, orboa.T))
+    z1ao[1] = reduce(np.dot, (orbvb, z1b, orbob.T))
+    veff = vresp((z1ao + z1ao.transpose(0, 2, 1)))
+
+    im0a = np.zeros((nmoa, nmoa))
+    im0b = np.zeros((nmob, nmob))
+    im0a[:nocca, :nocca] = reduce(np.dot, (orboa.T, veff0doo[0] + veff[0], orboa))
+    im0b[:noccb, :noccb] = reduce(np.dot, (orbob.T, veff0doo[1] + veff[1], orbob))
+    im0a[:nocca, :nocca] += lib.einsum('al,ka->lk', veff0mo[noccb:, :nocca], x)
+    im0b[:noccb, :noccb] += lib.einsum('al,ka->lk', veff0mo.T[nocca:, :noccb], y)
+    im0a[nocca:, nocca:] = lib.einsum('jd,jc->dc', veff0mo[:noccb, nocca:], y)
+    im0b[noccb:, noccb:] = lib.einsum('jd,jc->dc', veff0mo.T[:nocca, noccb:], x)
+    im0a[:nocca, nocca:] = lib.einsum('jk,jc->kc', veff0mo[:noccb, :nocca], y) * 2
+    im0b[:noccb, noccb:] = lib.einsum('jk,jc->kc', veff0mo.T[:nocca, :noccb], x) * 2
+    im0a += (q_delta_a + q_delta_a.T) * 0.5
+    im0b += (q_delta_b + q_delta_b.T) * 0.5
+
+    zeta_a = (mo_energy[0][:, None] + mo_energy[0]) * 0.5
+    zeta_b = (mo_energy[1][:, None] + mo_energy[1]) * 0.5
+    zeta_a[nocca:, :nocca] = mo_energy[0][:nocca]
+    zeta_b[noccb:, :noccb] = mo_energy[1][:noccb]
+    zeta_a[:nocca, nocca:] = mo_energy[0][nocca:]
+    zeta_b[:noccb, noccb:] = mo_energy[1][noccb:]
+    dm1a = np.zeros((nmoa, nmoa))
+    dm1b = np.zeros((nmob, nmob))
+    dm1a[:nocca, :nocca] = dooa
+    dm1b[:noccb, :noccb] = doob
+    dm1a[nocca:, nocca:] = dvva
+    dm1b[noccb:, noccb:] = dvvb
+    dm1a[nocca:, :nocca] = z1a * 2
+    dm1b[noccb:, :noccb] = z1b * 2
+    dm1a[:nocca, :nocca] += np.eye(nocca)
+    dm1b[:noccb, :noccb] += np.eye(noccb)
+    im0a = reduce(np.dot, (mo_coeff[0], im0a + zeta_a * dm1a, mo_coeff[0].T))
+    im0b = reduce(np.dot, (mo_coeff[1], im0b + zeta_b * dm1b, mo_coeff[1].T))
+    im0 = im0a + im0b
+
+    mf_grad = tdobj._scf.nuc_grad_method()
+    hcore_deriv = mf_grad.hcore_generator(mol)
+    s1 = mf_grad.get_ovlp(mol)
+
+    dmz1dooa = 4 * z1ao[0] + 2 * dmzooa
+    dmz1doob = 4 * z1ao[1] + 2 * dmzoob
+    dm_probe_a, dm_probe_b = satda_fock_probe_densities(tdobj, x_y)
+    dmz1dooa_direct = dmz1dooa + 2 * dm_probe_a
+    dmz1doob_direct = dmz1doob + 2 * dm_probe_b
+    oo0a = reduce(np.dot, (orboa, orboa.T))
+    oo0b = reduce(np.dot, (orbob, orbob.T))
+    as_dm1 = oo0a + oo0b + (dmz1dooa_direct + dmz1doob_direct) * 0.5
+
+    dm = (oo0a, dmz1dooa_direct + dmz1dooa_direct.T,
+          oo0b, dmz1doob_direct + dmz1doob_direct.T)
+    vj, vk = td_grad.get_jk(mol, dm, hermi=1)
+    vj = vj.reshape(2, 2, 3, nao, nao)
+    vk = vk.reshape(2, 2, 3, nao, nao)
+    veff1 = vj[0] + vj[1] - vk
+    vk1 = -td_grad.get_k(mol, (dmt, dmt.T))
+    veff1a, veff1b = veff1
+    time1 = log.timer('SATDA/HF 2e AO integral derivatives', *time1)
+
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+    offsetdic = mol.offset_nr_by_atom()
+    de = np.zeros((len(atmlst), 3))
+    de += satda_delta_hf_exchange_direct_de(
+        td_grad, tdobj, x_y, atmlst, offsetdic
+    )
+
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+
+        h1ao = hcore_deriv(ia)
+        de[k] += lib.einsum('xpq,pq->x', h1ao, as_dm1)
+        de[k] += lib.einsum('xpq,pq->x', veff1a[0, :, p0:p1], oo0a[p0:p1]) * 2
+        de[k] += lib.einsum('xpq,pq->x', veff1b[0, :, p0:p1], oo0b[p0:p1]) * 2
+
+        de[k] -= lib.einsum('xpq,pq->x', s1[:, p0:p1], im0[p0:p1])
+        de[k] -= lib.einsum('xqp,pq->x', s1[:, p0:p1], im0[:, p0:p1])
+
+        de[k] += lib.einsum('xpq,pq->x', veff1a[0, :, p0:p1], dmz1dooa_direct[p0:p1]) * .5
+        de[k] += lib.einsum('xpq,pq->x', veff1b[0, :, p0:p1], dmz1doob_direct[p0:p1]) * .5
+        de[k] += lib.einsum('xpq,qp->x', veff1a[0, :, p0:p1], dmz1dooa_direct[:, p0:p1]) * .5
+        de[k] += lib.einsum('xpq,qp->x', veff1b[0, :, p0:p1], dmz1doob_direct[:, p0:p1]) * .5
+        de[k] += lib.einsum('xij,ij->x', veff1a[1, :, p0:p1], oo0a[p0:p1]) * .5
+        de[k] += lib.einsum('xij,ij->x', veff1b[1, :, p0:p1], oo0b[p0:p1]) * .5
+
+        de[k] += lib.einsum('xpq,pq->x', vk1[0, :, p0:p1], dmt[p0:p1]) * 2
+        de[k] += lib.einsum('xpq,pq->x', vk1[1, :, p0:p1], dmt.T[p0:p1]) * 2
+        de[k] += td_grad.extra_force(ia, locals())
+
+    log.timer('SATDA/HF electronic nuclear gradients', *time0)
+    return de
+
+
 class Gradients(rhf_grad.GradientsBase):
-    '''Finite-difference gradients for :class:`pyscf.sftda.satda.SATDA`.
+    '''Nuclear gradients for :class:`pyscf.sftda.satda.SATDA`.
 
     The returned gradient is for the total excited-state energy
 
@@ -89,6 +1060,7 @@ class Gradients(rhf_grad.GradientsBase):
 
     _keys = rhf_grad.GradientsBase._keys | {
         'state', 'step', 'nstates', 'root_overlap_tol', 'method',
+        'cphf_max_cycle', 'cphf_conv_tol',
     }
 
     def __init__(self, td):
@@ -98,21 +1070,27 @@ class Gradients(rhf_grad.GradientsBase):
         self.nstates = td.nstates
         self.root_overlap_tol = 0.7
         self.method = 'finite_diff'
+        self.cphf_max_cycle = 50
+        self.cphf_conv_tol = 1e-8
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
         log.info('\n')
-        log.info('******** finite-difference SATDA gradients for %s ********',
+        log.info('******** SATDA gradients for %s ********',
                  self.base.__class__)
         log.info('State ID = %d', self.state)
         log.info('step = %.6g Bohr', self.step)
         log.info('nstates = %d', self.nstates)
         log.info('root_overlap_tol = %.6g', self.root_overlap_tol)
         log.info('method = %s', self.method)
+        log.info('cphf_conv_tol = %.6g', self.cphf_conv_tol)
+        log.info('cphf_max_cycle = %d', self.cphf_max_cycle)
         log.info('unit = Eh/Bohr')
         if self.method == 'finite_diff':
-            log.warn('SATDA analytical gradients are not implemented yet; '
-                     'using central finite differences of E_ref + omega.')
+            log.warn('Using central finite differences of E_ref + omega.')
+        elif self.method == 'analytic_experimental':
+            log.warn('method="analytic_experimental" is an HF-only development '
+                     'path for SATDA deltaS=-1.')
         return self
 
     def _run_td_at(self, coords_bohr, x_ref=None):
@@ -181,10 +1159,39 @@ class Gradients(rhf_grad.GradientsBase):
 
     def _kernel_analytic(self, xy, atmlst):
         raise NotImplementedError(
-            'SATDA analytical nuclear gradients are not implemented yet.  Use '
-            'method="finite_diff" for central finite differences of '
-            'E_ref + omega.'
+            'Full SATDA analytical nuclear gradients are not complete yet.  '
+            'Use method="analytic_experimental" for the HF-only deltaS=-1 '
+            'development implementation, or method="finite_diff" for central '
+            'finite differences of E_ref + omega.'
         )
+
+    def _kernel_analytic_experimental(self, xy, atmlst):
+        if getattr(self.base, 'deltaS', None) != -1:
+            raise NotImplementedError(
+                'The experimental analytical SATDA gradient currently supports '
+                'only deltaS=-1.'
+            )
+        mf = self.base._scf
+        if isinstance(mf, dft.KohnShamDFT) and mf.xc.upper() != 'HF':
+            raise NotImplementedError(
+                'SATDA analytical gradients for DFT require XC-kernel nuclear '
+                'derivatives and are not implemented in this HF-only path.'
+            )
+        make_satda_sf_blocks(self.base, xy)
+        e_probe = _satda_hf_energy_for_orbs(
+            self.base, xy, mf.mo_coeff, mf.mo_coeff
+        )
+        if abs(e_probe - self.base.e[self.state - 1]) > 1e-7:
+            raise RuntimeError(
+                'Internal SATDA/HF orbital-RHS energy check failed: %.12g vs %.12g'
+                % (e_probe, self.base.e[self.state - 1])
+            )
+        de = grad_elec_hf_experimental(
+            self, xy, atmlst=atmlst, max_memory=self.max_memory,
+            verbose=self.verbose,
+        )
+        de += self.base._scf.nuc_grad_method().grad_nuc(atmlst=atmlst)
+        return de
 
     def kernel(self, state=None, atmlst=None, step=None, method=None):
         if state is not None:
@@ -219,6 +1226,8 @@ class Gradients(rhf_grad.GradientsBase):
             de = self._kernel_finite_diff(atmlst)
         elif self.method == 'analytic':
             de = self._kernel_analytic(xy, atmlst)
+        elif self.method == 'analytic_experimental':
+            de = self._kernel_analytic_experimental(xy, atmlst)
         else:
             raise ValueError('Unknown SATDA gradient method %s' % self.method)
 
@@ -232,7 +1241,7 @@ class Gradients(rhf_grad.GradientsBase):
 
     def _finalize(self):
         if self.verbose >= logger.NOTE:
-            logger.note(self, '--------- finite-difference SATDA gradients '
+            logger.note(self, '-------------- SATDA gradients '
                         'for state %d ----------', self.state)
             self._write(self.mol, self.de, self.atmlst)
             logger.note(self, '--------------------------------------------')
