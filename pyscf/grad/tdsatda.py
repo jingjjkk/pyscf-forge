@@ -32,6 +32,7 @@ from pyscf import ao2mo
 from pyscf import dft
 from pyscf import lib
 from pyscf import scf
+from pyscf.dft import numint
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import tdrks as tdrks_grad
 from pyscf.lib import logger
@@ -732,6 +733,27 @@ def _satda_sf_lda_block_matrix(si):
     ))
 
 
+def _satda_sf_gga_block_matrices(si):
+    a = np.sqrt((2 * si + 1) / (2 * si))
+    b = np.sqrt(2 * si / (2 * si - 1))
+    c = np.sqrt((2 * si + 1) / (2 * si - 1))
+    d = 1.0 / (2 * si - 1)
+    e = 2 * si / (2 * si - 1)
+    m0 = np.asarray((
+        (1.0, a, b, e),
+        (a, 1.0, c, a),
+        (b, c, 1.0, b),
+        (e, a, b, 1.0),
+    ))
+    m1 = np.asarray((
+        (d, 0.0, 0.0, -d),
+        (0.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0),
+        (-d, 0.0, 0.0, d),
+    ))
+    return m0, m1
+
+
 # ``fxc_ref`` is built with the ROKS half-density convention used by
 # ``cache_xc_kernel(..., spin=1)``.  The SATDA spin-flip block gradient carries
 # the corresponding quarter factor, while the sigma-vector contraction itself
@@ -771,6 +793,106 @@ def _satda_sf_lda_apply_fxc_ref(tdobj, dms, fxc_ref, max_memory=2000):
         mf.mol, mf.grids, mf.xc, None, dms, 0, 0,
         None, None, fxc_ref, max_memory=max_memory,
     )
+
+
+def _satda_sf_gga_apply_fxc1_ref(tdobj, dms, fxc_ref, max_memory=2000):
+    from pyscf.sftda.satda import nr_rks_fxc1_gga
+
+    mf = tdobj._scf
+    dms = np.asarray(dms)
+    if dms.ndim == 2:
+        dms = dms.reshape(1, *dms.shape)
+    return nr_rks_fxc1_gga(
+        mf._numint, mf.mol, mf.grids, mf.xc, dms, fxc_ref,
+        max_memory=max_memory,
+    )
+
+
+def _satda_sf_gga_primitives(ni, mol, ao, mask, ao_loc, dms):
+    shls_slice = (0, mol.nbas)
+    prim = []
+    for dm in dms:
+        c0 = numint._dot_ao_dm(mol, ao[0], dm, mask, shls_slice, ao_loc)
+        rho0 = numint._contract_rho(ao[0], c0)
+        r_grad = np.asarray([
+            numint._contract_rho(ao[i], c0) for i in range(1, 4)
+        ])
+        c_grad = [
+            numint._dot_ao_dm(mol, ao[i], dm, mask, shls_slice, ao_loc)
+            for i in range(1, 4)
+        ]
+        l_grad = np.asarray([
+            numint._contract_rho(ao[0], c_grad[i]) for i in range(3)
+        ])
+        tau = np.empty((3, 3, rho0.size))
+        for i in range(3):
+            for j in range(3):
+                tau[i, j] = numint._contract_rho(ao[j + 1], c_grad[i])
+        prim.append((rho0, l_grad, r_grad, tau))
+    return prim
+
+
+def _satda_sf_gga_u_from_primitive(fxc, primitive):
+    rho0, l_grad, r_grad, tau = primitive
+    ngrids = rho0.size
+    u = np.zeros((4, 4, ngrids))
+    u[0, 0] = fxc[0, 0] * rho0
+    u[0, 0] += lib.einsum('ig,ig->g', fxc[1:4, 0], l_grad)
+    u[0, 0] += lib.einsum('jg,jg->g', fxc[0, 1:4], r_grad)
+    u[0, 0] += lib.einsum('ijg,ijg->g', fxc[1:4, 1:4], tau)
+    u[1:4, 0] += fxc[1:4, 0] * rho0
+    u[1:4, 0] += lib.einsum('ijg,jg->ig', fxc[1:4, 1:4], r_grad)
+    u[0, 1:4] += fxc[0, 1:4] * rho0
+    u[0, 1:4] += lib.einsum('ijg,ig->jg', fxc[1:4, 1:4], l_grad)
+    u[1:4, 1:4] += fxc[1:4, 1:4] * rho0
+    return u
+
+
+def _satda_sf_gga_primitive_bilinear_coeff(prim_l, prim_r):
+    rho_l, l_l, r_l, tau_l = prim_l
+    rho_r, l_r, r_r, tau_r = prim_r
+    coeff = np.empty((4, 4, rho_l.size))
+    coeff[0, 0] = rho_l * rho_r
+    coeff[1:4, 0] = l_r * rho_l + r_l * rho_r
+    coeff[0, 1:4] = r_r * rho_l + l_l * rho_r
+    coeff[1:4, 1:4] = (
+        lib.einsum('g,ijg->ijg', rho_l, tau_r)
+        + lib.einsum('ig,jg->ijg', r_l, r_r)
+        + lib.einsum('jg,ig->ijg', l_l, l_r)
+        + lib.einsum('ijg,g->ijg', tau_l, rho_r)
+    )
+    return coeff
+
+
+def _satda_sf_ao_deriv_component(ao, idx, coord):
+    if idx == 0:
+        return ao[1 + coord]
+    if idx == 1:
+        return (ao[4], ao[5], ao[6])[coord]
+    if idx == 2:
+        return (ao[5], ao[7], ao[8])[coord]
+    if idx == 3:
+        return (ao[6], ao[8], ao[9])[coord]
+    raise ValueError('Invalid AO derivative index %d' % idx)
+
+
+def _satda_sf_gga_eval_k1_mat_deriv(mol, ao, u, mask, ao_loc):
+    shls_slice = (0, mol.nbas)
+    vmat = np.zeros((4, mol.nao_nr(), mol.nao_nr()))
+    for i in range(4):
+        for j in range(4):
+            if not np.any(u[i, j]):
+                continue
+            aow = numint._scale_ao(ao[j], u[i, j])
+            vmat[0] += numint._dot_ao_ao(
+                mol, ao[i], aow, mask, shls_slice, ao_loc
+            )
+            for x in range(3):
+                vmat[x + 1] += numint._dot_ao_ao(
+                    mol, _satda_sf_ao_deriv_component(ao, i, x), aow,
+                    mask, shls_slice, ao_loc,
+                )
+    return vmat
 
 
 def _satda_sf_lda_ref_density_mats(tdobj, xy, with_deriv=False,
@@ -834,6 +956,75 @@ def _satda_sf_lda_ref_density_mats(tdobj, xy, with_deriv=False,
     return vmat_a[0], vmat_b[0]
 
 
+def _satda_sf_gga_ref_density_mats(tdobj, xy, with_deriv=False,
+                                   max_memory=2000):
+    mf = tdobj._scf
+    mol = mf.mol
+    ni = mf._numint
+    if ni._xc_type(mf.xc) != 'GGA':
+        raise NotImplementedError('SATDA/GGA reference response requested '
+                                  'for a non-GGA functional')
+
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    dms = [blk[2] for blk in blocks]
+    m0, m1 = _satda_sf_gga_block_matrices(b.si)
+    nao = mol.nao_nr()
+    shls_slice = (0, mol.nbas)
+    ao_loc = mol.ao_loc_nr()
+    vmat_a = np.zeros((4, nao, nao))
+    vmat_b = np.zeros_like(vmat_a)
+    ao_deriv = 2
+
+    for ao, mask, weight, coords in ni.block_loop(
+            mol, mf.grids, nao, ao_deriv, max_memory=max_memory):
+        rho0 = ni.eval_rho2(
+            mol, ao[:4], mf.mo_coeff, mf.mo_occ, mask, 'GGA',
+            with_lapl=False,
+        ) * 0.5
+        rho = (rho0, rho0)
+        kxc = ni.eval_xc_eff(
+            mf.xc, rho, deriv=3, xctype='GGA', spin=1,
+        )[3]
+        kref_a = 0.5 * (
+            kxc[0, :, 0, :, 0, :, :] - kxc[0, :, 1, :, 0, :, :]
+            - kxc[1, :, 0, :, 0, :, :] + kxc[1, :, 1, :, 0, :, :]
+        )
+        kref_b = 0.5 * (
+            kxc[0, :, 0, :, 1, :, :] - kxc[0, :, 1, :, 1, :, :]
+            - kxc[1, :, 0, :, 1, :, :] + kxc[1, :, 1, :, 1, :, :]
+        )
+        rho_blocks = np.asarray([
+            ni.eval_rho(mol, ao[:4], dm, mask, 'GGA', hermi=0,
+                        with_lapl=False)
+            for dm in dms
+        ])
+        prim = _satda_sf_gga_primitives(ni, mol, ao, mask, ao_loc, dms)
+
+        coeff0 = lib.einsum('bl,bxg,lyg->xyg', m0, rho_blocks, rho_blocks)
+        coeff1 = np.zeros_like(coeff0)
+        for ib in range(4):
+            for il in range(4):
+                if m1[ib, il] != 0:
+                    coeff1 += m1[ib, il] * _satda_sf_gga_primitive_bilinear_coeff(
+                        prim[ib], prim[il]
+                    )
+        coeff = (coeff0 + coeff1) * SATDA_SF_LDA_XC_GRAD_SCALE
+        wv_a = lib.einsum('xyg,xyzg,g->zg', coeff, kref_a, weight)
+        wv_b = lib.einsum('xyg,xyzg,g->zg', coeff, kref_b, weight)
+        tdrks_grad._gga_eval_mat_(
+            mol, vmat_a, ao, wv_a, mask, shls_slice, ao_loc
+        )
+        tdrks_grad._gga_eval_mat_(
+            mol, vmat_b, ao, wv_b, mask, shls_slice, ao_loc
+        )
+
+    if with_deriv:
+        vmat_a[1:] *= -1
+        vmat_b[1:] *= -1
+        return vmat_a, vmat_b
+    return vmat_a[0], vmat_b[0]
+
+
 def _satda_sf_lda_transition_deriv_mats(tdobj, xy, fxc_ref,
                                         max_memory=2000):
     mf = tdobj._scf
@@ -870,6 +1061,50 @@ def _satda_sf_lda_transition_deriv_mats(tdobj, xy, fxc_ref,
         out[iblk] = (
             SATDA_SF_LDA_XC_GRAD_SCALE
             * lib.einsum('l,lxpq->xpq', mat[iblk], src)
+        )
+    return out
+
+
+def _satda_sf_gga_transition_deriv_mats(tdobj, xy, fxc_ref,
+                                        max_memory=2000):
+    mf = tdobj._scf
+    mol = mf.mol
+    ni = mf._numint
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    dms = [blk[2] for blk in blocks]
+    m0, m1 = _satda_sf_gga_block_matrices(b.si)
+    nao = mol.nao_nr()
+    shls_slice = (0, mol.nbas)
+    ao_loc = mol.ao_loc_nr()
+    src0 = np.zeros((4, 4, nao, nao))
+    src1 = np.zeros_like(src0)
+
+    p1 = 0
+    for ao, mask, weight, coords in ni.block_loop(
+            mol, mf.grids, nao, 2, max_memory=max_memory):
+        p0, p1 = p1, p1 + weight.size
+        fxc_blk = fxc_ref[:, :, p0:p1]
+        prim = _satda_sf_gga_primitives(ni, mol, ao, mask, ao_loc, dms)
+        for iblk, dm in enumerate(dms):
+            rho = ni.eval_rho(
+                mol, ao[:4], dm, mask, 'GGA', hermi=0, with_lapl=False
+            )
+            wv = lib.einsum('xg,xyg,g->yg', rho, fxc_blk, weight)
+            tdrks_grad._gga_eval_mat_(
+                mol, src0[iblk], ao, wv, mask, shls_slice, ao_loc
+            )
+            u = _satda_sf_gga_u_from_primitive(fxc_blk * weight, prim[iblk])
+            src1[iblk] += _satda_sf_gga_eval_k1_mat_deriv(
+                mol, ao, u, mask, ao_loc
+            )
+
+    src0[:, 1:] *= -1
+    src1[:, 1:] *= -1
+    out = np.zeros_like(src0)
+    for iblk in range(4):
+        out[iblk] = SATDA_SF_LDA_XC_GRAD_SCALE * (
+            lib.einsum('l,lxpq->xpq', m0[iblk], src0)
+            + lib.einsum('l,lxpq->xpq', m1[iblk], src1)
         )
     return out
 
@@ -912,6 +1147,49 @@ def _satda_sf_lda_xc_q(tdobj, xy, max_memory=2000):
     return q_alpha, q_beta
 
 
+def _satda_sf_gga_xc_q(tdobj, xy, max_memory=2000):
+    mf = tdobj._scf
+    if mf._numint._xc_type(mf.xc) != 'GGA':
+        nmo = mf.mo_coeff.shape[1]
+        return np.zeros((nmo, nmo)), np.zeros((nmo, nmo))
+
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    m0, m1 = _satda_sf_gga_block_matrices(b.si)
+    mo_coeff = mf.mo_coeff
+    nmo = mo_coeff.shape[1]
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+
+    fxc_ref = _satda_sf_lda_fxc_ref(tdobj, max_memory=max_memory)
+    dms = [blk[2] for blk in blocks]
+    v0 = _satda_sf_lda_apply_fxc_ref(
+        tdobj, dms, fxc_ref, max_memory=max_memory
+    )
+    v1 = _satda_sf_gga_apply_fxc1_ref(
+        tdobj, dms, fxc_ref, max_memory=max_memory
+    )
+    vblocks = np.asarray([
+        2.0 * SATDA_SF_LDA_XC_GRAD_SCALE
+        * (lib.einsum('l,lpq->pq', m0[iblk], v0)
+           + lib.einsum('l,lpq->pq', m1[iblk], v1))
+        for iblk in range(4)
+    ])
+
+    for vmat, (target_idx, source_idx, dm, amp_t_s) in zip(vblocks, blocks):
+        vmo = mo_coeff.conj().T @ vmat @ mo_coeff
+        q_beta[:, target_idx] += vmo[:, source_idx] @ amp_t_s.T
+        q_alpha[:, source_idx] += vmo[:, target_idx] @ amp_t_s
+
+    wa, wb = _satda_sf_gga_ref_density_mats(
+        tdobj, xy, with_deriv=False, max_memory=max_memory
+    )
+    occidxa = np.where(mf.mo_occ > 0)[0]
+    occidxb = np.where(mf.mo_occ == 2)[0]
+    q_alpha[:, occidxa] += mo_coeff.conj().T @ (wa + wa.T) @ mo_coeff[:, occidxa]
+    q_beta[:, occidxb] += mo_coeff.conj().T @ (wb + wb.T) @ mo_coeff[:, occidxb]
+    return q_alpha, q_beta
+
+
 def _satda_sf_lda_xc_direct_de(td_grad, tdobj, xy, atmlst, offsetdic,
                                oo0a, oo0b, max_memory=2000):
     mf = tdobj._scf
@@ -942,12 +1220,46 @@ def _satda_sf_lda_xc_direct_de(td_grad, tdobj, xy, atmlst, offsetdic,
     return de
 
 
+def _satda_sf_gga_xc_direct_de(td_grad, tdobj, xy, atmlst, offsetdic,
+                               oo0a, oo0b, max_memory=2000):
+    mf = tdobj._scf
+    if mf._numint._xc_type(mf.xc) != 'GGA':
+        return np.zeros((len(tuple(atmlst)), 3))
+
+    atmlst = tuple(atmlst)
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    dms = [blk[2] for blk in blocks]
+    fxc_ref = _satda_sf_lda_fxc_ref(tdobj, max_memory=max_memory)
+    trans_der = _satda_sf_gga_transition_deriv_mats(
+        tdobj, xy, fxc_ref, max_memory=max_memory
+    )
+    wa_der, wb_der = _satda_sf_gga_ref_density_mats(
+        tdobj, xy, with_deriv=True, max_memory=max_memory
+    )
+
+    de = np.zeros((len(atmlst), 3))
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+        for fder, dm in zip(trans_der[:, 1:], dms):
+            de[k] += lib.einsum('xpq,pq->x', fder[:, p0:p1], dm[p0:p1]) * 2
+            de[k] += lib.einsum('xpq,pq->x', fder[:, p0:p1], dm.T[p0:p1]) * 2
+        de[k] += lib.einsum('xpq,pq->x', wa_der[1:, p0:p1], oo0a[p0:p1])
+        de[k] += lib.einsum('xpq,pq->x', wa_der[1:, p0:p1], oo0a.T[p0:p1])
+        de[k] += lib.einsum('xpq,pq->x', wb_der[1:, p0:p1], oo0b[p0:p1])
+        de[k] += lib.einsum('xpq,pq->x', wb_der[1:, p0:p1], oo0b.T[p0:p1])
+    return de
+
+
 def _contract_uks_lda_vxc_deriv(td_grad, mf, dmoo=None, max_memory=2000):
     mol = td_grad.mol
     ni = mf._numint
     xctype = ni._xc_type(mf.xc)
-    if xctype != 'LDA':
-        raise NotImplementedError('Only LDA XC AO derivatives are available '
+    if xctype == 'LDA':
+        fmat_, ao_deriv = tdrks_grad._lda_eval_mat_, 1
+    elif xctype == 'GGA':
+        fmat_, ao_deriv = tdrks_grad._gga_eval_mat_, 2
+    else:
+        raise NotImplementedError('Only LDA/GGA XC AO derivatives are available '
                                   'in the SATDA experimental DFT path')
 
     nao = mf.mo_coeff[0].shape[0]
@@ -961,8 +1273,8 @@ def _contract_uks_lda_vxc_deriv(td_grad, mf, dmoo=None, max_memory=2000):
         f1dm = np.zeros((2, 4, nao, nao))
 
     for ao, mask, weight, coords in ni.block_loop(
-            mol, mf.grids, nao, 1, max_memory=max_memory):
-        ao0 = ao[0]
+            mol, mf.grids, nao, ao_deriv, max_memory=max_memory):
+        ao0 = ao[0] if xctype == 'LDA' else ao[:4]
         rho = (
             ni.eval_rho2(mol, ao0, mf.mo_coeff[0], mf.mo_occ[0], mask,
                          xctype, with_lapl=False),
@@ -972,10 +1284,10 @@ def _contract_uks_lda_vxc_deriv(td_grad, mf, dmoo=None, max_memory=2000):
         vxc, fxc = ni.eval_xc_eff(
             mf.xc, rho, deriv=2, xctype=xctype, spin=1,
         )[1:3]
-        tdrks_grad._lda_eval_mat_(
+        fmat_(
             mol, vxc1[0], ao, vxc[0] * weight, mask, shls_slice, ao_loc
         )
-        tdrks_grad._lda_eval_mat_(
+        fmat_(
             mol, vxc1[1], ao, vxc[1] * weight, mask, shls_slice, ao_loc
         )
 
@@ -986,12 +1298,13 @@ def _contract_uks_lda_vxc_deriv(td_grad, mf, dmoo=None, max_memory=2000):
                 ni.eval_rho(mol, ao0, dmoo[1], mask, xctype, hermi=1,
                             with_lapl=False),
             ))
-            rho2 = rho2[:, np.newaxis]
+            if xctype == 'LDA':
+                rho2 = rho2[:, np.newaxis]
             wv = lib.einsum('axg,axbyg,g->byg', rho2, fxc, weight)
-            tdrks_grad._lda_eval_mat_(
+            fmat_(
                 mol, f1dm[0], ao, wv[0], mask, shls_slice, ao_loc
             )
-            tdrks_grad._lda_eval_mat_(
+            fmat_(
                 mol, f1dm[1], ao, wv[1], mask, shls_slice, ao_loc
             )
 
@@ -1167,10 +1480,10 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
     mf = _as_spin_unrestricted_reference(tdobj._scf)
     xctype_ref = (mf_ref._numint._xc_type(mf_ref.xc)
                   if isinstance(mf_ref, dft.KohnShamDFT) else 'HF')
-    if xctype_ref not in ('HF', 'LDA'):
+    if xctype_ref not in ('HF', 'LDA', 'GGA'):
         raise NotImplementedError(
             'SATDA analytical gradients with XC kernels currently support '
-            'only LDA.  Use finite_diff for GGA/MGGA functionals.'
+            'only LDA/GGA.  Use finite_diff for MGGA functionals.'
         )
     hybrid, hyb, omega, alpha = _hybrid_coefficients(mf_ref)
 
@@ -1231,6 +1544,12 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
     q_delta_a, q_delta_b = satda_delta_q(tdobj, x_y)
     if xctype_ref == 'LDA':
         q_xc_a, q_xc_b = _satda_sf_lda_xc_q(
+            tdobj, x_y, max_memory=max_memory
+        )
+        q_delta_a += q_xc_a
+        q_delta_b += q_xc_b
+    elif xctype_ref == 'GGA':
+        q_xc_a, q_xc_b = _satda_sf_gga_xc_q(
             tdobj, x_y, max_memory=max_memory
         )
         q_delta_a += q_xc_a
@@ -1330,7 +1649,7 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
         veff1 = vj[0] + vj[1]
         veff1 = np.stack((veff1, veff1))
         vk1 = np.zeros((2, 3, nao, nao))
-    if xctype_ref == 'LDA':
+    if xctype_ref in ('LDA', 'GGA'):
         vxc1, f1dm = _contract_uks_lda_vxc_deriv(
             td_grad, mf,
             dmoo=(dmz1dooa_direct + dmz1dooa_direct.T,
@@ -1352,6 +1671,11 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
     )
     if xctype_ref == 'LDA':
         de += _satda_sf_lda_xc_direct_de(
+            td_grad, tdobj, x_y, atmlst, offsetdic, oo0a, oo0b,
+            max_memory=max_memory,
+        )
+    elif xctype_ref == 'GGA':
+        de += _satda_sf_gga_xc_direct_de(
             td_grad, tdobj, x_y, atmlst, offsetdic, oo0a, oo0b,
             max_memory=max_memory,
         )
@@ -1511,10 +1835,10 @@ class Gradients(rhf_grad.GradientsBase):
         mf = self.base._scf
         xctype = (mf._numint._xc_type(mf.xc)
                   if isinstance(mf, dft.KohnShamDFT) else 'HF')
-        if xctype not in ('HF', 'LDA'):
+        if xctype not in ('HF', 'LDA', 'GGA'):
             raise NotImplementedError(
                 'SATDA analytical gradients with XC kernels currently support '
-                'only LDA in the experimental deltaS=-1 path.'
+                'only LDA/GGA in the experimental deltaS=-1 path.'
             )
         make_satda_sf_blocks(self.base, xy)
         if xctype == 'HF':
