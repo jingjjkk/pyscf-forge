@@ -2071,3 +2071,325 @@ X_co, X_cv, X_oo, X_ov
 ```
 
 **代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py:grad_elec_hf_experimental()` L864-1046；`Gradients._kernel_analytic_experimental()` L1168-1194。
+
+---
+
+## 推导：SATDA/HF $\Delta S=-1$ 态间 NAC 的 AWF 有限差分与解析双线性化 — 2026-05-23
+
+**目标：** 从 SATDA/HF 的激发能梯度工作方程出发，得到两个 SATDA 态 $I,J$ 之间的非绝热导数耦合（NAC）实现公式，并说明 `pyscf/nac/tdsatda.py` 中有限差分和解析实现的对应关系。
+
+**假设：**
+- 只考虑 Tamm-Dancoff 近似，$Y=0$。
+- 只考虑 `deltaS=-1`，即 $S_f=S_i-1$ 的 spin-flip 激发。
+- 当前解析实现只覆盖 HF 或 `xc='HF'`，不含 DFT XC 核导数。
+- 轨道、AO 基函数和激发振幅均取实数。
+
+**符号声明：**
+- $X^{I}_{ia}$ 和 $X^{J}_{ia}$ 分别表示态 $I,J$ 的 SATDA spin-flip 振幅，其中 $i$ 属于 $\alpha$ 占据空间，$a$ 属于 $\beta$ 非双占据空间。
+- $\omega_I,\omega_J$ 是 SATDA 激发能，$\Delta E_{JI}=\omega_J-\omega_I$。
+- $\mathbf{A}$ 是 SATDA/TDA 矩阵；$\mathbf{A}^{[x]}$ 表示去除 MO 响应后的核坐标 $x$ 显式导数。
+- $\mathbf{Z}^{IJ}$ 是态间 NAC 的 Z-vector。
+- $\mathbf{Q}_{\Delta A}$ 表示 SATDA spin-adaptation 修正项对 MO 旋转的一阶导数矩阵。
+
+**代码变量到数学符号的对应：**
+- `x_y_i[0]`, shape `(nocca, nvirb)` = $X^{I}_{ia}$。
+- `x_y_j[0]`, shape `(nocca, nvirb)` = $X^{J}_{ia}$。
+- `get_hf_interstate_numerator()` = $\langle I|\hat{H}^{[x]}|J\rangle$ 加 orbital-response 消元后的 numerator。
+- `awf_overlap()` = 辅助波函数重叠 $\langle \widetilde{\Phi}_I(\mathbf{R})|\widetilde{\Phi}_J(\mathbf{R}')\rangle$。
+- `nac_csf()` = AWF determinant basis 的显式 overlap-metric 项。
+
+### Step 1: NAC 与 numerator 的关系
+
+对绝热本征态有
+
+$$
+\hat{H}|\Phi_K\rangle = E_K|\Phi_K\rangle.
+$$
+
+→ **解释：** 这里 $K$ 可取 $I$ 或 $J$；在 SATDA 中实际使用的是辅助波函数或等价的 EOM/TDA 响应表象。
+
+对核坐标 $x$ 求导并左乘 $\langle\Phi_I|$，在 $I\ne J$ 时得到
+
+$$
+\langle\Phi_I|\hat{H}^{[x]}|\Phi_J\rangle
+= (E_I-E_J)\langle\Phi_I|\Phi_J^{[x]}\rangle.
+$$
+
+→ **解释：** 使用正交归一条件 $\langle\Phi_I|\Phi_J\rangle=0$ 和本征方程消去 $\hat{H}|\Phi_J^{[x]}\rangle$ 项。
+
+因此代码中的两种返回约定为
+
+$$
+\mathbf{d}_{IJ}^{x}
+= \langle\Phi_I|\Phi_J^{[x]}\rangle,
+\qquad
+\mathbf{N}_{IJ}^{x}
+= \Delta E_{JI}\,\mathbf{d}_{IJ}^{x}.
+$$
+
+→ **解释：** `ediff=True` 返回 $\mathbf{d}_{IJ}^{x}$，`ediff=False` 返回 numerator-like quantity $\mathbf{N}_{IJ}^{x}$；这与已有 SF-TDDFT NAC 代码保持一致。
+
+### Step 2: AWF 有限差分参考
+
+SATDA/TDA 辅助波函数写为
+
+$$
+|\widetilde{\Phi}_I\rangle
+= \sum_{ia} X^{I}_{ia} |\widetilde{\Phi}_{ia}\rangle.
+$$
+
+→ **解释：** $|\widetilde{\Phi}_{ia}\rangle$ 是由 ROKS 高自旋参考态生成的 spin-flip determinant/CSF 基函数；`awf_overlap()` 用行列式 overlap 评价其几何变化。
+
+有限差分 NAC 采用固定左态、移动右态的中心差分：
+
+$$
+d_{IJ}^{x}
+\approx
+\frac{
+\langle\widetilde{\Phi}_I(\mathbf{R})|
+\widetilde{\Phi}_J(\mathbf{R}+h\mathbf{e}_x)\rangle
+-
+\langle\widetilde{\Phi}_I(\mathbf{R})|
+\widetilde{\Phi}_J(\mathbf{R}-h\mathbf{e}_x)\rangle
+}{2h}.
+$$
+
+→ **解释：** `NonAdiabaticCouplings._kernel_finite_diff()` 对每个原子坐标重跑 ROKS/SATDA，用振幅 overlap 做 root tracking，并通过 `awf_overlap()` 计算左右几何之间的辅助波函数重叠。
+
+### Step 3: 解析项由梯度公式双线性化得到
+
+对单一态 $K$，SATDA/HF 解析梯度中的电子部分可写成二次型泛函
+
+$$
+G^{x}(X^{K},X^{K})
+=
+(X^{K})^{T}\mathbf{A}^{[x]}X^{K}
++ \text{orbital-response and overlap terms}.
+$$
+
+→ **解释：** `grad_elec_hf_experimental()` 已经实现了普通 SF 项、SATDA Fock-like probe density、SATDA HF exchange-like direct skeleton derivative 和 Z-vector overlap metric 项。
+
+态间矩阵元用极化恒等式从二次型得到：
+
+$$
+G^{x}(X^{I},X^{J})
+=
+\frac{1}{2}
+\left[
+G^{x}(X^{I}+X^{J},X^{I}+X^{J})
+-G^{x}(X^{I},X^{I})
+-G^{x}(X^{J},X^{J})
+\right].
+$$
+
+→ **解释：** 这就是 `_polarized_tuple()` 与 `_polarized_array()` 的作用；它把已有 gradient helper 中的 SATDA $\Delta A$ 二次项转换为 NAC 所需的态间双线性项。
+
+### Step 4: SATDA 专属 $\Delta A$ 项进入 Z-vector RHS
+
+SATDA 修正对 MO 旋转的导数写成
+
+$$
+\mathbf{Q}_{\Delta A}^{IJ}
+=
+\frac{1}{2}
+\left[
+\mathbf{Q}_{\Delta A}(X^{I}+X^{J})
+-\mathbf{Q}_{\Delta A}(X^{I})
+-\mathbf{Q}_{\Delta A}(X^{J})
+\right].
+$$
+
+→ **解释：** `satda_delta_q()` 原本返回单态二次型的 MO derivative；NAC 中通过 `_bilinear_delta_q()` 得到态间版本。
+
+Z-vector RHS 的 SATDA 增量取反对称部分：
+
+$$
+\mathbf{R}_{\Delta A}^{IJ}
+= \mathbf{Q}_{\Delta A}^{IJ}
+- \left(\mathbf{Q}_{\Delta A}^{IJ}\right)^{T}.
+$$
+
+→ **解释：** 代码中 `r_delta_a/b = q_delta_a/b - q_delta_a/b.T`，随后投影到 virtual-occupied 块并加到 `wvoa/wvob`。
+
+### Step 5: SATDA 专属 overlap metric 项
+
+同一个 $\mathbf{Q}_{\Delta A}^{IJ}$ 的对称部分进入 overlap metric coefficient：
+
+$$
+\mathbf{B}_{\Delta A}^{IJ}
+=
+\frac{1}{2}
+\left[
+\mathbf{Q}_{\Delta A}^{IJ}
++ \left(\mathbf{Q}_{\Delta A}^{IJ}\right)^{T}
+\right].
+$$
+
+→ **解释：** `get_hf_interstate_numerator()` 中将该项加到 `im0a/im0b`，对应梯度实现里 Z-vector 之后回填 overlap metric 的 SATDA 修正。
+
+### Step 6: 直接 AO skeleton derivative
+
+SATDA Fock-like probe density 的态间形式为
+
+$$
+\mathbf{D}_{\mathrm{probe}}^{IJ}
+=
+\frac{1}{2}
+\left[
+\mathbf{D}_{\mathrm{probe}}(X^{I}+X^{J})
+-\mathbf{D}_{\mathrm{probe}}(X^{I})
+-\mathbf{D}_{\mathrm{probe}}(X^{J})
+\right].
+$$
+
+→ **解释：** `_bilinear_probe_densities()` 对 `satda_fock_probe_densities()` 做极化，得到 $\alpha$ 和 $\beta$ 两个 spin-separated probe density。
+
+HF exchange-like 的直接 AO 积分导数同样双线性化：
+
+$$
+\Omega_{\Delta A,\mathrm{eri}}^{[x],IJ}
+=
+\frac{1}{2}
+\left[
+\Omega_{\Delta A,\mathrm{eri}}^{[x]}(X^{I}+X^{J})
+-\Omega_{\Delta A,\mathrm{eri}}^{[x]}(X^{I})
+-\Omega_{\Delta A,\mathrm{eri}}^{[x]}(X^{J})
+\right].
+$$
+
+→ **解释：** `_bilinear_direct_de()` 复用 `satda_delta_hf_exchange_direct_de()`，因此 gradient 中已拆好的 COCO、OVOV、CVCO、CVOV、COOV、CVOO、COOO、OVOO 等 direct ERI 块可以直接进入 NAC。
+
+### 最终结果
+
+解析实现返回的 numerator 为
+
+$$
+\mathbf{N}_{IJ}^{x}
+=
+\mathbf{N}_{IJ,\mathrm{ordinary\ SF}}^{x}
++ \mathbf{N}_{IJ,\Delta A}^{x}
++ \Delta E_{JI}\,\mathbf{d}_{IJ,\mathrm{basis}}^{x}.
+$$
+
+→ **解释：** 前两项由 `get_hf_interstate_numerator()` 计算；最后一项由 `nac_csf()` 给出，在 `use_etfs=False` 时加入，用来匹配 AWF 有限差分参考。
+
+最终 NAC 为
+
+$$
+\mathbf{d}_{IJ}^{x}
+=
+\frac{\mathbf{N}_{IJ}^{x}}{\Delta E_{JI}}.
+$$
+
+→ **解释：** `ediff=True` 时执行该除法；若 `ediff=False`，代码保留 numerator 形式，便于与动力学程序中按能隙处理的约定兼容。
+
+**代码对应：** `pyscf-forge/pyscf/nac/tdsatda.py:get_hf_interstate_numerator()`、`awf_overlap()`、`nac_csf()`、`NonAdiabaticCouplings.kernel()`；入口为 `pyscf-forge/pyscf/sftda/satda.py:SATDA.NAC()`。
+
+---
+
+## 推导补记：SATDA/HF NAC 解析路径的对角极限检查 — 2026-05-23
+
+**目标：** 记录当前 `analytic_experimental` NAC 路径被禁用的原因，并给出后续修复必须满足的最小物理校验。
+
+**假设：**
+- 仍限定 HF、TDA、`deltaS=-1`。
+- `finite_diff` 使用 AWF overlap 中心差分，并已在甲醛 triplet reference 的非零 NAC 分量上检查步长平台。
+- 对角极限只用于校验 Hellmann-Feynman numerator，不表示要计算同态 NAC。
+
+**符号声明：**
+- $\omega_I$ 是第 $I$ 个 SATDA 激发能。
+- $\mathbf{N}_{IJ}^{x}$ 是解析 NAC 中的 Hellmann-Feynman numerator。
+- $\mathbf{G}_{I,\mathrm{exc}}^{x}$ 是纯激发能梯度，即总激发态梯度减去基态梯度。
+
+### Step 1: 对角极限应成立
+
+若解析 numerator 的对象确实是纯激发空间哈密顿量，则在 $I=J$ 时必须满足
+
+$$
+\mathbf{N}_{II}^{x} = \frac{\partial \omega_I}{\partial x}.
+$$
+
+→ **解释：** 这是 Hellmann-Feynman 定理在 TDA 激发矩阵本征值问题上的对角极限；注意右边不是总激发态能量梯度，而是总梯度减去基态梯度。
+
+代码校验中应使用
+
+$$
+\mathbf{G}_{I,\mathrm{exc}}^{x}
+=
+\mathbf{G}_{I,\mathrm{total}}^{x}
+-\mathbf{G}_{\mathrm{ref}}^{x}.
+$$
+
+→ **解释：** `td.Gradients().kernel(state=I)` 的目标是 $E_{\mathrm{ref}}+\omega_I$，因此直接比较会把基态贡献混入。
+
+### Step 2: 甲醛诊断结果
+
+在甲醛 `STO-3G`、triplet ROKS/HF reference、`state_I=2`、`state_J=3`、O 原子 $z$ 分量上，有限差分 NAC 的步长平台为
+
+$$
+d_{23}^{z}(h=5\times 10^{-4})
+\approx -0.034904647.
+$$
+
+→ **解释：** 该值与 $h=2\times 10^{-4}$ 的结果只差约 $1.8\times 10^{-7}$，因此不是步长过小导致的不稳定大数。
+
+对应能隙为
+
+$$
+\Delta E_{32} \approx 0.003639802089.
+$$
+
+→ **解释：** 因此有限差分对应的 numerator 量级应为 $-1.27\times 10^{-4}$ Hartree/Bohr，而不是 $10^{-2}$ Hartree/Bohr。
+
+当前旧解析路径给出
+
+$$
+\mathbf{N}_{23}^{z} \approx -0.03726804,
+\qquad
+\frac{\mathbf{N}_{23}^{z}}{\Delta E_{32}} \approx -10.239.
+$$
+
+→ **解释：** 这比有限差分 numerator 大约两个数量级，说明错误来自 Hellmann-Feynman numerator 构造。
+
+### Step 3: 分块定位
+
+旧路径中 `get_hf_interstate_numerator()` 的 atom loop 可分为
+
+$$
+\mathbf{N}^{x}
+=
+\mathbf{N}_{h}^{x}
++\mathbf{N}_{S}^{x}
++\mathbf{N}_{\mathrm{veff,dz}}^{x}
++\mathbf{N}_{\mathrm{veff,oo}}^{x}
++\mathbf{N}_{K}^{x}
++\mathbf{N}_{\Delta A,\mathrm{direct}}^{x}.
+$$
+
+→ **解释：** 这些分别对应 `hcore/as_dm1`、`overlap/im0`、`veff1` 与 response density、`veff1` 与 reference occupied density、ordinary SF exchange derivative、SATDA direct ERI derivative。
+
+甲醛诊断显示异常主要来自大项之间的错误抵消，而不是 `nac_csf()` 或 SATDA direct ERI 单项：
+
+$$
+\mathbf{N}_{h}^{z}\approx -0.39393,\quad
+\mathbf{N}_{\mathrm{veff,dz}}^{z}\approx 0.30012,\quad
+\mathbf{N}_{\mathrm{veff,oo}}^{z}\approx 0.14150,\quad
+\mathbf{N}_{K}^{z}\approx -0.08989.
+$$
+
+→ **解释：** 这些量级都远大于有限差分 numerator。把普通 SF-NAC/gradient 的 atom-loop 结构直接套到 SATDA 自旋适配振幅上，不能保证得到纯 SATDA excitation Hamiltonian derivative。
+
+### 最终结论
+
+当前 `analytic_experimental` NAC 路径被禁用，直到满足下面的最小条件：
+
+$$
+\mathrm{get\_hf\_interstate\_numerator}(X_I,X_I)
+=
+\mathbf{G}_{I,\mathrm{total}}
+-\mathbf{G}_{\mathrm{ref}}.
+$$
+
+→ **解释：** 只有对角极限先成立，态间 $I\ne J$ 的解析 NAC 才有继续验证的意义。
+
+**代码对应：** `pyscf-forge/pyscf/nac/tdsatda.py:NonAdiabaticCouplings._kernel_analytic_experimental()` 当前显式抛出 `NotImplementedError`；有限差分路径 `method="finite_diff"` 保持可用。

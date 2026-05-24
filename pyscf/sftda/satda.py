@@ -712,3 +712,21 @@ class SATDA(TDBase):
         return tdsatda.Gradients(self)
 
     nuc_grad_method = Gradients
+
+    def NAC(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        name = '_pyscf_forge_nac_tdsatda'
+        if name in sys.modules:
+            tdsatda = sys.modules[name]
+        else:
+            path = Path(__file__).resolve().parents[1] / 'nac' / 'tdsatda.py'
+            spec = importlib.util.spec_from_file_location(name, path)
+            tdsatda = importlib.util.module_from_spec(spec)
+            sys.modules[name] = tdsatda
+            spec.loader.exec_module(tdsatda)
+        return tdsatda.NAC(self)
+
+    nac_method = NAC
