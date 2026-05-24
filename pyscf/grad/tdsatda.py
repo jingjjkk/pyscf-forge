@@ -892,6 +892,12 @@ def _satda_sf_gga_eval_k1_mat_deriv(mol, ao, u, mask, ao_loc):
                     mol, _satda_sf_ao_deriv_component(ao, i, x), aow,
                     mask, shls_slice, ao_loc,
                 )
+                aow_x = numint._scale_ao(
+                    _satda_sf_ao_deriv_component(ao, j, x), u[i, j]
+                )
+                vmat[x + 1] += numint._dot_ao_ao(
+                    mol, ao[i], aow_x, mask, shls_slice, ao_loc,
+                )
     return vmat
 
 
