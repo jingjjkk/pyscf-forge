@@ -2542,3 +2542,369 @@ $$
 这两类直接在 atom loop 中逐原子收缩，避免把 SATDA block 组合误写成普通 SF-TDDFT 的单密度 `_contract_xc_kernel`。
 
 **代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py` 中的 `_satda_sf_lda_xc_q()` 与 `_satda_sf_lda_xc_direct_de()`。
+
+---
+
+## 推导：SATDA $\Delta S=-1$ GGA XC 核解析梯度入口 — 2026-05-24
+
+**目标：** 将上一节 LDA 的 SATDA block-kernel 梯度推广到 GGA。关键差别是：GGA 下 `gen_rohf_response_sf()` 中的 `vref0` 与 `vref1` 不再是同一个 kernel map，因此不能像 LDA 那样合并成单一矩阵 $M$。必须保留两个独立算符：
+
+- $K_0^{\mathrm{ref}}$：`ni.nr_rks_fxc(..., fxc_ref)`，对应 `dms0=(co,cv,oo,ov)`。
+- $K_1^{\mathrm{ref}}$：`nr_rks_fxc1_gga(..., fxc_ref)`，对应 `dms1=(co,ov)` 的非 Hermitian GGA left/right-gradient contraction。
+
+**假设：**
+- 只处理 `deltaS=-1`。
+- 只推导 GGA，不含 MGGA 的 $\tau$ 项。
+- 使用与 `satda.py:gen_rohf_response_sf()` 完全一致的 `co/cv/oo/ov` AO transition density 定义。
+- hybrid-GGA 的 exact exchange 部分继续沿用 HF/hybrid exchange 解析块；本节只处理 XC kernel 部分。
+
+### Step 1: GGA reference kernel
+
+GGA 的 reference kernel 仍然由 ROKS spin-density kernel 组合得到：
+
+$$
+f^{\mathrm{ref}}_{xy}
+=\frac12\left(
+f^{\alpha\alpha}_{xy}
+-f^{\alpha\beta}_{xy}
+-f^{\beta\alpha}_{xy}
++f^{\beta\beta}_{xy}
+\right),
+\qquad x,y\in\{0,1,2,3\}.
+$$
+
+这里 $x=0$ 表示密度 $\rho$，$x=1,2,3$ 表示 $\nabla_x\rho,\nabla_y\rho,\nabla_z\rho$。代码中这就是
+
+```python
+fxc_ref = 0.5 * (
+    fxc_d0[0, :, 0] - fxc_d0[0, :, 1]
+    - fxc_d0[1, :, 0] + fxc_d0[1, :, 1]
+)
+```
+
+其中 `fxc_ref.shape == (4, 4, ngrids)`。
+
+### Step 2: 两个 GGA kernel map
+
+定义 block density 顺序
+
+$$
+B,L\in\{co,cv,oo,ov\}.
+$$
+
+对任意 AO pair density $D$，定义 GGA generalized density
+
+$$
+g(D)=
+\left(\rho(D), \nabla_x\rho(D), \nabla_y\rho(D), \nabla_z\rho(D)\right).
+$$
+
+`K0` 是 PySCF 标准 GGA Hessian contraction：
+
+$$
+K_0^{\mathrm{ref}}[D]
+=\mathcal{H}\left[
+\sum_{y=0}^{3} f^{\mathrm{ref}}_{xy} g_y(D)
+\right],
+$$
+
+其中 $\mathcal{H}$ 表示 `_gga_eval_mat_` / `nr_rks_fxc` 中的 Hermitian AO matrix 构造。
+
+`K1` 是 `nr_rks_fxc1_gga()` 使用的 non-Hermitian map。对非对称 $D$ 定义
+
+$$
+\rho = \phi D\phi,\qquad
+L_i = \phi D(\partial_i\phi),\qquad
+R_i = (\partial_i\phi)D\phi,\qquad
+T_{ij}=(\partial_i\phi)D(\partial_j\phi).
+$$
+
+`nr_rks_fxc1_gga()` 逐 grid 构造
+
+$$
+\begin{aligned}
+U_{00} &= f_{00}\rho + f_{i0}L_i + f_{0j}R_j + f_{ij}T_{ij},\\
+U_{i0} &= f_{i0}\rho + f_{ij}R_j,\\
+U_{0j} &= f_{0j}\rho + f_{ij}L_i,\\
+U_{ij} &= f_{ij}\rho,
+\end{aligned}
+$$
+
+并形成
+
+$$
+K_1^{\mathrm{ref}}[D]_{\mu\nu}
+=\int
+\begin{pmatrix}\phi_\mu & \partial_i\phi_\mu\end{pmatrix}
+U(D)
+\begin{pmatrix}\phi_\nu \\ \partial_j\phi_\nu\end{pmatrix}
+d\mathbf r.
+$$
+
+这一步是 GGA 不能复用普通 SF `_contract_xc_kernel` 的主要原因：SATDA 的 `vref1` 用的是显式 left/right-gradient map，而不是单一 transition density 的 Hermitian GGA response。
+
+### Step 3: SATDA block 系数矩阵
+
+令
+
+$$
+a=\sqrt{\frac{2S+1}{2S}},\quad
+b=\sqrt{\frac{2S}{2S-1}},\quad
+c=\sqrt{\frac{2S+1}{2S-1}},\quad
+d=\frac{1}{2S-1},\quad
+e=\frac{2S}{2S-1}.
+$$
+
+`vref0` 的系数矩阵为
+
+$$
+\boxed{
+M^{0}=
+\begin{pmatrix}
+1 & a & b & e \\
+a & 1 & c & a \\
+b & c & 1 & b \\
+e & a & b & 1
+\end{pmatrix}.
+}
+$$
+
+`vref1` 只作用在 `co/ov` 两个源 block 上，其系数矩阵为
+
+$$
+\boxed{
+M^{1}=
+\begin{pmatrix}
+d & 0 & 0 & -d \\
+0 & 0 & 0 & 0 \\
+0 & 0 & 0 & 0 \\
+-d & 0 & 0 & d
+\end{pmatrix}.
+}
+$$
+
+因此 GGA 下每个输出 block 的 XC potential 为
+
+$$
+\boxed{
+V_B^{\mathrm{GGA}}
+=
+\sum_L M^{0}_{BL}K_0^{\mathrm{ref}}[D_L]
++
+\sum_L M^{1}_{BL}K_1^{\mathrm{ref}}[D_L].
+}
+$$
+
+当退化为 LDA 时 $K_0^{\mathrm{ref}}=K_1^{\mathrm{ref}}$，于是
+
+$$
+M^{0}+M^{1}
+=
+\begin{pmatrix}
+1+d & a & b & 1 \\
+a & 1 & c & a \\
+b & c & 1 & b \\
+1 & a & b & 1+d
+\end{pmatrix},
+$$
+
+这正好回到上一节的 LDA block matrix。
+
+### Step 4: GGA XC 二次型
+
+定义 AO trace pairing
+
+$$
+\langle A,B\rangle=\mathrm{Tr}(A^TB).
+$$
+
+GGA block XC 二次型写为
+
+$$
+E_{\mathrm{xc}}^{\mathrm{GGA}}
+=
+\frac14
+\sum_{B,L}
+\left[
+M^{0}_{BL}\langle D_B,K_0^{\mathrm{ref}}[D_L]\rangle
++
+M^{1}_{BL}\langle D_B,K_1^{\mathrm{ref}}[D_L]\rangle
+\right].
+$$
+
+$1/4$ 是 ROKS half-density convention 对 SATDA spin-flip block 梯度的同一缩放因子；LDA 数值测试已经验证该约定。
+
+由于 $K_1$ 对非 Hermitian density 不必自伴，不能把导数简单写成 $2V_B$。定义伴随算符 $K_1^\dagger$ 满足
+
+$$
+\langle A,K_1[B]\rangle
+=
+\langle K_1^\dagger[A],B\rangle.
+$$
+
+则对 transition density 的有效 AO potential 为
+
+$$
+\boxed{
+P_B^{\mathrm{xc}}
+=
+\frac14
+\sum_L
+\left[
+2M^{0}_{BL}K_0^{\mathrm{ref}}[D_L]
++
+M^{1}_{BL}K_1^{\mathrm{ref}}[D_L]
++
+M^{1}_{LB}K_1^{\mathrm{ref}\dagger}[D_L]
+\right].
+}
+$$
+
+这里 $K_0$ 已经由 `nr_rks_fxc` / `_gga_eval_mat_` Hermitian 化，因此 $K_0^\dagger=K_0$；而 $K_1^\dagger$ 在代码实现时应通过交换 left/right-gradient 角色或显式构造 adjoint contraction 得到。
+
+### Step 5: Z-vector RHS 与 im0
+
+每个 SATDA block 都是 beta-target / alpha-source 的 transition density：
+
+$$
+D_B = C^{\beta}_{t(B)} X_B^T (C^{\alpha}_{s(B)})^T.
+$$
+
+有了 $P_B^{\mathrm{xc}}$ 后，MO coefficient derivative 的 projection 部分为
+
+$$
+Q^\beta_{r,t(B)}
+\leftarrow
+\left(C^TP_B^{\mathrm{xc}}C_{s(B)}^\alpha\right)_{r,\cdot}X_B,
+\qquad
+Q^\alpha_{r,s(B)}
+\leftarrow
+\left(C^TP_B^{\mathrm{xc}}C_{t(B)}^\beta\right)_{r,\cdot}X_B^T.
+$$
+
+随后与 HF/LDA 路径相同：
+
+$$
+R_{\mathrm{xc}}^\sigma = Q_{\mathrm{xc}}^\sigma-(Q_{\mathrm{xc}}^\sigma)^T
+$$
+
+投影到 virtual-occupied block 后加入 Z-vector RHS；
+
+$$
+B_{\mathrm{xc}}^\sigma
+=\frac12\left(Q_{\mathrm{xc}}^\sigma+(Q_{\mathrm{xc}}^\sigma)^T\right)
+$$
+
+在 Z-vector 解出后加入 `im0a/im0b` 的 overlap metric coefficient。
+
+### Step 6: reference-density response
+
+GGA 下 $f^{\mathrm{ref}}_{xy}$ 依赖 reference generalized density
+
+$$
+g^\tau_z=(\rho_\tau,\nabla_x\rho_\tau,\nabla_y\rho_\tau,\nabla_z\rho_\tau),
+\qquad \tau\in\{\alpha,\beta\}.
+$$
+
+定义三阶 reference kernel
+
+$$
+k^{\mathrm{ref},\tau}_{xyz}
+=
+\frac{\partial f^{\mathrm{ref}}_{xy}}
+{\partial g^\tau_z}
+=\frac12(
+k^{\alpha\alpha\tau}_{xyz}
+-k^{\alpha\beta\tau}_{xyz}
+-k^{\beta\alpha\tau}_{xyz}
++k^{\beta\beta\tau}_{xyz}).
+$$
+
+对每个 grid 点，reference-density response weight 为
+
+$$
+W^\tau_z
+=
+\frac14
+\sum_{B,L}
+\left[
+M^0_{BL}
+\frac{\partial \mathcal{B}_0(D_B,D_L)}
+{\partial g^\tau_z}
++
+M^1_{BL}
+\frac{\partial \mathcal{B}_1(D_B,D_L)}
+{\partial g^\tau_z}
+\right],
+$$
+
+其中
+
+$$
+\mathcal{B}_0(D,E)
+=
+\sum_{xy} g_x(D) f^{\mathrm{ref}}_{xy} g_y(E),
+$$
+
+而 $\mathcal{B}_1(D,E)$ 是 `nr_rks_fxc1_gga()` 的 local bilinear form：
+
+$$
+\mathcal{B}_1(D,E)
+=
+\rho(D)U_{00}(E)
++R_i(D)U_{i0}(E)
++L_j(D)U_{0j}(E)
++T_{ij}(D)U_{ij}(E).
+$$
+
+因此实现时不应只使用
+$g(D)^T k^{\mathrm{ref}} g(E)$；`K1` 的 left/right-gradient 结构必须通过 $\mathcal{B}_1$ 的导数进入 $W^\tau$。
+
+最终 reference response 对 MO derivative 的贡献是
+
+$$
+Q^\tau_{r i}
+\leftarrow
+\left[
+C^T\left(\mathcal{V}[W^\tau]+\mathcal{V}[W^\tau]^T\right)
+C_{\mathrm{occ},\tau}
+\right]_{r i},
+$$
+
+其中 $\mathcal{V}[W^\tau]$ 由 `_gga_eval_mat_` 构造。
+
+### Step 7: direct AO skeleton derivative
+
+GGA direct skeleton derivative 要对下面的 local bilinear form 做显式 AO/grid 导数：
+
+$$
+G_{\mathrm{xc,direct}}^{[x]}
+=
+\frac14
+\sum_{B,L}
+\left[
+M^0_{BL}
+\partial_x\mathcal{B}_0(D_B,D_L)
++
+M^1_{BL}
+\partial_x\mathcal{B}_1(D_B,D_L)
+\right].
+$$
+
+$\partial_x$ 在这里只作用于 AO values、AO gradients 和 grid weight，不包含 MO coefficient response。实际实现要求：
+
+- `ao_deriv=2`，因为 GGA 的 AO-gradient skeleton derivative 需要二阶 AO 导数。
+- `K0` direct 项可按 `_gga_eval_mat_` 的 derivative matrices 收缩。
+- `K1` direct 项必须复用 `nr_rks_fxc1_gga()` 中的 $U_{00},U_{i0},U_{0j},U_{ij}$ 结构并构造其 AO 导数；不能用普通 SF-TDDFT 的 `f1vo` 单密度收缩替代。
+- reference-density direct 项使用上一步的 $W^\tau_z$，并对 alpha/beta reference occupied density 做 GGA AO skeleton 收缩。
+
+### Step 8: 实现检查点
+
+GGA 程序实现前至少需要满足以下内部检查：
+
+1. 对任意测试 density，`K0/K1` block 组合必须逐 block 复现 `satda.py:gen_rohf_response_sf()` 中的 `v1ao_co/cv/oo/ov`。
+2. 在 LDA 极限下，$K_0=K_1$ 且 $M^0+M^1$ 必须精确退化到当前 LDA 实现。
+3. 关闭 `K1` 或把 $K1$ 错当作 $K0$ 时，GGA 有限差分应明显不闭合；这可作为防止误复用普通 SF kernel 的负测试。
+4. 最终验收使用 `PBE` 或 `BLYP` 小体系的 `E_ref+\omega` 中心有限差分。
+
+**代码对应（待实现）：** 后续应在 `pyscf-forge/pyscf/grad/tdsatda.py` 中新增 SATDA/GGA 专用 `K0/K1` helper，而不是扩展普通 `tduks_sf._contract_xc_kernel`。
