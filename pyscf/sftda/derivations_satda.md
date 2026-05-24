@@ -2393,3 +2393,152 @@ $$
 → **解释：** 只有对角极限先成立，态间 $I\ne J$ 的解析 NAC 才有继续验证的意义。
 
 **代码对应：** `pyscf-forge/pyscf/nac/tdsatda.py:NonAdiabaticCouplings._kernel_analytic_experimental()` 当前显式抛出 `NotImplementedError`；有限差分路径 `method="finite_diff"` 保持可用。
+
+---
+
+## 推导：SATDA $\Delta S=-1$ LDA XC 核解析梯度入口 — 2026-05-24
+
+**目标：** 将 `gen_rohf_response_sf()` 中的 LDA XC block 组合写成可用于梯度的统一双线性形式。这里不使用普通 SF-TDDFT 的 `_contract_xc_kernel` 作为黑盒，因为 SATDA 的 XC 核不是单一 transition density 的 $f_{xc}$ 收缩，而是由 `co/cv/oo/ov` 四个 block 经过自旋适配系数组合得到。
+
+**假设：**
+- 只处理 `deltaS=-1`。
+- 第一阶段只处理 LDA 型 XC 核；GGA/MGGA 的密度梯度与 $\tau$ 项另行推导。
+- hybrid-LDA 的 exact exchange 部分继续沿用 HF 解析块并乘以 hybrid/range-separated 系数。
+- $D_{co},D_{cv},D_{oo},D_{ov}$ 使用 `satda.py:gen_vind_sf()` 中相同 AO transition density 定义。
+
+### Step 1: SATDA LDA block kernel matrix
+
+`gen_rohf_response_sf()` 先计算
+
+$$
+V^{0}_{B}=K^{\mathrm{ref}}[D_B],\quad B\in\{co,cv,oo,ov\},
+$$
+
+以及
+
+$$
+V^{1}_{co}=K^{\mathrm{ref}}[D_{co}],\qquad
+V^{1}_{ov}=K^{\mathrm{ref}}[D_{ov}].
+$$
+
+对 LDA 而言，$V^{0}$ 与 $V^{1}$ 使用同一个局域核
+
+$$
+f_{xc}^{\mathrm{ref}}
+=\frac12(f_{\alpha\alpha}-f_{\alpha\beta}
+-f_{\beta\alpha}+f_{\beta\beta}).
+$$
+
+因此可以合并为一个对称 block 矩阵
+
+$$
+\mathbf V_B=\sum_L M_{BL}K^{\mathrm{ref}}[D_L],
+\qquad B,L\in\{co,cv,oo,ov\}.
+$$
+
+令
+
+$$
+a=\sqrt{\frac{2S+1}{2S}},\quad
+b=\sqrt{\frac{2S}{2S-1}},\quad
+c=\sqrt{\frac{2S+1}{2S-1}},\quad
+d=\frac{1}{2S-1}.
+$$
+
+则
+
+$$
+\boxed{
+M=
+\begin{pmatrix}
+1+d & a & b & 1 \\
+a & 1 & c & a \\
+b & c & 1 & b \\
+1 & a & b & 1+d
+\end{pmatrix}.
+}
+$$
+
+这正是 `satda.py` 中 `vref0/vref1` 的 $\Delta S=-1$ 系数组合；例如 $co,ov$ 元素中 $2S/(2S-1)-1/(2S-1)=1$。
+
+### Step 2: XC 二次型
+
+SATDA LDA XC 响应能量写作
+
+$$
+E_{\mathrm{xc}}^{\mathrm{SATDA}}
+=\sum_{B,L}M_{BL}
+\int f_{xc}^{\mathrm{ref}}(\mathbf r)\,
+\rho_B(\mathbf r)\rho_L(\mathbf r)\,d\mathbf r .
+$$
+
+因为 $M$ 对称，对 transition density 的一阶导数为
+
+$$
+\frac{\partial E_{\mathrm{xc}}}{\partial D_B}
+=2\sum_LM_{BL}K^{\mathrm{ref}}[D_L].
+$$
+
+在 ROKS `cache_xc_kernel(..., spin=1)` 的 half-density 约定下，梯度收缩使用额外的 $1/4$ 因子：
+
+$$
+Q^{B}_{\mathrm{xc}}
+\leftarrow
+\frac14 \cdot
+2\sum_LM_{BL}K^{\mathrm{ref}}[D_L].
+$$
+
+代码中这部分作为 `Q_xc` 加入 Z-vector RHS 的反对称部分，并把对称部分加入 `im0`。
+
+### Step 3: reference-density response
+
+由于 $f_{xc}^{\mathrm{ref}}$ 依赖参考密度，Z-vector RHS 还需要三阶核项：
+
+$$
+W_\tau(\mathbf r)
+=
+\frac14
+\sum_{B,L}M_{BL}\rho_B(\mathbf r)\rho_L(\mathbf r)
+\frac{\partial f_{xc}^{\mathrm{ref}}}{\partial\rho_\tau},
+\qquad \tau\in\{\alpha,\beta\}.
+$$
+
+其中
+
+$$
+\frac{\partial f_{xc}^{\mathrm{ref}}}{\partial\rho_\tau}
+=\frac12(
+k_{\alpha\alpha\tau}
+-k_{\alpha\beta\tau}
+-k_{\beta\alpha\tau}
++k_{\beta\beta\tau}).
+$$
+
+该势对占据轨道密度的导数投影为
+
+$$
+Q^\tau_{r i} \leftarrow
+\left[C^T(W_\tau+W_\tau^T)C_{\mathrm{occ},\tau}\right]_{r i}.
+$$
+
+### Step 4: direct AO skeleton derivative
+
+显式 AO/grid 导数分成两类：
+
+1. transition density AO 导数：
+
+$$
+2\cdot\frac14
+\sum_B \mathrm{Tr}\left[D_B^{[x]}
+\sum_LM_{BL}K^{\mathrm{ref}}[D_L]\right].
+$$
+
+2. reference density AO 导数：
+
+$$
+\sum_\tau \mathrm{Tr}\left[(D^\tau_{\mathrm{occ}})^{[x]} W_\tau\right].
+$$
+
+这两类直接在 atom loop 中逐原子收缩，避免把 SATDA block 组合误写成普通 SF-TDDFT 的单密度 `_contract_xc_kernel`。
+
+**代码对应：** `pyscf-forge/pyscf/grad/tdsatda.py` 中的 `_satda_sf_lda_xc_q()` 与 `_satda_sf_lda_xc_direct_de()`。

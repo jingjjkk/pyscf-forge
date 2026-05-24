@@ -33,6 +33,7 @@ from pyscf import dft
 from pyscf import lib
 from pyscf import scf
 from pyscf.grad import rhf as rhf_grad
+from pyscf.grad import tdrks as tdrks_grad
 from pyscf.lib import logger
 from pyscf.scf import ucphf
 
@@ -237,7 +238,7 @@ def _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
 
 
 def _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta):
-    '''Add HF Fock-density response contribution to Q_alpha/Q_beta.'''
+    '''Add Fock-density response contribution to Q_alpha/Q_beta.'''
     mf = tdobj._scf
     mol = mf.mol
     mo_coeff = mf.mo_coeff
@@ -245,12 +246,17 @@ def _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta):
     occidxa = np.where(mo_occ > 0)[0]
     occidxb = np.where(mo_occ == 2)[0]
 
-    p_tot = p_alpha + p_beta
-    vj = mf.get_j(mol, p_tot.T, hermi=0)
-    vk_a = mf.get_k(mol, p_alpha.T, hermi=0)
-    vk_b = mf.get_k(mol, p_beta.T, hermi=0)
-    va = vj - vk_a
-    vb = vj - vk_b
+    if isinstance(mf, dft.KohnShamDFT) and mf._numint._xc_type(mf.xc) != 'HF':
+        umf = _as_spin_unrestricted_reference(mf)
+        vresp = umf.gen_response(hermi=0)
+        va, vb = vresp(np.asarray((p_alpha.T, p_beta.T)))
+    else:
+        p_tot = p_alpha + p_beta
+        vj = mf.get_j(mol, p_tot.T, hermi=0)
+        vk_a = mf.get_k(mol, p_alpha.T, hermi=0)
+        vk_b = mf.get_k(mol, p_beta.T, hermi=0)
+        va = vj - vk_a
+        vb = vj - vk_b
     q_alpha[:, occidxa] += mo_coeff.conj().T @ (va + va.T) @ mo_coeff[:, occidxa]
     q_beta[:, occidxb] += mo_coeff.conj().T @ (vb + vb.T) @ mo_coeff[:, occidxb]
 
@@ -713,6 +719,288 @@ def _as_v1_stack(v1):
     return v1
 
 
+def _satda_sf_lda_block_matrix(si):
+    a = np.sqrt((2 * si + 1) / (2 * si))
+    b = np.sqrt(2 * si / (2 * si - 1))
+    c = np.sqrt((2 * si + 1) / (2 * si - 1))
+    d = 1.0 / (2 * si - 1)
+    return np.asarray((
+        (1 + d, a, b, 1.0),
+        (a, 1.0, c, a),
+        (b, c, 1.0, b),
+        (1.0, a, b, 1 + d),
+    ))
+
+
+# ``fxc_ref`` is built with the ROKS half-density convention used by
+# ``cache_xc_kernel(..., spin=1)``.  The SATDA spin-flip block gradient carries
+# the corresponding quarter factor, while the sigma-vector contraction itself
+# keeps the unscaled matrix in ``satda.py``.
+SATDA_SF_LDA_XC_GRAD_SCALE = 0.25
+
+
+def _satda_sf_transition_blocks(tdobj, xy):
+    b = make_satda_sf_blocks(tdobj, xy)
+    _, _, _, orbcs, orbos, orbvs = _satda_orbitals(tdobj)
+    blocks = (
+        (b.osidx, b.csidx, _mo_pair_dm(orbos, b.x_co.T, orbcs), b.x_co.T),
+        (b.vsidx, b.csidx, _mo_pair_dm(orbvs, b.x_cv.T, orbcs), b.x_cv.T),
+        (b.osidx, b.osidx, _mo_pair_dm(orbos, b.x_oo.T, orbos), b.x_oo.T),
+        (b.vsidx, b.osidx, _mo_pair_dm(orbvs, b.x_ov.T, orbos), b.x_ov.T),
+    )
+    return b, blocks
+
+
+def _satda_sf_lda_fxc_ref(tdobj, max_memory=2000):
+    mf = tdobj._scf
+    ni = mf._numint
+    fxc = ni.cache_xc_kernel(
+        mf.mol, mf.grids, mf.xc, mf.mo_coeff, mf.mo_occ, 1,
+        max_memory=max_memory,
+    )[2]
+    return 0.5 * (fxc[0, :, 0] - fxc[0, :, 1]
+                  - fxc[1, :, 0] + fxc[1, :, 1])
+
+
+def _satda_sf_lda_apply_fxc_ref(tdobj, dms, fxc_ref, max_memory=2000):
+    mf = tdobj._scf
+    dms = np.asarray(dms)
+    if dms.ndim == 2:
+        dms = dms.reshape(1, *dms.shape)
+    return mf._numint.nr_rks_fxc(
+        mf.mol, mf.grids, mf.xc, None, dms, 0, 0,
+        None, None, fxc_ref, max_memory=max_memory,
+    )
+
+
+def _satda_sf_lda_ref_density_mats(tdobj, xy, with_deriv=False,
+                                   max_memory=2000):
+    mf = tdobj._scf
+    mol = mf.mol
+    ni = mf._numint
+    xctype = ni._xc_type(mf.xc)
+    if xctype != 'LDA':
+        raise NotImplementedError('SATDA XC analytical gradient currently '
+                                  'supports only LDA kernels')
+
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    dms = [blk[2] for blk in blocks]
+    mat = _satda_sf_lda_block_matrix(b.si)
+    nao = mol.nao_nr()
+    shls_slice = (0, mol.nbas)
+    ao_loc = mol.ao_loc_nr()
+    vmat_a = np.zeros((4, nao, nao))
+    vmat_b = np.zeros_like(vmat_a)
+
+    for ao, mask, weight, coords in ni.block_loop(
+            mol, mf.grids, nao, 1, max_memory=max_memory):
+        ao0 = ao[0]
+        rho0 = ni.eval_rho2(
+            mol, ao0, mf.mo_coeff, mf.mo_occ, mask, xctype,
+            with_lapl=False,
+        ) * 0.5
+        rho = (rho0, rho0)
+        kxc = ni.eval_xc_eff(
+            mf.xc, rho, deriv=3, xctype=xctype, spin=1,
+        )[3]
+        kref_a = 0.5 * (
+            kxc[0, 0, 0, 0, 0, 0] - kxc[0, 0, 1, 0, 0, 0]
+            - kxc[1, 0, 0, 0, 0, 0] + kxc[1, 0, 1, 0, 0, 0]
+        )
+        kref_b = 0.5 * (
+            kxc[0, 0, 0, 0, 1, 0] - kxc[0, 0, 1, 0, 1, 0]
+            - kxc[1, 0, 0, 0, 1, 0] + kxc[1, 0, 1, 0, 1, 0]
+        )
+        rho_blocks = np.asarray([
+            ni.eval_rho(mol, ao0, dm, mask, xctype, hermi=0,
+                        with_lapl=False)
+            for dm in dms
+        ])
+        rho_pair = lib.einsum('bl,bg,lg->g', mat, rho_blocks, rho_blocks)
+        rho_pair *= SATDA_SF_LDA_XC_GRAD_SCALE
+        wv_a = (kref_a * rho_pair * weight).reshape(1, -1)
+        wv_b = (kref_b * rho_pair * weight).reshape(1, -1)
+        tdrks_grad._lda_eval_mat_(
+            mol, vmat_a, ao, wv_a, mask, shls_slice, ao_loc
+        )
+        tdrks_grad._lda_eval_mat_(
+            mol, vmat_b, ao, wv_b, mask, shls_slice, ao_loc
+        )
+
+    if with_deriv:
+        vmat_a[1:] *= -1
+        vmat_b[1:] *= -1
+        return vmat_a, vmat_b
+    return vmat_a[0], vmat_b[0]
+
+
+def _satda_sf_lda_transition_deriv_mats(tdobj, xy, fxc_ref,
+                                        max_memory=2000):
+    mf = tdobj._scf
+    mol = mf.mol
+    ni = mf._numint
+    xctype = ni._xc_type(mf.xc)
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    dms = [blk[2] for blk in blocks]
+    mat = _satda_sf_lda_block_matrix(b.si)
+    nao = mol.nao_nr()
+    shls_slice = (0, mol.nbas)
+    ao_loc = mol.ao_loc_nr()
+    fxc_ref = np.asarray(fxc_ref).reshape(-1, np.asarray(fxc_ref).shape[-1])
+    src = np.zeros((4, 4, nao, nao))
+
+    p1 = 0
+    for ao, mask, weight, coords in ni.block_loop(
+            mol, mf.grids, nao, 1, max_memory=max_memory):
+        p0, p1 = p1, p1 + weight.size
+        ao0 = ao[0]
+        fxc_blk = fxc_ref[:, p0:p1]
+        for iblk, dm in enumerate(dms):
+            rho = ni.eval_rho(
+                mol, ao0, dm, mask, xctype, hermi=0, with_lapl=False
+            )
+            wv = fxc_blk * rho.reshape(1, -1) * weight
+            tdrks_grad._lda_eval_mat_(
+                mol, src[iblk], ao, wv, mask, shls_slice, ao_loc
+            )
+
+    src[:, 1:] *= -1
+    out = np.zeros_like(src)
+    for iblk in range(4):
+        out[iblk] = (
+            SATDA_SF_LDA_XC_GRAD_SCALE
+            * lib.einsum('l,lxpq->xpq', mat[iblk], src)
+        )
+    return out
+
+
+def _satda_sf_lda_xc_q(tdobj, xy, max_memory=2000):
+    mf = tdobj._scf
+    if mf._numint._xc_type(mf.xc) != 'LDA':
+        nmo = mf.mo_coeff.shape[1]
+        return np.zeros((nmo, nmo)), np.zeros((nmo, nmo))
+
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    mat = _satda_sf_lda_block_matrix(b.si)
+    mo_coeff = mf.mo_coeff
+    nmo = mo_coeff.shape[1]
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+
+    fxc_ref = _satda_sf_lda_fxc_ref(tdobj, max_memory=max_memory)
+    vsrc = _satda_sf_lda_apply_fxc_ref(
+        tdobj, [blk[2] for blk in blocks], fxc_ref, max_memory=max_memory
+    )
+    vblocks = np.asarray([
+        2.0 * SATDA_SF_LDA_XC_GRAD_SCALE
+        * lib.einsum('l,lpq->pq', mat[iblk], vsrc)
+        for iblk in range(4)
+    ])
+
+    for vmat, (target_idx, source_idx, dm, amp_t_s) in zip(vblocks, blocks):
+        vmo = mo_coeff.conj().T @ vmat @ mo_coeff
+        q_beta[:, target_idx] += vmo[:, source_idx] @ amp_t_s.T
+        q_alpha[:, source_idx] += vmo[:, target_idx] @ amp_t_s
+
+    wa, wb = _satda_sf_lda_ref_density_mats(
+        tdobj, xy, with_deriv=False, max_memory=max_memory
+    )
+    occidxa = np.where(mf.mo_occ > 0)[0]
+    occidxb = np.where(mf.mo_occ == 2)[0]
+    q_alpha[:, occidxa] += mo_coeff.conj().T @ (wa + wa.T) @ mo_coeff[:, occidxa]
+    q_beta[:, occidxb] += mo_coeff.conj().T @ (wb + wb.T) @ mo_coeff[:, occidxb]
+    return q_alpha, q_beta
+
+
+def _satda_sf_lda_xc_direct_de(td_grad, tdobj, xy, atmlst, offsetdic,
+                               oo0a, oo0b, max_memory=2000):
+    mf = tdobj._scf
+    if mf._numint._xc_type(mf.xc) != 'LDA':
+        return np.zeros((len(tuple(atmlst)), 3))
+
+    atmlst = tuple(atmlst)
+    b, blocks = _satda_sf_transition_blocks(tdobj, xy)
+    dms = [blk[2] for blk in blocks]
+    fxc_ref = _satda_sf_lda_fxc_ref(tdobj, max_memory=max_memory)
+    trans_der = _satda_sf_lda_transition_deriv_mats(
+        tdobj, xy, fxc_ref, max_memory=max_memory
+    )
+    wa_der, wb_der = _satda_sf_lda_ref_density_mats(
+        tdobj, xy, with_deriv=True, max_memory=max_memory
+    )
+
+    de = np.zeros((len(atmlst), 3))
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+        for fder, dm in zip(trans_der[:, 1:], dms):
+            de[k] += lib.einsum('xpq,pq->x', fder[:, p0:p1], dm[p0:p1]) * 2
+            de[k] += lib.einsum('xpq,pq->x', fder[:, p0:p1], dm.T[p0:p1]) * 2
+        de[k] += lib.einsum('xpq,pq->x', wa_der[1:, p0:p1], oo0a[p0:p1])
+        de[k] += lib.einsum('xpq,pq->x', wa_der[1:, p0:p1], oo0a.T[p0:p1])
+        de[k] += lib.einsum('xpq,pq->x', wb_der[1:, p0:p1], oo0b[p0:p1])
+        de[k] += lib.einsum('xpq,pq->x', wb_der[1:, p0:p1], oo0b.T[p0:p1])
+    return de
+
+
+def _contract_uks_lda_vxc_deriv(td_grad, mf, dmoo=None, max_memory=2000):
+    mol = td_grad.mol
+    ni = mf._numint
+    xctype = ni._xc_type(mf.xc)
+    if xctype != 'LDA':
+        raise NotImplementedError('Only LDA XC AO derivatives are available '
+                                  'in the SATDA experimental DFT path')
+
+    nao = mf.mo_coeff[0].shape[0]
+    shls_slice = (0, mol.nbas)
+    ao_loc = mol.ao_loc_nr()
+    vxc1 = np.zeros((2, 4, nao, nao))
+    if dmoo is None:
+        f1dm = None
+    else:
+        dmoo = np.asarray(dmoo)
+        f1dm = np.zeros((2, 4, nao, nao))
+
+    for ao, mask, weight, coords in ni.block_loop(
+            mol, mf.grids, nao, 1, max_memory=max_memory):
+        ao0 = ao[0]
+        rho = (
+            ni.eval_rho2(mol, ao0, mf.mo_coeff[0], mf.mo_occ[0], mask,
+                         xctype, with_lapl=False),
+            ni.eval_rho2(mol, ao0, mf.mo_coeff[1], mf.mo_occ[1], mask,
+                         xctype, with_lapl=False),
+        )
+        vxc, fxc = ni.eval_xc_eff(
+            mf.xc, rho, deriv=2, xctype=xctype, spin=1,
+        )[1:3]
+        tdrks_grad._lda_eval_mat_(
+            mol, vxc1[0], ao, vxc[0] * weight, mask, shls_slice, ao_loc
+        )
+        tdrks_grad._lda_eval_mat_(
+            mol, vxc1[1], ao, vxc[1] * weight, mask, shls_slice, ao_loc
+        )
+
+        if dmoo is not None:
+            rho2 = np.asarray((
+                ni.eval_rho(mol, ao0, dmoo[0], mask, xctype, hermi=1,
+                            with_lapl=False),
+                ni.eval_rho(mol, ao0, dmoo[1], mask, xctype, hermi=1,
+                            with_lapl=False),
+            ))
+            rho2 = rho2[:, np.newaxis]
+            wv = lib.einsum('axg,axbyg,g->byg', rho2, fxc, weight)
+            tdrks_grad._lda_eval_mat_(
+                mol, f1dm[0], ao, wv[0], mask, shls_slice, ao_loc
+            )
+            tdrks_grad._lda_eval_mat_(
+                mol, f1dm[1], ao, wv[1], mask, shls_slice, ao_loc
+            )
+
+    vxc1[:, 1:] *= -1
+    if f1dm is not None:
+        f1dm[:, 1:] *= -1
+    return vxc1, f1dm
+
+
 def _add_j_bilinear_ip1(de, td_grad, mol, dm_l, dm_r, atmlst, offsetdic,
                         scale=1.0, omega=None):
     '''Add direct ERI derivative for scale * sum L[pq] R[tu] (pq|tu).'''
@@ -863,18 +1151,28 @@ def satda_delta_hf_exchange_direct_de(td_grad, tdobj, xy, atmlst, offsetdic):
 
 def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
                               max_memory=2000, verbose=logger.INFO):
-    '''HF-only electronic gradient for SATDA deltaS=-1.
+    '''Development electronic gradient for SATDA deltaS=-1.
 
-    The implementation uses the HF equivalence between the new ROKS-native
-    SATDA sigma vector and the older SF-base plus spin-adaptation decomposition.
-    The orbital response is solved once in a spin-unrestricted CPHF layout.
+    HF uses the equivalence between the ROKS-native SATDA sigma vector and the
+    SF-base plus spin-adaptation decomposition.  LDA adds the SATDA-specific
+    block XC kernel contractions on top of the same spin-unrestricted CPHF
+    layout.
     '''
     log = logger.new_logger(td_grad, verbose)
     time0 = logger.process_clock(), logger.perf_counter()
 
     mol = td_grad.mol
     tdobj = td_grad.base
+    mf_ref = tdobj._scf
     mf = _as_spin_unrestricted_reference(tdobj._scf)
+    xctype_ref = (mf_ref._numint._xc_type(mf_ref.xc)
+                  if isinstance(mf_ref, dft.KohnShamDFT) else 'HF')
+    if xctype_ref not in ('HF', 'LDA'):
+        raise NotImplementedError(
+            'SATDA analytical gradients with XC kernels currently support '
+            'only LDA.  Use finite_diff for GGA/MGGA functionals.'
+        )
+    hybrid, hyb, omega, alpha = _hybrid_coefficients(mf_ref)
 
     mo_coeff = mf.mo_coeff
     mo_energy = mf.mo_energy
@@ -912,10 +1210,16 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
     dmy = reduce(np.dot, (orbob, y, orbva.T))
     dmt = dmx + dmy
 
-    vj0, vk0 = mf.get_jk(mol, (dmzooa, dmzoob), hermi=1)
-    vk1 = mf.get_k(mol, dmt, hermi=0)
-    veff0doo = vj0[0] + vj0[1] - vk0
-    veff0mo = reduce(np.dot, (mo_coeff[1].T, -vk1, mo_coeff[0]))
+    vresp = mf.gen_response(hermi=1)
+    veff0doo = vresp(np.asarray((dmzooa, dmzoob)))
+    if hybrid:
+        vk1 = mf.get_k(mol, dmt, hermi=0) * hyb
+        if omega != 0:
+            vk1 += mf.get_k(mol, dmt, hermi=0, omega=omega) * (alpha - hyb)
+        veff0mo = reduce(np.dot, (mo_coeff[1].T, -vk1, mo_coeff[0]))
+    else:
+        vk1 = np.zeros_like(dmt)
+        veff0mo = np.zeros((nmob, nmoa))
 
     wvoa = reduce(np.dot, (orbva.T, veff0doo[0], orboa))
     wvob = reduce(np.dot, (orbvb.T, veff0doo[1], orbob))
@@ -925,12 +1229,16 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
     wvob -= lib.einsum('jk,jc->ck', veff0mo.T[:nocca, :noccb], x)
 
     q_delta_a, q_delta_b = satda_delta_q(tdobj, x_y)
+    if xctype_ref == 'LDA':
+        q_xc_a, q_xc_b = _satda_sf_lda_xc_q(
+            tdobj, x_y, max_memory=max_memory
+        )
+        q_delta_a += q_xc_a
+        q_delta_b += q_xc_b
     r_delta_a = q_delta_a - q_delta_a.T
     r_delta_b = q_delta_b - q_delta_b.T
     wvoa += r_delta_a[np.ix_(viridxa, occidxa)]
     wvob += r_delta_b[np.ix_(viridxb, occidxb)]
-
-    vresp = mf.gen_response(hermi=1)
 
     def fvind(z):
         za = z[0, :nvira * nocca].reshape(nvira, nocca)
@@ -1003,11 +1311,34 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
 
     dm = (oo0a, dmz1dooa_direct + dmz1dooa_direct.T,
           oo0b, dmz1doob_direct + dmz1doob_direct.T)
-    vj, vk = td_grad.get_jk(mol, dm, hermi=1)
-    vj = vj.reshape(2, 2, 3, nao, nao)
-    vk = vk.reshape(2, 2, 3, nao, nao)
-    veff1 = vj[0] + vj[1] - vk
-    vk1 = -td_grad.get_k(mol, (dmt, dmt.T))
+    if hybrid:
+        vj, vk = td_grad.get_jk(mol, dm, hermi=1)
+        vj = vj.reshape(2, 2, 3, nao, nao)
+        vk = vk.reshape(2, 2, 3, nao, nao) * hyb
+        if omega != 0:
+            vk += td_grad.get_k(
+                mol, dm, hermi=1, omega=omega
+            ).reshape(2, 2, 3, nao, nao) * (alpha - hyb)
+        veff1 = vj[0] + vj[1] - vk
+        vk1 = -td_grad.get_k(mol, (dmt, dmt.T)) * hyb
+        if omega != 0:
+            vk1 += -td_grad.get_k(
+                mol, (dmt, dmt.T), omega=omega
+            ) * (alpha - hyb)
+    else:
+        vj = td_grad.get_j(mol, dm, hermi=1).reshape(2, 2, 3, nao, nao)
+        veff1 = vj[0] + vj[1]
+        veff1 = np.stack((veff1, veff1))
+        vk1 = np.zeros((2, 3, nao, nao))
+    if xctype_ref == 'LDA':
+        vxc1, f1dm = _contract_uks_lda_vxc_deriv(
+            td_grad, mf,
+            dmoo=(dmz1dooa_direct + dmz1dooa_direct.T,
+                  dmz1doob_direct + dmz1doob_direct.T),
+            max_memory=max_memory,
+        )
+        veff1[:, 0] += vxc1[:, 1:]
+        veff1[:, 1] += f1dm[:, 1:]
     veff1a, veff1b = veff1
     time1 = log.timer('SATDA/HF 2e AO integral derivatives', *time1)
 
@@ -1019,6 +1350,11 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
     de += satda_delta_hf_exchange_direct_de(
         td_grad, tdobj, x_y, atmlst, offsetdic
     )
+    if xctype_ref == 'LDA':
+        de += _satda_sf_lda_xc_direct_de(
+            td_grad, tdobj, x_y, atmlst, offsetdic, oo0a, oo0b,
+            max_memory=max_memory,
+        )
 
     for k, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = offsetdic[ia]
@@ -1038,11 +1374,12 @@ def grad_elec_hf_experimental(td_grad, x_y, atmlst=None,
         de[k] += lib.einsum('xij,ij->x', veff1a[1, :, p0:p1], oo0a[p0:p1]) * .5
         de[k] += lib.einsum('xij,ij->x', veff1b[1, :, p0:p1], oo0b[p0:p1]) * .5
 
-        de[k] += lib.einsum('xpq,pq->x', vk1[0, :, p0:p1], dmt[p0:p1]) * 2
-        de[k] += lib.einsum('xpq,pq->x', vk1[1, :, p0:p1], dmt.T[p0:p1]) * 2
+        if hybrid:
+            de[k] += lib.einsum('xpq,pq->x', vk1[0, :, p0:p1], dmt[p0:p1]) * 2
+            de[k] += lib.einsum('xpq,pq->x', vk1[1, :, p0:p1], dmt.T[p0:p1]) * 2
         de[k] += td_grad.extra_force(ia, locals())
 
-    log.timer('SATDA/HF electronic nuclear gradients', *time0)
+    log.timer('SATDA electronic nuclear gradients', *time0)
     return de
 
 
@@ -1172,26 +1509,43 @@ class Gradients(rhf_grad.GradientsBase):
                 'only deltaS=-1.'
             )
         mf = self.base._scf
-        if isinstance(mf, dft.KohnShamDFT) and mf.xc.upper() != 'HF':
+        xctype = (mf._numint._xc_type(mf.xc)
+                  if isinstance(mf, dft.KohnShamDFT) else 'HF')
+        if xctype not in ('HF', 'LDA'):
             raise NotImplementedError(
-                'SATDA analytical gradients for DFT require XC-kernel nuclear '
-                'derivatives and are not implemented in this HF-only path.'
+                'SATDA analytical gradients with XC kernels currently support '
+                'only LDA in the experimental deltaS=-1 path.'
             )
         make_satda_sf_blocks(self.base, xy)
-        e_probe = _satda_hf_energy_for_orbs(
-            self.base, xy, mf.mo_coeff, mf.mo_coeff
-        )
-        if abs(e_probe - self.base.e[self.state - 1]) > 1e-7:
-            raise RuntimeError(
-                'Internal SATDA/HF orbital-RHS energy check failed: %.12g vs %.12g'
-                % (e_probe, self.base.e[self.state - 1])
+        if xctype == 'HF':
+            e_probe = _satda_hf_energy_for_orbs(
+                self.base, xy, mf.mo_coeff, mf.mo_coeff
             )
+            if abs(e_probe - self.base.e[self.state - 1]) > 1e-7:
+                raise RuntimeError(
+                    'Internal SATDA/HF orbital-RHS energy check failed: %.12g vs %.12g'
+                    % (e_probe, self.base.e[self.state - 1])
+                )
+            de = grad_elec_hf_experimental(
+                self, xy, atmlst=atmlst, max_memory=self.max_memory,
+                verbose=self.verbose,
+            )
+            de += self.base._scf.nuc_grad_method().grad_nuc(atmlst=atmlst)
+            return de
+
         de = grad_elec_hf_experimental(
             self, xy, atmlst=atmlst, max_memory=self.max_memory,
             verbose=self.verbose,
         )
-        de += self.base._scf.nuc_grad_method().grad_nuc(atmlst=atmlst)
-        return de
+        xy0 = (np.zeros_like(np.asarray(xy[0])), 0)
+        de0 = grad_elec_hf_experimental(
+            self, xy0, atmlst=atmlst, max_memory=self.max_memory,
+            verbose=self.verbose,
+        )
+        g0 = self.base._scf.nuc_grad_method().set(
+            verbose=0,
+        ).kernel(atmlst=atmlst)
+        return g0 + de - de0
 
     def kernel(self, state=None, atmlst=None, step=None, method=None):
         if state is not None:

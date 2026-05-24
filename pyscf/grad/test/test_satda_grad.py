@@ -38,11 +38,14 @@ class KnownValues(unittest.TestCase):
     def tearDownClass(cls):
         cls.mol.stdout.close()
 
-    def make_mf(self):
-        return self.mol.ROKS(xc='HF').set(conv_tol=1e-10).run()
+    def make_mf(self, xc='HF'):
+        mf = self.mol.ROKS(xc=xc).set(conv_tol=1e-10)
+        if xc.upper() != 'HF':
+            mf.grids.level = 1
+        return mf.run()
 
-    def make_td(self, deltaS, nstates=4):
-        mf = self.make_mf()
+    def make_td(self, deltaS, nstates=4, xc='HF'):
+        mf = self.make_mf(xc=xc)
         td = SATDA(mf).set(deltaS=deltaS, nstates=nstates,
                            verbose=0, conv_tol=1e-8)
         td.kernel()
@@ -50,10 +53,13 @@ class KnownValues(unittest.TestCase):
         return td
 
     def run_satda_at(self, coords_bohr, deltaS, nstates, x_ref=None,
-                     target_state=1):
+                     target_state=1, xc='HF'):
         mol = self.mol.copy()
         mol.set_geom_(coords_bohr, unit='Bohr')
-        mf = mol.ROKS(xc='HF').set(conv_tol=1e-10, verbose=0).run()
+        mf = mol.ROKS(xc=xc).set(conv_tol=1e-10, verbose=0)
+        if xc.upper() != 'HF':
+            mf.grids.level = 1
+        mf.kernel()
         td = SATDA(mf).set(deltaS=deltaS, nstates=nstates,
                            verbose=0, conv_tol=1e-8)
         td.kernel()
@@ -123,6 +129,17 @@ class KnownValues(unittest.TestCase):
             verbose=0, root_overlap_tol=0.2).kernel(
                 state=state, step=2e-4, method='finite_diff')
         self.assertAlmostEqual(abs(grad_analytic - grad_fd).max(), 0, 3)
+
+    def test_analytic_experimental_deltaS_minus1_lda_matches_finite_diff(self):
+        td = self.make_td(deltaS=-1, nstates=3, xc='SVWN')
+        state = 2
+        grad_analytic = td.Gradients().set(
+            verbose=0, root_overlap_tol=0.2).kernel(
+                state=state, method='analytic_experimental')
+        grad_fd = td.Gradients().set(
+            verbose=0, root_overlap_tol=0.2).kernel(
+                state=state, step=2e-4, method='finite_diff')
+        self.assertAlmostEqual(abs(grad_analytic - grad_fd).max(), 0, 4)
 
     def test_analytic_experimental_deltaS_0_not_implemented(self):
         td = self.make_td(deltaS=0, nstates=3)
