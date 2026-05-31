@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import importlib
 import importlib.util
 from pathlib import Path
 import sys
@@ -199,6 +200,35 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(details['de_direct'].shape, grad.shape)
         self.assertEqual(details['de_orbital'].shape, grad.shape)
         self.assertTrue(np.all(np.isfinite(grad)))
+
+    def test_migrated_hf_delta_zvec_krylov_matches_dense(self):
+        delta = load_tdsatda_delta()
+        zsolver = importlib.import_module(delta.__name__ + '._zvec_solver')
+
+        td = self.make_td(deltaS=-1, nstates=4)
+        grad_obj = _GradShim(td)
+        xy = td.xy[1]
+
+        href, pairs, _ = zsolver.build_roks_hessian_reference(td)
+        hnew, pairs_new, _ = zsolver.build_roks_hessian(td)
+        self.assertEqual(pairs, pairs_new)
+        self.assertAlmostEqual(abs(hnew - href).max(), 0, 10)
+
+        action_t, pairs_t, _ = zsolver.make_roks_hessian_transpose_action(
+            td, pairs)
+        eye = np.eye(len(pairs))
+        ht_action = np.column_stack([action_t(e) for e in eye])
+        self.assertAlmostEqual(abs(ht_action - hnew.T).max(), 0, 10)
+
+        grad_dense, details_dense = delta.satda_delta_gradient_zvec(
+            grad_obj, td, xy, atmlst=range(td.mol.natm),
+            hessian_solver='dense')
+        grad_krylov, details_krylov = delta.satda_delta_gradient_zvec(
+            grad_obj, td, xy, atmlst=range(td.mol.natm),
+            hessian_solver='krylov')
+        self.assertEqual(details_krylov['hessian_solver'], 'krylov')
+        self.assertLess(details_krylov['zvec_residual'], 1e-8)
+        self.assertAlmostEqual(abs(grad_krylov - grad_dense).max(), 0, 8)
 
 
 if __name__ == '__main__':

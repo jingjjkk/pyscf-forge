@@ -39,8 +39,10 @@ from ._block_cvoo_hf import (
 
 from ._zvec_solver import (
     build_roks_hessian,
+    make_roks_hessian_transpose_action,
     pack_mvec,
     solve_zvec,
+    solve_zvec_krylov,
     zvec_orbital_grad,
 )
 
@@ -114,7 +116,8 @@ def sasf_delta_gradient(td_grad, tdobj, xy, atmlst=None, verbose=0):
 #  Z-vector route (ONE linear solve total)
 # ---------------------------------------------------------------------------
 
-def sasf_delta_gradient_zvec(td_grad, tdobj, xy, atmlst=None):
+def sasf_delta_gradient_zvec(td_grad, tdobj, xy, atmlst=None,
+                             hessian_solver='krylov'):
     """Total SASF delta_A gradient via Z-vector method.
 
     One solve of H^T @ z = M_vec replaces 9 * 3 * N_atom CPHF solves.
@@ -134,10 +137,31 @@ def sasf_delta_gradient_zvec(td_grad, tdobj, xy, atmlst=None):
     # 2. Sum direct (skeleton) gradients
     de_direct = _total_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
 
-    # 3. Build Hessian once, pack M-vector, solve Z-vector
-    hmat, pairs, nmo = build_roks_hessian(tdobj)
-    mvec = pack_mvec(m_total, pairs)
-    zvec = solve_zvec(hmat, mvec)
+    # 3. Pack M-vector and solve Z-vector
+    if hessian_solver == 'dense':
+        hmat, pairs, nmo = build_roks_hessian(tdobj)
+        mvec = pack_mvec(m_total, pairs)
+        zvec = solve_zvec(hmat, mvec)
+    elif hessian_solver == 'krylov':
+        action_t, pairs, nmo = make_roks_hessian_transpose_action(tdobj)
+        mvec = pack_mvec(m_total, pairs)
+        zvec = solve_zvec_krylov(
+            action_t, pairs, tdobj, mvec,
+            tol=min(getattr(td_grad, 'cphf_conv_tol', 1e-9), 1e-12),
+            max_cycle=max(getattr(td_grad, 'cphf_max_cycle', 50), len(mvec)),
+            verbose=getattr(td_grad, 'verbose', 0),
+        )
+        zvec_residual = np.max(np.abs(action_t(zvec) - mvec))
+        if zvec_residual > 1e-8:
+            hmat, pairs, nmo = build_roks_hessian(tdobj)
+            mvec = pack_mvec(m_total, pairs)
+            zvec = solve_zvec(hmat, mvec)
+            hessian_solver = 'dense_fallback'
+            zvec_residual = np.max(np.abs(hmat.T @ zvec - mvec))
+        else:
+            hmat = None
+    else:
+        raise ValueError('Unknown hessian_solver %s' % hessian_solver)
 
     # 4. Orbital response via Z-vector
     de_orbital = zvec_orbital_grad(
@@ -152,6 +176,11 @@ def sasf_delta_gradient_zvec(td_grad, tdobj, xy, atmlst=None):
         'zvec': zvec,
         'hmat': hmat,
         'pairs': pairs,
+        'hessian_solver': hessian_solver,
+        'zvec_residual': (
+            np.max(np.abs(hmat.T @ zvec - mvec))
+            if hessian_solver == 'dense' else zvec_residual
+        ),
     }
 
 
