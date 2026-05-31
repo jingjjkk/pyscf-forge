@@ -111,6 +111,21 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(np.all(td.converged))
         return td
 
+    def make_td_hno_lda_unpruned(self, nstates=3):
+        mol = gto.M(
+            atom='H 0 0 0; N 0 0 1.05; O 0.85 0 1.65',
+            spin=2, basis='sto-3g', verbose=0,
+        )
+        mf = mol.ROKS(xc='SVWN').set(conv_tol=1e-10, verbose=0)
+        mf.grids.level = 3
+        mf.grids.prune = None
+        mf.kernel()
+        td = SATDA(mf).set(deltaS=-1, nstates=nstates,
+                           verbose=0, conv_tol=1e-8)
+        td.kernel()
+        self.assertTrue(np.all(td.converged))
+        return td
+
     def run_satda_at(self, coords_bohr, deltaS, nstates, x_ref=None,
                      target_state=1, xc='HF'):
         mol = self.mol.copy()
@@ -336,12 +351,48 @@ class KnownValues(unittest.TestCase):
 
         self.assertAlmostEqual(abs(analytic - fd).max(), 0, 5)
 
-    def test_migrated_lda_total_delta_gradient_not_silently_enabled(self):
+    def test_migrated_lda_zvec_not_silently_enabled(self):
         delta = load_tdsatda_delta()
         td = self.make_td_lda_unpruned(nstates=3)
         with self.assertRaises(NotImplementedError):
             delta.satda_delta_gradient_zvec(
                 _GradShim(td), td, td.xy[1], atmlst=range(td.mol.natm))
+
+    def test_migrated_lda_delta_cpks_matches_fixed_amplitude_fd(self):
+        delta = load_tdsatda_delta()
+        delta_grad = importlib.import_module(delta.__name__ + '._delta_grad')
+
+        td = self.make_td_hno_lda_unpruned(nstates=3)
+        xy = td.xy[1]
+        grad_obj = _GradShim(td)
+        analytic, details = delta.satda_delta_gradient_cpks(
+            grad_obj, td, xy, atmlst=range(td.mol.natm))
+        max_res = max(np.max(v) for v in details['response']['residuals'].values())
+        self.assertLess(max_res, 1e-10)
+
+        coords0 = td.mol.atom_coords()
+        fd = np.zeros_like(analytic)
+        step = 2e-4
+        check_components = ((0, 2), (1, 2), (2, 0), (2, 2))
+
+        def energy_at(coords):
+            mol = td.mol.copy()
+            mol.set_geom_(coords, unit='Bohr')
+            mf = mol.ROKS(xc=td._scf.xc).set(conv_tol=1e-10, verbose=0)
+            _copy_grid_settings(td._scf, mf)
+            mf.kernel()
+            displaced = _FrozenTD(mf, td.nstates)
+            return delta_grad._total_delta_energy(displaced, xy)
+
+        for ia, xyz in check_components:
+            cp = coords0.copy()
+            cm = coords0.copy()
+            cp[ia, xyz] += step
+            cm[ia, xyz] -= step
+            fd[ia, xyz] = (energy_at(cp) - energy_at(cm)) / (2 * step)
+
+        for ia, xyz in check_components:
+            self.assertAlmostEqual(analytic[ia, xyz], fd[ia, xyz], 5)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import numpy as np
 
 from pyscf import ao2mo
+from pyscf import dft
 from pyscf import lib
 
 from ._blocks import (
@@ -9,6 +10,7 @@ from ._blocks import (
     _mo_pair_dm,
     make_sasf_blocks,
 )
+from ._fock_coeff import sasf_fock_probe_densities
 
 
 def _as_dm_stack(dm):
@@ -65,9 +67,85 @@ def _full_spin_fock_derivs_by_atom(td_grad, tdobj, ia, eri1=None):
     h1 = mf.nuc_grad_method().hcore_generator(mol)(ia)
     j1a, k1a = _full_jk_deriv_atom(mol, dm_a, ia, eri1=eri1)
     j1b, k1b = _full_jk_deriv_atom(mol, dm_b, ia, eri1=eri1)
-    f1a = h1 + j1a + j1b - k1a
-    f1b = h1 + j1a + j1b - k1b
+    if (isinstance(mf, dft.KohnShamDFT)
+            and mf._numint._xc_type(mf.xc) != 'HF'):
+        hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
+        if omega != 0:
+            raise NotImplementedError(
+                'Range-separated LDA Fock derivatives are not implemented'
+            )
+        f1a = h1 + j1a + j1b
+        f1b = h1 + j1a + j1b
+        if hybrid:
+            f1a -= hyb * k1a
+            f1b -= hyb * k1b
+        v1a, v1b = _full_lda_vxc_deriv_atom(
+            mf, dm_a, dm_b, ia, max_memory=getattr(td_grad, 'max_memory', 2000)
+        )
+        f1a += v1a
+        f1b += v1b
+    else:
+        f1a = h1 + j1a + j1b - k1a
+        f1b = h1 + j1a + j1b - k1b
     return f1a, f1b
+
+
+def _full_lda_vxc_deriv_atom(mf, dm_a, dm_b, ia, max_memory=2000):
+    """Full nuclear derivative of LDA ``v_xc`` for fixed AO densities.
+
+    The returned matrices follow the same full-matrix convention as
+    :func:`_full_jk_deriv_atom`: all AO centers belonging to ``ia`` are
+    differentiated and the sign is the nuclear derivative, not the electron
+    coordinate derivative.
+    """
+    mol = mf.mol
+    ni = mf._numint
+    if ni._xc_type(mf.xc) != 'LDA':
+        raise NotImplementedError('Only LDA vxc derivatives are implemented')
+
+    nao = mol.nao_nr()
+    p0, p1 = mol.offset_nr_by_atom()[ia][2:]
+    v1 = np.zeros((2, 3, nao, nao))
+    ao_loc = mol.ao_loc_nr()
+
+    for ao, mask, weight, coords in ni.block_loop(
+            mol, mf.grids, nao, 1, max_memory=max_memory):
+        ao0 = ao[0]
+        rho_a = ni.eval_rho(
+            mol, ao0, dm_a, mask, 'LDA', hermi=1, with_lapl=False
+        )
+        rho_b = ni.eval_rho(
+            mol, ao0, dm_b, mask, 'LDA', hermi=1, with_lapl=False
+        )
+        vxc, fxc = ni.eval_xc_eff(
+            mf.xc, (rho_a, rho_b), deriv=2, xctype='LDA', spin=1,
+        )[1:3]
+
+        for xyz in range(3):
+            aoa = ao[xyz + 1][:, p0:p1]
+            for ispin in range(2):
+                wv = weight * vxc[ispin, 0]
+                aow = ao0 * wv[:, None]
+                v1[ispin, xyz, p0:p1] -= aoa.T @ aow
+                v1[ispin, xyz, :, p0:p1] -= aow.T @ aoa
+
+            drho_a = -_rho_deriv_atom_component(ao0, aoa, dm_a, p0, p1)
+            drho_b = -_rho_deriv_atom_component(ao0, aoa, dm_b, p0, p1)
+            for ispin in range(2):
+                wv = weight * (
+                    fxc[ispin, 0, 0, 0] * drho_a
+                    + fxc[ispin, 0, 1, 0] * drho_b
+                )
+                aow = ao0 * wv[:, None]
+                v1[ispin, xyz] += ao0.T @ aow
+
+    return v1[0], v1[1]
+
+
+def _rho_deriv_atom_component(ao0, aoa, dm, p0, p1):
+    left = lib.einsum('gu,uv,gv->g', aoa, dm[p0:p1], ao0)
+    right = lib.einsum('gu,uv,gv->g', ao0, dm[:, p0:p1], aoa)
+    return left + right
 
 
 def _full_alpha_fock_deriv_by_atom(td_grad, tdobj, ia, eri1=None):
@@ -80,6 +158,23 @@ def _full_beta_fock_deriv_by_atom(td_grad, tdobj, ia, eri1=None):
     return _full_spin_fock_derivs_by_atom(
         td_grad, tdobj, ia, eri1=eri1
     )[1]
+
+
+def sasf_delta_fock_direct_de(td_grad, tdobj, xy, atmlst=None):
+    """Direct skeleton derivative of all SATDA Fock-like delta terms."""
+    if atmlst is None:
+        atmlst = range(tdobj.mol.natm)
+    atmlst = tuple(atmlst)
+    de = np.zeros((len(atmlst), 3))
+    dm_a, dm_b = sasf_fock_probe_densities(tdobj, xy)
+    eri1 = tdobj.mol.intor('int2e_ip1', comp=3)
+    for k, ia in enumerate(atmlst):
+        f1a, f1b = _full_spin_fock_derivs_by_atom(
+            td_grad, tdobj, ia, eri1=eri1
+        )
+        de[k] += lib.einsum('pq,xpq->x', dm_a, f1a)
+        de[k] += lib.einsum('pq,xpq->x', dm_b, f1b)
+    return de
 
 
 def _add_j_bilinear_ip1(de, td_grad, mol, dm_l, dm_r, atmlst, offsetdic,

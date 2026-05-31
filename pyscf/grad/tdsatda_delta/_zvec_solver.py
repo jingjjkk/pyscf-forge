@@ -10,6 +10,7 @@ Theory: The orbital response of energy E is dE/dR = direct + orbital.
 """
 
 import numpy as np
+from pyscf import dft
 from pyscf import lib
 
 from ._block_analytic_hf import (
@@ -18,7 +19,7 @@ from ._block_analytic_hf import (
     _anti_mo_from_roks_canonical_vec,
     _roks_general_orbital_action_hf,
 )
-from ._direct import _full_jk_deriv_atom
+from ._direct import _full_spin_fock_derivs_by_atom
 
 
 def _spin_fock_mo(mf, mo_coeff):
@@ -27,6 +28,40 @@ def _spin_fock_mo(mf, mo_coeff):
         mo_coeff.T @ fock.focka @ mo_coeff,
         mo_coeff.T @ fock.fockb @ mo_coeff,
     )
+
+
+def _response_mf(mf):
+    if (isinstance(mf, dft.KohnShamDFT)
+            and mf._numint._xc_type(mf.xc) != 'HF'):
+        out = mf.to_uks()
+        out.verbose = 0
+        return out
+    return mf
+
+
+def _roks_general_orbital_action(tdobj, pairs, kappa):
+    """ROKS canonical Hessian action for a general MO rotation matrix."""
+    mf = tdobj._scf
+    mo_coeff = mf.mo_coeff
+    mo_occ = mf.mo_occ
+    fmo_a, fmo_b = _spin_fock_mo(mf, mo_coeff)
+    occ_a = np.zeros_like(mo_occ, dtype=float)
+    occ_b = np.zeros_like(mo_occ, dtype=float)
+    occ_a[mo_occ > 0] = 1.0
+    occ_b[mo_occ == 2] = 1.0
+    ddm_mo_a = kappa * occ_a[None, :] + occ_a[:, None] * kappa.T
+    ddm_mo_b = kappa * occ_b[None, :] + occ_b[:, None] * kappa.T
+    ddm_a = mo_coeff @ ddm_mo_a @ mo_coeff.T
+    ddm_b = mo_coeff @ ddm_mo_b @ mo_coeff.T
+    vfock_a, vfock_b = _response_mf(mf).gen_response(hermi=1)(
+        np.stack((ddm_a, ddm_b))
+    )
+
+    dfmo_a = kappa.T @ fmo_a + fmo_a @ kappa
+    dfmo_a += mo_coeff.T @ vfock_a @ mo_coeff
+    dfmo_b = kappa.T @ fmo_b + fmo_b @ kappa
+    dfmo_b += mo_coeff.T @ vfock_b @ mo_coeff
+    return _pack_roks_canonical_residual(pairs, dfmo_a, dfmo_b)
 
 
 # ---------------------------------------------------------------------------
@@ -41,34 +76,14 @@ def make_roks_hessian_action(tdobj, pairs=None):
     to ``mf.gen_response``.  The outer ROKS packing/projection is kept local
     because PySCF's UCPHF layout does not represent the spatial CV constraint.
     """
-    mf = tdobj._scf
-    mol = mf.mol
-    mo_coeff = mf.mo_coeff
-    mo_occ = mf.mo_occ
+    mo_coeff = tdobj._scf.mo_coeff
     nmo = mo_coeff.shape[1]
     if pairs is None:
         pairs = _canonical_roks_pairs(tdobj)
 
-    fmo_a, fmo_b = _spin_fock_mo(mf, mo_coeff)
-    occ_a = np.zeros_like(mo_occ, dtype=float)
-    occ_b = np.zeros_like(mo_occ, dtype=float)
-    occ_a[mo_occ > 0] = 1.0
-    occ_b[mo_occ == 2] = 1.0
-    vresp = mf.gen_response(hermi=1)
-
     def action_one(vec):
         kappa = _anti_mo_from_roks_canonical_vec(nmo, pairs, vec)
-        ddm_mo_a = kappa * occ_a[None, :] + occ_a[:, None] * kappa.T
-        ddm_mo_b = kappa * occ_b[None, :] + occ_b[:, None] * kappa.T
-        ddm_a = mo_coeff @ ddm_mo_a @ mo_coeff.T
-        ddm_b = mo_coeff @ ddm_mo_b @ mo_coeff.T
-        vfock_a, vfock_b = vresp(np.stack((ddm_a, ddm_b)))
-
-        dfmo_a = kappa.T @ fmo_a + fmo_a @ kappa
-        dfmo_a += mo_coeff.T @ vfock_a @ mo_coeff
-        dfmo_b = kappa.T @ fmo_b + fmo_b @ kappa
-        dfmo_b += mo_coeff.T @ vfock_b @ mo_coeff
-        return _pack_roks_canonical_residual(pairs, dfmo_a, dfmo_b)
+        return _roks_general_orbital_action(tdobj, pairs, kappa)
 
     def action(vec):
         vec = np.asarray(vec)
@@ -94,7 +109,7 @@ def make_roks_hessian_transpose_action(tdobj, pairs=None):
     occ_b = np.zeros_like(mo_occ, dtype=float)
     occ_a[mo_occ > 0] = 1.0
     occ_b[mo_occ == 2] = 1.0
-    vresp = mf.gen_response(hermi=1)
+    vresp = _response_mf(mf).gen_response(hermi=1)
 
     def unpack_adjoint_source(vec):
         g_alpha = np.zeros((nmo, nmo))
@@ -261,22 +276,18 @@ def solve_zvec_krylov(action, pairs, tdobj, mvec, tol=1e-12, max_cycle=None,
 #  Perturbation RHS builder
 # ---------------------------------------------------------------------------
 
-def _perturbation_rhs(tdobj, ia, xyz, pairs, eri1, hcore_deriv, s1):
+def _perturbation_rhs(td_grad, tdobj, ia, xyz, pairs, eri1, hcore_deriv, s1):
     mol = tdobj.mol
     mf = tdobj._scf
     mo_coeff = mf.mo_coeff
-    mo_occ = mf.mo_occ
     offsetdic = mol.offset_nr_by_atom()
     p0, p1 = offsetdic[ia][2:]
 
-    dm_a = mo_coeff[:, mo_occ > 0] @ mo_coeff[:, mo_occ > 0].T
-    dm_b = mo_coeff[:, mo_occ == 2] @ mo_coeff[:, mo_occ == 2].T
-
-    j1a, k1a = _full_jk_deriv_atom(mol, dm_a, ia, eri1=eri1)
-    j1b, k1b = _full_jk_deriv_atom(mol, dm_b, ia, eri1=eri1)
-
-    dfock_a = hcore_deriv(ia)[xyz] + j1a[xyz] + j1b[xyz] - k1a[xyz]
-    dfock_b = hcore_deriv(ia)[xyz] + j1a[xyz] + j1b[xyz] - k1b[xyz]
+    f1a, f1b = _full_spin_fock_derivs_by_atom(
+        td_grad, tdobj, ia, eri1=eri1
+    )
+    dfock_a = f1a[xyz]
+    dfock_b = f1b[xyz]
 
     gfix = _pack_roks_canonical_residual(
         pairs,
@@ -289,9 +300,51 @@ def _perturbation_rhs(tdobj, ia, xyz, pairs, eri1, hcore_deriv, s1):
     s1ao[:, p0:p1] += s1[xyz, p0:p1].T
     ksym = -0.5 * (mo_coeff.T @ s1ao @ mo_coeff)
 
-    h_resp = _roks_general_orbital_action_hf(tdobj, pairs, ksym)
+    h_resp = _roks_general_orbital_action(tdobj, pairs, ksym)
 
     return gfix, ksym, h_resp
+
+
+def roks_canonical_response_kappas(td_grad, tdobj, atmlst=None):
+    """Solve the forward ROKS CPKS equations in canonical variables."""
+    mol = tdobj.mol
+    mf = tdobj._scf
+    nmo = mf.mo_coeff.shape[1]
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+
+    hmat, pairs, _ = build_roks_hessian(tdobj)
+    hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
+    s1 = mf.nuc_grad_method().get_ovlp(mol)
+    eri1 = mol.intor('int2e_ip1', comp=3)
+    kappas = {}
+    residuals = {}
+    rhs_by_atom = {}
+    for ia in atmlst:
+        katom = np.zeros((3, nmo, nmo))
+        ratom = np.zeros(3)
+        rhs_atom = np.zeros((3, len(pairs)))
+        for xyz in range(3):
+            gfix, ksym, h_resp = _perturbation_rhs(
+                td_grad, tdobj, ia, xyz, pairs, eri1, hcore_deriv, s1,
+            )
+            rhs = -(gfix + h_resp)
+            avec = np.linalg.solve(hmat, rhs)
+            katom[xyz] = (
+                _anti_mo_from_roks_canonical_vec(nmo, pairs, avec) + ksym
+            )
+            ratom[xyz] = np.max(np.abs(hmat @ avec - rhs))
+            rhs_atom[xyz] = rhs
+        kappas[ia] = katom
+        residuals[ia] = ratom
+        rhs_by_atom[ia] = rhs_atom
+    return kappas, {
+        'hmat': hmat,
+        'pairs': pairs,
+        'residuals': residuals,
+        'rhs': rhs_by_atom,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +383,7 @@ def zvec_orbital_grad(td_grad, tdobj, hmat, pairs, m_full, zvec, atmlst=None):
     for k, ia in enumerate(atmlst):
         for xyz in range(3):
             gfix, ksym, h_resp = _perturbation_rhs(
-                tdobj, ia, xyz, pairs, eri1, hcore_deriv, s1,
+                td_grad, tdobj, ia, xyz, pairs, eri1, hcore_deriv, s1,
             )
             rhs = -(gfix + h_resp)
             de[k, xyz] = zvec @ rhs + np.trace(m_full @ ksym)

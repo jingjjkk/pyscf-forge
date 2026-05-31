@@ -1191,7 +1191,7 @@ $$
 
 → **解释：** 该对象通过 frozen-orbital/frozen-amplitude nuclear finite difference 验证。
 
-尚未由本节完成的是完整 DFT 总梯度中的 ROKS z-vector 核扰动 RHS：
+尚未由本节完成的是完整 DFT 总梯度中的 ROKS 核扰动 RHS：
 
 $$
 \mathbf{g}_{\mathrm{fix}}^{[x]}
@@ -1206,7 +1206,7 @@ C
 \right].
 $$
 
-→ **解释：** 当前 `_zvec_solver._perturbation_rhs()` 仍是 HF AO integral derivative convention。完整 LDA 总梯度闭合前必须单独校准这一项，不能把本节的两个局部闭合测试误读成完整 DFT 梯度已经完成。
+→ **解释：** 这是第一阶段后的待办项；下一节记录了正向 CPKS 路线中对该 RHS 的 LDA 实现与校准。DFT z-vector 路线仍需额外验证 adjoint action 后再启用。
 
 **代码对应：**
 - `pyscf/grad/tdsatda_delta/_xc_lda.py:lda_xc_energy`
@@ -1214,3 +1214,189 @@ $$
 - `pyscf/grad/tdsatda_delta/_xc_lda.py:lda_xc_direct_de`
 - `pyscf/grad/test/test_satda_grad.py:test_migrated_lda_xc_m_matrix_matches_orbital_fd`
 - `pyscf/grad/test/test_satda_grad.py:test_migrated_lda_xc_direct_matches_frozen_fd`
+
+## 推导：LDA ROKS-CPKS 正向梯度路线 — 2026-05-31
+
+**目标：** 在已验证的 LDA $M_{\mathrm{xc}}$ 与 direct skeleton 基础上，推导并记录 `tdsatda_delta/_delta_grad.py` 当前实现的正向 ROKS-CPKS 路线。
+
+**假设：**
+- 只讨论 `deltaS=-1`、ROKS、LDA、实轨道。
+- CPKS 路线用于调试和验证完整 LDA `delta_A` 梯度；z-vector DFT 路线仍保持禁用。
+- 核坐标导数采用 PySCF 默认无 grid-response convention。
+
+**符号声明：**
+- $\kappa^{[x]}=\kappa_{\mathrm{anti}}^{[x]}+\kappa_{\mathrm{sym}}^{[x]}$ 为 MO coefficient 的一阶变化。
+- $\kappa_{\mathrm{sym}}^{[x]}=-\frac{1}{2}C^{T}S^{[x]}C$。
+- $\mathbf{H}_{\mathrm{ROKS}}^{\mathrm{DFT}}$ 为 ROKS 空间变量上的 KS orbital Hessian。
+- $\mathbf{g}_{\mathrm{fix}}^{[x]}$ 为固定 MO 系数下 canonical residual 的显式核导数。
+
+**代码变量到数学符号的对应：**
+- `_roks_general_orbital_action()` = $\mathbf{H}_{\mathrm{ROKS}}^{\mathrm{DFT}}\kappa$。
+- `_perturbation_rhs()` = $(\mathbf{g}_{\mathrm{fix}}^{[x]},\kappa_{\mathrm{sym}}^{[x]},\mathbf{H}\kappa_{\mathrm{sym}}^{[x]})$。
+- `roks_canonical_response_kappas()` = 求解每个原子方向的 $\kappa^{[x]}$。
+- `sasf_delta_gradient_cpks()` = direct skeleton 加 $\operatorname{Tr}[M\kappa^{[x]}]$。
+
+### Step 1: 正向 CPKS 方程
+
+对每个原子方向 $x$，非冗余空间轨道响应满足
+
+$$
+\mathbf{H}_{\mathrm{ROKS}}^{\mathrm{DFT}}
+\kappa_{\mathrm{anti}}^{[x]}
+=
+-\left(
+\mathbf{g}_{\mathrm{fix}}^{[x]}
++
+\mathbf{H}_{\mathrm{ROKS}}^{\mathrm{DFT}}
+\kappa_{\mathrm{sym}}^{[x]}
+\right).
+$$
+
+→ **解释：** 这就是 `roks_canonical_response_kappas()` 中的 `rhs = -(gfix + h_resp)`。与 z-vector 路线相比，这里直接求实际的 orbital response，因此不涉及 adjoint packing。
+
+求出 $\kappa^{[x]}$ 后，`delta_A` 梯度为
+
+$$
+\Omega_{\Delta A}^{[x]}
+=
+\Omega_{\mathrm{direct}}^{[x]}
++
+\operatorname{Tr}
+\left[
+M_{\Delta A}
+\kappa^{[x]}
+\right].
+$$
+
+→ **解释：** `sasf_delta_gradient_cpks()` 中 `de_orbital = einsum('pq,xpq->x', m_total, kappas[ia])`。这里 $M_{\Delta A}$ 已包含 HF-like、Fock-like 与 LDA XC block-kernel 的所有已实现贡献。
+
+### Step 2: LDA 固定核扰动 RHS
+
+固定 AO density matrix 时，spin Fock 的显式核导数写成
+
+$$
+F_{\sigma}^{[x]}
+=
+h^{[x]}
++
+J^{[x]}[D_{\alpha}]
++
+J^{[x]}[D_{\beta}]
+-
+a_{\mathrm{x}}K^{[x]}[D_{\sigma}]
++
+v_{\mathrm{xc},\sigma}^{[x]}.
+$$
+
+→ **解释：** 这对应 `_full_spin_fock_derivs_by_atom()`。纯 LDA 下 $a_{\mathrm{x}}=0$，但函数保留 non-range hybrid LDA 的系数入口。
+
+LDA 的 XC 显式核导数分为 AO 显式项和 reference-density 项：
+
+$$
+\left[v_{\mathrm{xc},\sigma}^{[x]}\right]_{\mu\nu}
+=
+-\int
+\left(
+\chi_{\mu}^{x_A}\chi_{\nu}
++
+\chi_{\mu}\chi_{\nu}^{x_A}
+\right)
+v_{\sigma}
+d\mathbf{r}
++
+\int
+\chi_{\mu}\chi_{\nu}
+\sum_{\tau}
+f_{\sigma\tau}
+\rho_{\tau}^{[x_A]}
+d\mathbf{r}.
+$$
+
+→ **解释：** 第一项是 AO basis 显式导数；第二项是参考态密度随 AO basis 改变导致的 $f_{\mathrm{xc}}\rho^{[x]}$。代码中它们由 `_full_lda_vxc_deriv_atom()` 逐 grid block 组装。
+
+参考态密度导数为
+
+$$
+\rho_{\tau}^{[x_A]}(\mathbf{r})
+=
+-\sum_{\mu\in A,\nu}
+\left(
+\chi_{\mu}^{x}\chi_{\nu}D_{\mu\nu}^{\tau}
++
+\chi_{\nu}^{x}\chi_{\mu}D_{\nu\mu}^{\tau}
+\right).
+$$
+
+→ **解释：** 负号来自核导数与电子坐标 AO 导数方向相反。代码中 `_rho_deriv_atom_component()` 先构造电子坐标导数，再在 `_full_lda_vxc_deriv_atom()` 中取负号。
+
+### Step 3: DFT Hessian action 必须使用 spin-unrestricted response
+
+虽然参考态是 ROKS，DFT response kernel 的 alpha/beta 密度响应必须用 spin-unrestricted reference 构造：
+
+$$
+\delta V_{\mathrm{KS}}
+=
+\mathrm{UKSResponse}
+\left[
+\delta D_{\alpha},
+\delta D_{\beta}
+\right].
+$$
+
+→ **解释：** 直接调用 `mf.gen_response()` 在 ROKS 对象上会把 `mo_occ=2/1/0` 传入 UHF-style response builder，CO/CV Hessian action 与 orbital finite difference 可差到约 $5\times 10^{-3}$。改用 `mf.to_uks().gen_response()` 后同一 action 与 orbital finite difference 闭合到约 $10^{-10}$。
+
+因此代码中定义
+
+$$
+\mathrm{vresp}
+=
+\mathrm{mf.to\_uks().gen\_response}(\mathrm{hermi}=1).
+$$
+
+→ **解释：** 这对应 `_zvec_solver._response_mf()`。同样的 convention 也用于 `_q_rhs._add_fock_response_q()` 的 DFT Fock response。
+
+### Step 4: direct skeleton 使用聚合 probe density
+
+Fock-like direct skeleton 不再逐 block 调用 HF-only direct 函数，而是先构造总 probe density：
+
+$$
+\Omega_{\mathrm{Fock}}
+=
+\operatorname{Tr}[D_{\alpha}^{\mathrm{probe}}F_{\alpha}]
++
+\operatorname{Tr}[D_{\beta}^{\mathrm{probe}}F_{\beta}].
+$$
+
+→ **解释：** `sasf_fock_probe_densities()` 给出 $D_{\alpha}^{\mathrm{probe}}$ 与 $D_{\beta}^{\mathrm{probe}}$。`sasf_delta_fock_direct_de()` 直接收缩新实现的 $F_{\alpha}^{[x]},F_{\beta}^{[x]}$，避免每个 HF block direct 函数各自假设 $F^{z}=\frac{1}{2}(F^{\alpha}-F^{\beta})$。
+
+### 最终结果
+
+当前 LDA CPKS 路线实现的是
+
+$$
+\boxed{
+\Omega_{\Delta A}^{[x]}
+=
+\Omega_{\mathrm{Fock,direct}}^{[x]}
++
+\Omega_{\mathrm{HFX,direct}}^{[x]}
++
+\Omega_{\mathrm{LDA\ XC,direct}}^{[x]}
++
+\operatorname{Tr}
+\left[
+M_{\Delta A}^{\mathrm{LDA}}
+\kappa_{\mathrm{CPKS}}^{[x]}
+\right]
+}
+$$
+
+→ **解释：** 对 HNO/STO-3G/SVWN 的固定振幅 `delta_A` energy finite difference，新增测试验证选定核坐标分量在 $10^{-5}$ 以内闭合；实际本地数值最大差约 $2.7\times10^{-7}$，CPKS residual 约 $10^{-15}$。
+
+**代码对应：**
+- `pyscf/grad/tdsatda_delta/_direct.py:_full_lda_vxc_deriv_atom`
+- `pyscf/grad/tdsatda_delta/_direct.py:sasf_delta_fock_direct_de`
+- `pyscf/grad/tdsatda_delta/_zvec_solver.py:_response_mf`
+- `pyscf/grad/tdsatda_delta/_zvec_solver.py:roks_canonical_response_kappas`
+- `pyscf/grad/tdsatda_delta/_delta_grad.py:sasf_delta_gradient_cpks`
+- `pyscf/grad/test/test_satda_grad.py:test_migrated_lda_delta_cpks_matches_fixed_amplitude_fd`

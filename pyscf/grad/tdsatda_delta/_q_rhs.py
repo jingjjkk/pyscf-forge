@@ -67,7 +67,11 @@ def _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta):
 
     if (isinstance(mf, dft.KohnShamDFT)
             and mf._numint._xc_type(mf.xc) != 'HF'):
-        va, vb = mf.gen_response(hermi=0)(np.asarray((p_alpha.T, p_beta.T)))
+        umf = mf.to_uks()
+        umf.verbose = 0
+        va, vb = umf.gen_response(hermi=0)(
+            np.asarray((p_alpha.T, p_beta.T))
+        )
     else:
         p_tot = p_alpha + p_beta
         vj = mf.get_j(mol, p_tot.T, hermi=0)

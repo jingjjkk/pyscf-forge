@@ -7,15 +7,19 @@ that the first migration step does not change the underlying equations.
 
 from ._delta_grad import (
     sasf_delta_gradient,
+    sasf_delta_gradient_cpks,
     sasf_delta_gradient_zvec,
 )
 
 satda_delta_gradient = sasf_delta_gradient
+satda_delta_gradient_cpks = sasf_delta_gradient_cpks
 satda_delta_gradient_zvec = sasf_delta_gradient_zvec
 
 __all__ = [
     "sasf_delta_gradient",
+    "sasf_delta_gradient_cpks",
     "sasf_delta_gradient_zvec",
     "satda_delta_gradient",
+    "satda_delta_gradient_cpks",
     "satda_delta_gradient_zvec",
 ]

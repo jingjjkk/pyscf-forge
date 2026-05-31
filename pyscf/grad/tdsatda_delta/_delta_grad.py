@@ -9,6 +9,8 @@ The z-vector route replaces 9 * 3 * N_atom CPHF solves with ONE linear solve.
 
 import numpy as np
 
+from ._fock_coeff import sasf_fock_coefficient_energy
+from ._exchange import sasf_hf_exchange_coefficient_energy
 from ._block_analytic_hf import (
     cvcv_m_matrix, cvcv_direct_grad, cvcv_analytic_grad,
 )
@@ -41,11 +43,17 @@ from ._zvec_solver import (
     build_roks_hessian,
     make_roks_hessian_transpose_action,
     pack_mvec,
+    roks_canonical_response_kappas,
     solve_zvec,
     solve_zvec_krylov,
     zvec_orbital_grad,
 )
+from ._direct import (
+    sasf_delta_fock_direct_de,
+    sasf_delta_hf_exchange_direct_de,
+)
 from ._xc_lda import (
+    lda_xc_energy,
     lda_xc_direct_de,
     lda_xc_m_matrix,
 )
@@ -67,6 +75,23 @@ def _assert_total_delta_gradient_supported(tdobj):
             'for the ROKS Z-vector equation still needs a separate '
             'calibrated implementation.'
         )
+
+
+def _assert_cpks_delta_gradient_supported(tdobj):
+    xctype = _xc_type(tdobj)
+    if xctype not in ('HF', 'LDA'):
+        raise NotImplementedError(
+            'The forward SATDA delta CPKS route currently supports only '
+            'HF and LDA references'
+        )
+
+
+def _total_delta_energy(tdobj, xy):
+    return (
+        sasf_fock_coefficient_energy(tdobj, xy)
+        + sasf_hf_exchange_coefficient_energy(tdobj, xy)
+        + lda_xc_energy(tdobj, xy)
+    )
 
 
 def _total_m_matrix(tdobj, xy):
@@ -102,6 +127,18 @@ def _total_direct_grad(td_grad, tdobj, xy, atmlst=None):
     return de
 
 
+def _total_direct_grad_cpks(td_grad, tdobj, xy, atmlst=None):
+    if atmlst is None:
+        atmlst = range(tdobj.mol.natm)
+    atmlst = tuple(atmlst)
+    return (
+        sasf_delta_fock_direct_de(td_grad, tdobj, xy, atmlst=atmlst)
+        + sasf_delta_hf_exchange_direct_de(
+            td_grad, tdobj, xy, atmlst, tdobj.mol.offset_nr_by_atom())
+        + lda_xc_direct_de(td_grad, tdobj, xy, atmlst=atmlst)
+    )
+
+
 # ---------------------------------------------------------------------------
 #  CPHF route (legacy — 9 separate per-block CPHF solves)
 # ---------------------------------------------------------------------------
@@ -135,6 +172,33 @@ def sasf_delta_gradient(td_grad, tdobj, xy, atmlst=None, verbose=0):
         de += d
         parts[name] = d
     return de, parts
+
+
+def sasf_delta_gradient_cpks(td_grad, tdobj, xy, atmlst=None):
+    """Total SATDA delta_A gradient via forward ROKS CPKS equations."""
+    _assert_cpks_delta_gradient_supported(tdobj)
+    if atmlst is None:
+        atmlst = range(tdobj.mol.natm)
+    atmlst = tuple(atmlst)
+
+    m_total = _total_m_matrix(tdobj, xy)
+    de_direct = _total_direct_grad_cpks(
+        td_grad, tdobj, xy, atmlst=atmlst
+    )
+    kappas, response = roks_canonical_response_kappas(
+        td_grad, tdobj, atmlst=atmlst
+    )
+    de_orbital = np.zeros((len(atmlst), 3))
+    for k, ia in enumerate(atmlst):
+        de_orbital[k] = np.einsum('pq,xpq->x', m_total, kappas[ia])
+
+    return de_direct + de_orbital, {
+        'de_direct': de_direct,
+        'de_orbital': de_orbital,
+        'm_total': m_total,
+        'kappas': kappas,
+        'response': response,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +276,4 @@ def sasf_delta_gradient_zvec(td_grad, tdobj, xy, atmlst=None,
 
 satda_delta_gradient = sasf_delta_gradient
 satda_delta_gradient_zvec = sasf_delta_gradient_zvec
+satda_delta_gradient_cpks = sasf_delta_gradient_cpks
