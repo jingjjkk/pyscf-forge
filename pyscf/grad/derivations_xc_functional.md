@@ -979,3 +979,238 @@ GGA 的 grid loop 必须分别计算 `wv_0` ($K_{0}^{\mathrm{Ref}}$) 和 `wv_1` 
 - `pyscf-forge/pyscf/sftda/satda.py:nr_rks_fxc1_gga` — GGA crossed kernel action (line 33-85)
 - `pyscf-forge/pyscf/grad/tdsatda_delta/_exchange.py` — HF 交换项（hybrid 时复用）
 - `pyscf-forge/pyscf/grad/tdsatda_delta/_direct.py` — ERI 直接导数（hybrid 时复用）
+
+## 推导：SATDA `deltaS=-1` LDA XC 分块梯度的第一阶段实现对象 — 2026-05-31
+
+**目标：** 从 SATDA 的 LDA block-kernel 能量泛函推导当前 `tdsatda_delta/_xc_lda.py` 中实现并测试的两个局部解析对象：轨道旋转导数矩阵 $M_{\mathrm{xc}}$ 与 frozen-orbital direct skeleton 梯度。
+
+**假设：**
+- 只讨论 LDA，不包含 GGA feature-gradient 与 crossed GGA kernel。
+- 当前对象是 `delta_A` 修正中的 SATDA block XC 部分，不是完整 TDDFT 总梯度入口。
+- 分子轨道、振幅和 AO 基均取实数。
+- direct skeleton 测试采用 frozen MO coefficient 与 frozen excitation amplitude，即只微分 AO/grid/reference-density 显式核。
+
+**符号声明：**
+- $B,L\in\{CO,CV,OO,OV\}$ 为四个 SATDA transition block。
+- $D^{B}_{\mu\nu}$ 为 block $B$ 的 AO pair density。
+- $\rho_{B}(\mathbf{r})=\sum_{\mu\nu}D^{B}_{\mu\nu}\chi_{\mu}(\mathbf{r})\chi_{\nu}(\mathbf{r})$。
+- $f_{\mathrm{xc}}^{\mathrm{Ref}}$ 为 spin-difference reference kernel。
+- $M_{BL}(S)$ 为 `deltaS=-1` 的 LDA block coefficient matrix。
+- $s_{\mathrm{LDA}}=\frac{1}{4}$ 为当前 half-density convention 下的 overall factor。
+
+**代码变量到数学符号的对应：**
+- `_lda_block_matrix(si)` = $M_{BL}(S)$。
+- `_transition_blocks(tdobj, xy)` = $\{D^{CO},D^{CV},D^{OO},D^{OV}\}$ 及其 MO target/source index。
+- `lda_xc_energy()` = $\Omega_{\mathrm{xc}}^{\mathrm{LDA}}$。
+- `lda_xc_q()` / `lda_xc_m_matrix()` = $Q_{\alpha},Q_{\beta}$ 与 $M_{\mathrm{xc}}=Q_{\alpha}+Q_{\beta}$。
+- `lda_xc_direct_de()` = frozen-orbital direct skeleton。
+
+### Step 1: LDA block-kernel 能量
+
+当前 LDA block XC 能量写成
+
+$$
+\Omega_{\mathrm{xc}}^{\mathrm{LDA}}
+=s_{\mathrm{LDA}}
+\sum_{B,L}
+M_{BL}(S)
+\int
+\rho_{B}(\mathbf{r})
+f_{\mathrm{xc}}^{\mathrm{Ref}}(\mathbf{r})
+\rho_{L}(\mathbf{r})
+d\mathbf{r}.
+$$
+
+→ **解释：** 这是 `lda_xc_energy()` 的 grid 形式。`_lda_block_matrix(si)` 给出 $M_{BL}$，`lda_fxc_ref()` 给出 $f_{\mathrm{xc}}^{\mathrm{Ref}}$，`ni.eval_rho(..., hermi=0)` 给出非对称 pair density 的 $\rho_{B}$。
+
+### Step 2: 对 block density 的一阶变分给出 `Q`
+
+对某个 block $B$ 的 density 变分，有
+
+$$
+\delta\Omega_{\mathrm{xc}}^{\mathrm{LDA}}
+=
+2s_{\mathrm{LDA}}
+\sum_{B,L}
+M_{BL}(S)
+\int
+\delta\rho_{B}(\mathbf{r})
+f_{\mathrm{xc}}^{\mathrm{Ref}}(\mathbf{r})
+\rho_{L}(\mathbf{r})
+d\mathbf{r}
++\delta\Omega_{\mathrm{ref}}.
+$$
+
+→ **解释：** $M_{BL}$ 对称，LDA kernel action 对左右 density 对称，所以 block density 变分产生因子 $2$。代码中这对应 `vblocks = 2.0 * SATDA_LDA_XC_GRAD_SCALE * einsum(mat[iblk], vsrc)`。
+
+把 kernel action 记为
+
+$$
+\left[V_{B}^{\mathrm{xc}}\right]_{\mu\nu}
+=
+2s_{\mathrm{LDA}}
+\sum_{L}
+M_{BL}(S)
+\int
+\chi_{\mu}(\mathbf{r})\chi_{\nu}(\mathbf{r})
+f_{\mathrm{xc}}^{\mathrm{Ref}}(\mathbf{r})
+\rho_{L}(\mathbf{r})
+d\mathbf{r}.
+$$
+
+→ **解释：** 这就是 `lda_apply_fxc_ref()` 后按 block matrix 组合出的 `vblocks[iblk]`。
+
+例如若 $D^{B}=C_{T}X_{B}^{T}C_{S}^{T}$，则轨道系数变分产生
+
+$$
+\delta\Omega_{B}
+=
+\operatorname{Tr}
+\left[
+V_{B}^{\mathrm{xc}}
+\delta C_{T}X_{B}^{T}C_{S}^{T}
+\right]
++
+\operatorname{Tr}
+\left[
+V_{B}^{\mathrm{xc}}
+C_{T}X_{B}^{T}\delta C_{S}^{T}
+\right].
+$$
+
+→ **解释：** 第一项把贡献放进 target spin channel，第二项把贡献放进 source spin channel。`lda_xc_q()` 中 `q_beta[:, target_idx]` 与 `q_alpha[:, source_idx]` 正是这两个项的 MO 形式。
+
+此外，$f_{\mathrm{xc}}^{\mathrm{Ref}}$ 本身依赖参考态 half-density。其变分给出
+
+$$
+\delta\Omega_{\mathrm{ref}}
+=
+\operatorname{Tr}
+\left[
+W_{\alpha}\delta D_{\alpha}^{0}
+\right]
++
+\operatorname{Tr}
+\left[
+W_{\beta}\delta D_{\beta}^{0}
+\right].
+$$
+
+→ **解释：** $W_{\alpha}$ 和 $W_{\beta}$ 来自 LDA 三阶导数 $k_{\mathrm{xc}}$。代码中它们是 `lda_ref_density_mats(..., with_deriv=False)` 返回的 `wa, wb`，随后加入占据列的 `q_alpha/q_beta`。
+
+### Step 3: 轨道旋转导数矩阵
+
+把 $Q_{\alpha}$ 与 $Q_{\beta}$ 合并到空间轨道变量，当前 helper 使用
+
+$$
+M_{\mathrm{xc}}=Q_{\alpha}+Q_{\beta}.
+$$
+
+→ **解释：** 这与已有 HF block helper 的 spatial M convention 一致。测试中对每个 canonical ROKS 反对称变量 $\kappa_{pq}$ 验证
+
+$$
+\frac{
+\Omega_{\mathrm{xc}}(C e^{+\epsilon\kappa_{pq}})
+-
+\Omega_{\mathrm{xc}}(C e^{-\epsilon\kappa_{pq}})
+}{
+2\epsilon
+}
+=
+\left[M_{\mathrm{xc}}-M_{\mathrm{xc}}^{T}\right]_{pq}.
+$$
+
+→ **解释：** 这就是新增测试 `test_migrated_lda_xc_m_matrix_matches_orbital_fd`。它不使用总梯度误差作为依据，而是直接验证 $M_{\mathrm{xc}}$ 的定义。
+
+### Step 4: frozen-orbital direct skeleton
+
+固定 MO coefficient 与振幅时，核坐标显式导数为
+
+$$
+\Omega_{\mathrm{xc,direct}}^{[x]}
+=
+s_{\mathrm{LDA}}
+\sum_{B,L}M_{BL}(S)
+\left[
+\int
+\rho_{B}^{[x]} f_{\mathrm{xc}}^{\mathrm{Ref}}\rho_{L}
++
+\rho_{B} f_{\mathrm{xc}}^{\mathrm{Ref}}\rho_{L}^{[x]}
+d\mathbf{r}
+\right]
++\Omega_{k_{\mathrm{xc}}}^{[x]}.
+$$
+
+→ **解释：** 前两项来自 AO/grid 显式导数，对应 `lda_transition_deriv_mats()`；最后一项来自 reference density 改变导致 $f_{\mathrm{xc}}^{\mathrm{Ref}}$ 的核导数，对应 `lda_ref_density_mats(..., with_deriv=True)`。
+
+在原子分块 AO 导数 convention 下，代码按该原子 AO 行块收缩：
+
+$$
+\frac{\partial\Omega_{\mathrm{xc,direct}}}{\partial R_{A,x}}
+=
+\sum_{B}
+\left[
+2\operatorname{Tr}_{A}
+\left(
+V_{B}^{[x]}D^{B}
+\right)
++
+2\operatorname{Tr}_{A}
+\left(
+V_{B}^{[x]}(D^{B})^{T}
+\right)
+\right]
++\operatorname{Tr}_{A}(W_{\alpha}^{[x]}D_{\alpha}^{0})
++\operatorname{Tr}_{A}(W_{\beta}^{[x]}D_{\beta}^{0})
++\mathrm{transpose\ terms}.
+$$
+
+→ **解释：** 这就是 `lda_xc_direct_de()` 中对 `trans_der[:, 1:]`、`wa_der[1:]`、`wb_der[1:]` 的收缩。新增测试 `test_migrated_lda_xc_direct_matches_frozen_fd` 用 frozen MO coefficient 的核位移 FD 验证该对象。
+
+### 最终结果
+
+当前第一阶段 LDA 实现已经锁定两个局部解析对象：
+
+$$
+\boxed{
+M_{\mathrm{xc}}^{\mathrm{LDA}}
+=
+Q_{\alpha}^{\mathrm{LDA}}
++
+Q_{\beta}^{\mathrm{LDA}}
+}
+$$
+
+→ **解释：** 该对象通过 canonical ROKS orbital-rotation finite difference 验证。
+
+$$
+\boxed{
+\Omega_{\mathrm{xc,direct}}^{\mathrm{LDA},[x]}
+}
+$$
+
+→ **解释：** 该对象通过 frozen-orbital/frozen-amplitude nuclear finite difference 验证。
+
+尚未由本节完成的是完整 DFT 总梯度中的 ROKS z-vector 核扰动 RHS：
+
+$$
+\mathbf{g}_{\mathrm{fix}}^{[x]}
+=
+\operatorname{pack}
+\left[
+C^{T}
+\left(
+h^{[x]}+J^{[x]}+v_{\mathrm{xc}}^{[x]}-\alpha_{\mathrm{x}}K^{[x]}
+\right)
+C
+\right].
+$$
+
+→ **解释：** 当前 `_zvec_solver._perturbation_rhs()` 仍是 HF AO integral derivative convention。完整 LDA 总梯度闭合前必须单独校准这一项，不能把本节的两个局部闭合测试误读成完整 DFT 梯度已经完成。
+
+**代码对应：**
+- `pyscf/grad/tdsatda_delta/_xc_lda.py:lda_xc_energy`
+- `pyscf/grad/tdsatda_delta/_xc_lda.py:lda_xc_q`
+- `pyscf/grad/tdsatda_delta/_xc_lda.py:lda_xc_direct_de`
+- `pyscf/grad/test/test_satda_grad.py:test_migrated_lda_xc_m_matrix_matches_orbital_fd`
+- `pyscf/grad/test/test_satda_grad.py:test_migrated_lda_xc_direct_matches_frozen_fd`

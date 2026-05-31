@@ -7,10 +7,12 @@ import sys
 import unittest
 
 import numpy as np
+from scipy.linalg import expm
 
 from pyscf import gto
 from pyscf import lib
 from pyscf.sftda.satda import SATDA
+from pyscf.sftda.satda import gen_rohf_response_sf
 
 
 def normalized_x(td, root):
@@ -53,6 +55,21 @@ class _GradShim:
         return getattr(self._mf_grad, name)
 
 
+class _FrozenTD:
+    def __init__(self, mf, nstates=1):
+        self._scf = mf
+        self.mol = mf.mol
+        self.nstates = nstates
+
+
+def _copy_grid_settings(src, dst):
+    dst.grids.level = src.grids.level
+    dst.grids.prune = src.grids.prune
+    dst.grids.radi_method = src.grids.radi_method
+    dst.grids.becke_scheme = src.grids.becke_scheme
+    return dst
+
+
 class KnownValues(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -78,6 +95,17 @@ class KnownValues(unittest.TestCase):
     def make_td(self, deltaS, nstates=4, xc='HF'):
         mf = self.make_mf(xc=xc)
         td = SATDA(mf).set(deltaS=deltaS, nstates=nstates,
+                           verbose=0, conv_tol=1e-8)
+        td.kernel()
+        self.assertTrue(np.all(td.converged))
+        return td
+
+    def make_td_lda_unpruned(self, nstates=3):
+        mf = self.mol.ROKS(xc='SVWN').set(conv_tol=1e-10, verbose=0)
+        mf.grids.level = 1
+        mf.grids.prune = None
+        mf.kernel()
+        td = SATDA(mf).set(deltaS=-1, nstates=nstates,
                            verbose=0, conv_tol=1e-8)
         td.kernel()
         self.assertTrue(np.all(td.converged))
@@ -229,6 +257,91 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(details_krylov['hessian_solver'], 'krylov')
         self.assertLess(details_krylov['zvec_residual'], 1e-8)
         self.assertAlmostEqual(abs(grad_krylov - grad_dense).max(), 0, 8)
+
+    def test_migrated_lda_fock_basis_uses_satda_fockz(self):
+        delta = load_tdsatda_delta()
+        fock_basis = importlib.import_module(delta.__name__ + '._fock_basis')
+
+        td = self.make_td_lda_unpruned(nstates=3)
+        fbasis = fock_basis.make_fock_basis(td._scf)
+        _, fockz_ref = gen_rohf_response_sf(
+            td._scf, mo_coeff=td._scf.mo_coeff, mo_occ=td._scf.mo_occ,
+            hermi=0, max_memory=td._scf.max_memory,
+        )
+        self.assertAlmostEqual(abs(fbasis.fockz - fockz_ref).max(), 0, 12)
+        self.assertAlmostEqual(
+            abs(fbasis.fock0 - (td._scf.get_fock().focka - fockz_ref)).max(),
+            0, 12,
+        )
+
+    def test_migrated_lda_xc_m_matrix_matches_orbital_fd(self):
+        delta = load_tdsatda_delta()
+        xc_lda = importlib.import_module(delta.__name__ + '._xc_lda')
+        zsolver = importlib.import_module(delta.__name__ + '._zvec_solver')
+
+        td = self.make_td_lda_unpruned(nstates=3)
+        xy = td.xy[1]
+        pairs = zsolver._canonical_roks_pairs(td)
+        m = xc_lda.lda_xc_m_matrix(td, xy)
+        analytic = zsolver.pack_mvec(m, pairs)
+
+        step = 1e-5
+        mo0 = td._scf.mo_coeff
+        fd = np.zeros_like(analytic)
+        eye = np.eye(len(pairs))
+        for ipair in range(len(pairs)):
+            kappa = zsolver._anti_mo_from_roks_canonical_vec(
+                mo0.shape[1], pairs, eye[ipair])
+            mf_p = td._scf.copy()
+            mf_m = td._scf.copy()
+            mf_p.mo_coeff = mo0 @ expm(step * kappa)
+            mf_m.mo_coeff = mo0 @ expm(-step * kappa)
+            e_p = xc_lda.lda_xc_energy(_FrozenTD(mf_p, td.nstates), xy)
+            e_m = xc_lda.lda_xc_energy(_FrozenTD(mf_m, td.nstates), xy)
+            fd[ipair] = (e_p - e_m) / (2 * step)
+
+        self.assertAlmostEqual(abs(analytic - fd).max(), 0, 6)
+
+    def test_migrated_lda_xc_direct_matches_frozen_fd(self):
+        delta = load_tdsatda_delta()
+        xc_lda = importlib.import_module(delta.__name__ + '._xc_lda')
+
+        td = self.make_td_lda_unpruned(nstates=3)
+        xy = td.xy[1]
+        grad_obj = _GradShim(td)
+        analytic = xc_lda.lda_xc_direct_de(
+            grad_obj, td, xy, atmlst=range(td.mol.natm))
+
+        coords0 = td.mol.atom_coords()
+        step = 1e-4
+        fd = np.zeros_like(analytic)
+
+        def energy_at(coords):
+            mol = td.mol.copy()
+            mol.set_geom_(coords, unit='Bohr')
+            mf = mol.ROKS(xc=td._scf.xc).set(verbose=0)
+            _copy_grid_settings(td._scf, mf)
+            mf.mo_coeff = td._scf.mo_coeff
+            mf.mo_occ = td._scf.mo_occ
+            mf.max_memory = td._scf.max_memory
+            return xc_lda.lda_xc_energy(_FrozenTD(mf, td.nstates), xy)
+
+        for ia in range(td.mol.natm):
+            for xyz in range(3):
+                cp = coords0.copy()
+                cm = coords0.copy()
+                cp[ia, xyz] += step
+                cm[ia, xyz] -= step
+                fd[ia, xyz] = (energy_at(cp) - energy_at(cm)) / (2 * step)
+
+        self.assertAlmostEqual(abs(analytic - fd).max(), 0, 5)
+
+    def test_migrated_lda_total_delta_gradient_not_silently_enabled(self):
+        delta = load_tdsatda_delta()
+        td = self.make_td_lda_unpruned(nstates=3)
+        with self.assertRaises(NotImplementedError):
+            delta.satda_delta_gradient_zvec(
+                _GradShim(td), td, td.xy[1], atmlst=range(td.mol.natm))
 
 
 if __name__ == '__main__':

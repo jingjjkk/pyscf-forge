@@ -21,6 +21,14 @@ from ._block_analytic_hf import (
 from ._direct import _full_jk_deriv_atom
 
 
+def _spin_fock_mo(mf, mo_coeff):
+    fock = mf.get_fock()
+    return (
+        mo_coeff.T @ fock.focka @ mo_coeff,
+        mo_coeff.T @ fock.fockb @ mo_coeff,
+    )
+
+
 # ---------------------------------------------------------------------------
 #  Hessian builder
 # ---------------------------------------------------------------------------
@@ -41,14 +49,7 @@ def make_roks_hessian_action(tdobj, pairs=None):
     if pairs is None:
         pairs = _canonical_roks_pairs(tdobj)
 
-    dm_a = mo_coeff[:, mo_occ > 0] @ mo_coeff[:, mo_occ > 0].T
-    dm_b = mo_coeff[:, mo_occ == 2] @ mo_coeff[:, mo_occ == 2].T
-    hcore = mf.get_hcore()
-    vj, vk = mf.get_jk(mol, (dm_a, dm_b), hermi=1)
-    fock_a = hcore + vj[0] + vj[1] - vk[0]
-    fock_b = hcore + vj[0] + vj[1] - vk[1]
-    fmo_a = mo_coeff.T @ fock_a @ mo_coeff
-    fmo_b = mo_coeff.T @ fock_b @ mo_coeff
+    fmo_a, fmo_b = _spin_fock_mo(mf, mo_coeff)
     occ_a = np.zeros_like(mo_occ, dtype=float)
     occ_b = np.zeros_like(mo_occ, dtype=float)
     occ_a[mo_occ > 0] = 1.0
@@ -88,14 +89,7 @@ def make_roks_hessian_transpose_action(tdobj, pairs=None):
     if pairs is None:
         pairs = _canonical_roks_pairs(tdobj)
 
-    dm_a = mo_coeff[:, mo_occ > 0] @ mo_coeff[:, mo_occ > 0].T
-    dm_b = mo_coeff[:, mo_occ == 2] @ mo_coeff[:, mo_occ == 2].T
-    hcore = mf.get_hcore()
-    vj, vk = mf.get_jk(mol, (dm_a, dm_b), hermi=1)
-    fock_a = hcore + vj[0] + vj[1] - vk[0]
-    fock_b = hcore + vj[0] + vj[1] - vk[1]
-    fmo_a = mo_coeff.T @ fock_a @ mo_coeff
-    fmo_b = mo_coeff.T @ fock_b @ mo_coeff
+    fmo_a, fmo_b = _spin_fock_mo(mf, mo_coeff)
     occ_a = np.zeros_like(mo_occ, dtype=float)
     occ_b = np.zeros_like(mo_occ, dtype=float)
     occ_a[mo_occ > 0] = 1.0
@@ -215,14 +209,9 @@ def _roks_canonical_precond_diag(tdobj, pairs, level_shift=0.0):
     mol = mf.mol
     mo_coeff = mf.mo_coeff
     mo_occ = mf.mo_occ
-    dm_a = mo_coeff[:, mo_occ > 0] @ mo_coeff[:, mo_occ > 0].T
-    dm_b = mo_coeff[:, mo_occ == 2] @ mo_coeff[:, mo_occ == 2].T
-    hcore = mf.get_hcore()
-    vj, vk = mf.get_jk(mol, (dm_a, dm_b), hermi=1)
-    fock_a = hcore + vj[0] + vj[1] - vk[0]
-    fock_b = hcore + vj[0] + vj[1] - vk[1]
-    eps_a = np.diag(mo_coeff.T @ fock_a @ mo_coeff)
-    eps_b = np.diag(mo_coeff.T @ fock_b @ mo_coeff)
+    fmo_a, fmo_b = _spin_fock_mo(mf, mo_coeff)
+    eps_a = np.diag(fmo_a)
+    eps_b = np.diag(fmo_b)
     eps_c = 0.5 * (eps_a + eps_b)
 
     diag = np.empty(len(pairs))

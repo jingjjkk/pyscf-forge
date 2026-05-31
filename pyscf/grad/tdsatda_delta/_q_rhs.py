@@ -1,6 +1,7 @@
 import numpy as np
 
 from pyscf import ao2mo
+from pyscf import dft
 from pyscf import lib
 
 from ._blocks import (
@@ -64,12 +65,16 @@ def _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta):
     occidxa = np.where(mo_occ > 0)[0]
     occidxb = np.where(mo_occ == 2)[0]
 
-    p_tot = p_alpha + p_beta
-    vj = mf.get_j(mol, p_tot.T, hermi=0)
-    vk_a = mf.get_k(mol, p_alpha.T, hermi=0)
-    vk_b = mf.get_k(mol, p_beta.T, hermi=0)
-    va = vj - vk_a
-    vb = vj - vk_b
+    if (isinstance(mf, dft.KohnShamDFT)
+            and mf._numint._xc_type(mf.xc) != 'HF'):
+        va, vb = mf.gen_response(hermi=0)(np.asarray((p_alpha.T, p_beta.T)))
+    else:
+        p_tot = p_alpha + p_beta
+        vj = mf.get_j(mol, p_tot.T, hermi=0)
+        vk_a = mf.get_k(mol, p_alpha.T, hermi=0)
+        vk_b = mf.get_k(mol, p_beta.T, hermi=0)
+        va = vj - vk_a
+        vb = vj - vk_b
     q_alpha[:, occidxa] += mo_coeff.conj().T @ (va + va.T) @ mo_coeff[:, occidxa]
     q_beta[:, occidxb] += mo_coeff.conj().T @ (vb + vb.T) @ mo_coeff[:, occidxb]
 

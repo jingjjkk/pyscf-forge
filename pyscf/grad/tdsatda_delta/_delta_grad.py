@@ -45,6 +45,28 @@ from ._zvec_solver import (
     solve_zvec_krylov,
     zvec_orbital_grad,
 )
+from ._xc_lda import (
+    lda_xc_direct_de,
+    lda_xc_m_matrix,
+)
+
+
+def _xc_type(tdobj):
+    mf = tdobj._scf
+    if hasattr(mf, '_numint'):
+        return mf._numint._xc_type(mf.xc)
+    return 'HF'
+
+
+def _assert_total_delta_gradient_supported(tdobj):
+    if _xc_type(tdobj) != 'HF':
+        raise NotImplementedError(
+            'Full SATDA delta DFT gradient is not enabled yet.  The LDA '
+            'block XC M-matrix and direct skeleton helpers are implemented '
+            'and locally FD-verified, but the DFT nuclear perturbation RHS '
+            'for the ROKS Z-vector equation still needs a separate '
+            'calibrated implementation.'
+        )
 
 
 def _total_m_matrix(tdobj, xy):
@@ -57,7 +79,8 @@ def _total_m_matrix(tdobj, xy):
         cooo_m_matrix(tdobj, xy) +
         ovoo_m_matrix(tdobj, xy) +
         coov_m_matrix(tdobj, xy) +
-        cvoo_m_matrix(tdobj, xy)
+        cvoo_m_matrix(tdobj, xy) +
+        lda_xc_m_matrix(tdobj, xy)
     )
 
 
@@ -75,6 +98,7 @@ def _total_direct_grad(td_grad, tdobj, xy, atmlst=None):
     de += ovoo_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
     de += coov_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
     de += cvoo_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
+    de += lda_xc_direct_de(td_grad, tdobj, xy, atmlst=atmlst)
     return de
 
 
@@ -88,6 +112,7 @@ def sasf_delta_gradient(td_grad, tdobj, xy, atmlst=None, verbose=0):
     Each of the 9 blocks calls the shared CPHF solver independently,
     resulting in 9 * 3 * N_atom linear solves.
     """
+    _assert_total_delta_gradient_supported(tdobj)
     if atmlst is None:
         atmlst = range(tdobj.mol.natm)
 
@@ -128,6 +153,7 @@ def sasf_delta_gradient_zvec(td_grad, tdobj, xy, atmlst=None,
     details : dict with keys:
         de_direct, de_orbital, m_total, zvec, hmat, pairs
     """
+    _assert_total_delta_gradient_supported(tdobj)
     if atmlst is None:
         atmlst = range(tdobj.mol.natm)
 

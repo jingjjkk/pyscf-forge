@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from pyscf import dft
+
 
 @dataclass
 class SATDAFockBasis:
@@ -47,11 +49,23 @@ def fock_by_spin(spin, fock0, fockz):
     raise ValueError('Unknown Fock spin label %s' % spin)
 
 
-def make_fock_basis(mf, mo_coeff=None):
+def make_fock_basis(mf, mo_coeff=None, max_memory=None):
     if mo_coeff is None:
         mo_coeff = mf.mo_coeff
     fock = mf.get_fock()
-    fock0, fockz = fock0z_from_alpha_beta(fock.focka, fock.fockb)
+    if (isinstance(mf, dft.KohnShamDFT)
+            and mf._numint._xc_type(mf.xc) != 'HF'):
+        from pyscf.sftda.satda import gen_rohf_response_sf
+
+        if max_memory is None:
+            max_memory = mf.max_memory
+        _, fockz = gen_rohf_response_sf(
+            mf, mo_coeff=mo_coeff, mo_occ=mf.mo_occ,
+            hermi=0, max_memory=max_memory,
+        )
+        fock0 = fock.focka - fockz
+    else:
+        fock0, fockz = fock0z_from_alpha_beta(fock.focka, fock.fockb)
     return SATDAFockBasis(
         fock0=fock0,
         fockz=fockz,
