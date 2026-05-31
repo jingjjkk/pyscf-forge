@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 
+import importlib.util
+from pathlib import Path
+import sys
 import unittest
 
 import numpy as np
@@ -20,6 +23,33 @@ def normalized_x(td, root):
 def amplitude_overlap(x_ref, td, root):
     x = normalized_x(td, root)
     return abs(np.vdot(x_ref, x))
+
+
+def load_tdsatda_delta():
+    pkg_dir = Path(__file__).resolve().parents[1] / 'tdsatda_delta'
+    name = 'pyscf_forge_tdsatda_delta'
+    mod = sys.modules.get(name)
+    if mod is not None:
+        return mod
+    spec = importlib.util.spec_from_file_location(
+        name, pkg_dir / '__init__.py',
+        submodule_search_locations=[str(pkg_dir)])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _GradShim:
+    """Minimal gradient object for direct helper-level SATDA delta tests."""
+
+    def __init__(self, td):
+        self.base = td
+        self.mol = td.mol
+        self._mf_grad = td._scf.nuc_grad_method().set(verbose=0)
+
+    def __getattr__(self, name):
+        return getattr(self._mf_grad, name)
 
 
 class KnownValues(unittest.TestCase):
@@ -155,6 +185,20 @@ class KnownValues(unittest.TestCase):
             verbose=0, root_overlap_tol=0.2).kernel(state=state, step=step)
         grad_ref = self.independent_total_finite_diff(td, state, step)
         self.assertAlmostEqual(abs(grad_interface - grad_ref).max(), 0, 8)
+
+    def test_migrated_hf_delta_zvec_helper_smoke(self):
+        satda_delta_gradient_zvec = (
+            load_tdsatda_delta().satda_delta_gradient_zvec)
+
+        td = self.make_td(deltaS=-1, nstates=4)
+        xy = td.xy[1]
+        grad, details = satda_delta_gradient_zvec(
+            _GradShim(td), td, xy, atmlst=range(td.mol.natm))
+
+        self.assertEqual(grad.shape, (td.mol.natm, 3))
+        self.assertEqual(details['de_direct'].shape, grad.shape)
+        self.assertEqual(details['de_orbital'].shape, grad.shape)
+        self.assertTrue(np.all(np.isfinite(grad)))
 
 
 if __name__ == '__main__':
