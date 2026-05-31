@@ -16,6 +16,10 @@ from ._fock_coeff import (
     sasf_fock_coefficients,
     sasf_fock_coefficient_energy,
 )
+from ._fock_basis import (
+    fock_by_spin,
+    make_fock_basis,
+)
 from ._exchange import sasf_hf_exchange_coefficient_energy
 from ._q_rhs import (
     _add_eri_term_q,
@@ -58,30 +62,22 @@ def _empty_probe(tdobj):
 
 
 def _fock_block(tdobj, name, left_idx, right_idx, coeff_mat, spin,
-                fock_mo_a, fock_mo_b, with_response=True):
+                fock0_mo, fockz_mo, with_response=True):
     q_alpha, q_beta = _empty_q(tdobj)
     p_alpha, p_beta = _empty_probe(tdobj)
     mo_coeff = tdobj._scf.mo_coeff
     _add_fock_term(
         q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-        fock_mo_a, fock_mo_b, left_idx, right_idx, coeff_mat, spin,
+        fock0_mo, fockz_mo, left_idx, right_idx, coeff_mat, spin,
     )
     if with_response:
         _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta)
 
     left_idx = np.asarray(left_idx)
     right_idx = np.asarray(right_idx)
-    if spin == 'alpha':
-        fblock = fock_mo_a[np.ix_(left_idx, right_idx)]
-    elif spin == 'beta':
-        fblock = fock_mo_b[np.ix_(left_idx, right_idx)]
-    elif spin == 'spin':
-        fblock = 0.5 * (
-            fock_mo_b[np.ix_(left_idx, right_idx)] -
-            fock_mo_a[np.ix_(left_idx, right_idx)]
-        )
-    else:
-        raise ValueError('Unknown Fock block spin label %s' % spin)
+    fblock = fock_by_spin(
+        spin, fock0_mo, fockz_mo
+    )[np.ix_(left_idx, right_idx)]
     energy = float(lib.einsum('pq,pq', coeff_mat, fblock))
 
     return SASFBlockContribution(
@@ -95,24 +91,22 @@ def fock_like_blocks(tdobj, xy, with_response=True):
     coeff = sasf_fock_coefficients(tdobj, xy)
     csidx, osidx, vsidx, _, _, _ = _sasf_orbitals(tdobj)
     mo_coeff = tdobj._scf.mo_coeff
-    fock = tdobj._scf.get_fock()
-    fock_mo_a = mo_coeff.T @ fock.focka @ mo_coeff
-    fock_mo_b = mo_coeff.T @ fock.fockb @ mo_coeff
+    fbasis = make_fock_basis(tdobj._scf, mo_coeff)
     return [
         _fock_block(tdobj, 'fock:S_CC', csidx, csidx, coeff.t_s_cc, 'spin',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:S_VV', vsidx, vsidx, coeff.t_s_vv, 'spin',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:S_CV', csidx, vsidx, coeff.t_s_cv, 'spin',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:B_VO', vsidx, osidx, coeff.t_b_vo, 'beta',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:B_CO', csidx, osidx, coeff.t_b_co, 'beta',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:A_OC', osidx, csidx, coeff.t_a_oc, 'alpha',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:A_VO', vsidx, osidx, coeff.t_a_vo, 'alpha',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
     ]
 
 
@@ -131,16 +125,14 @@ def cvcv_fock_blocks(tdobj, xy, with_response=True):
         raise NotImplementedError('SASF spin adaptation requires Si > 1/2')
     csidx, _, vsidx, _, _, _ = _sasf_orbitals(tdobj)
     mo_coeff = tdobj._scf.mo_coeff
-    fock = tdobj._scf.get_fock()
-    fock_mo_a = mo_coeff.T @ fock.focka @ mo_coeff
-    fock_mo_b = mo_coeff.T @ fock.fockb @ mo_coeff
+    fbasis = make_fock_basis(tdobj._scf, mo_coeff)
     t_cc = lib.einsum('ia,ja->ji', b.x_cv, b.x_cv) / b.si
     t_vv = lib.einsum('ia,ib->ab', b.x_cv, b.x_cv) / b.si
     return [
         _fock_block(tdobj, 'fock:CVCV_CC', csidx, csidx, t_cc, 'spin',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
         _fock_block(tdobj, 'fock:CVCV_VV', vsidx, vsidx, t_vv, 'spin',
-                    fock_mo_a, fock_mo_b, with_response=with_response),
+                    fbasis.fock0_mo, fbasis.fockz_mo, with_response=with_response),
     ]
 
 
@@ -431,10 +423,9 @@ def cvcv_block_matrix(tdobj):
     si = (mf.mol.nelec[0] - mf.mol.nelec[1]) * 0.5
     orbcs = mo_coeff[:, csidx]
     orbvs = mo_coeff[:, vsidx]
-    fock = mf.get_fock()
-    focks = 0.5 * (fock.fockb - fock.focka)
-    focksc = orbcs.T @ focks @ orbcs
-    focksv = orbvs.T @ focks @ orbvs
+    fbasis = make_fock_basis(mf)
+    focksc = -orbcs.T @ fbasis.fockz @ orbcs
+    focksv = -orbvs.T @ fbasis.fockz @ orbvs
     a = np.zeros((ncs + nos, nos + nvs, ncs + nos, nos + nvs))
     a_cvcv = (
         lib.einsum('ij,ab->iajb', np.eye(ncs), focksv) +

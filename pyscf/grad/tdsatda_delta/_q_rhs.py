@@ -12,10 +12,15 @@ from ._blocks import (
     pack_roks_kappa,
 )
 from ._fock_coeff import sasf_fock_coefficients
+from ._fock_basis import (
+    alpha_from_0z,
+    beta_from_0z,
+    make_fock_basis,
+)
 
 
 def _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, left_idx, right_idx, coeff_mat, spin):
+                   fock0_mo, fockz_mo, left_idx, right_idx, coeff_mat, spin):
     '''Accumulate projection and probe-density pieces for one Fock term.'''
     coeff_mat = np.asarray(coeff_mat)
     if coeff_mat.size == 0:
@@ -26,6 +31,8 @@ def _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
     c_left = mo_coeff[:, left_idx]
     c_right = mo_coeff[:, right_idx]
     dm = _mo_pair_dm(c_left, coeff_mat, c_right)
+    fock_alpha_mo = alpha_from_0z(fock0_mo, fockz_mo)
+    fock_beta_mo = beta_from_0z(fock0_mo, fockz_mo)
 
     def add_projection(q, fock_mo, scale):
         if scale == 0:
@@ -34,14 +41,14 @@ def _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
         q[:, right_idx] += scale * (fock_mo[:, left_idx] @ coeff_mat)
 
     if spin == 'alpha':
-        add_projection(q_alpha, focka_mo, 1.0)
+        add_projection(q_alpha, fock_alpha_mo, 1.0)
         p_alpha += dm
     elif spin == 'beta':
-        add_projection(q_beta, fockb_mo, 1.0)
+        add_projection(q_beta, fock_beta_mo, 1.0)
         p_beta += dm
     elif spin == 'spin':
-        add_projection(q_beta, fockb_mo, 0.5)
-        add_projection(q_alpha, focka_mo, -0.5)
+        add_projection(q_beta, fock_beta_mo, 0.5)
+        add_projection(q_alpha, fock_alpha_mo, -0.5)
         p_beta += 0.5 * dm
         p_alpha -= 0.5 * dm
     else:
@@ -79,30 +86,28 @@ def sasf_delta_fock_q(tdobj, xy, with_response=True):
 
     coeff = sasf_fock_coefficients(tdobj, xy)
     csidx, osidx, vsidx, _, _, _ = _sasf_orbitals(tdobj)
-    fock = mf.get_fock()
-    focka_mo = mo_coeff.conj().T @ fock.focka @ mo_coeff
-    fockb_mo = mo_coeff.conj().T @ fock.fockb @ mo_coeff
+    fbasis = make_fock_basis(mf, mo_coeff)
 
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, csidx, csidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, csidx, csidx,
                    coeff.t_s_cc, 'spin')
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, vsidx, vsidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, vsidx, vsidx,
                    coeff.t_s_vv, 'spin')
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, csidx, vsidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, csidx, vsidx,
                    coeff.t_s_cv, 'spin')
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, vsidx, osidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, vsidx, osidx,
                    coeff.t_b_vo, 'beta')
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, csidx, osidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, csidx, osidx,
                    coeff.t_b_co, 'beta')
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, osidx, csidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, osidx, csidx,
                    coeff.t_a_oc, 'alpha')
     _add_fock_term(q_alpha, q_beta, p_alpha, p_beta, mo_coeff,
-                   focka_mo, fockb_mo, vsidx, osidx,
+                   fbasis.fock0_mo, fbasis.fockz_mo, vsidx, osidx,
                    coeff.t_a_vo, 'alpha')
 
     if with_response:

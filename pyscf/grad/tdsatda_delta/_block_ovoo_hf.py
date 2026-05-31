@@ -6,6 +6,12 @@ from pyscf import lib
 from ._blocks import (
     _hybrid_coefficients, _mo_pair_dm, _sasf_orbitals, make_sasf_blocks,
 )
+from ._fock_basis import (
+    alpha_from_0z,
+    beta_from_0z,
+    fock0z_from_alpha_beta,
+    make_fock_basis,
+)
 from ._q_rhs import (
     _add_eri_term_q, _add_fock_response_q, _add_fock_term,
 )
@@ -41,10 +47,17 @@ def ovoo_block_energy(tdobj, xy):
     b = make_sasf_blocks(tdobj, xy)
     zeta, _ = _spin_coeffs(b.si)
     _, _, _, _, orbos, orbvs = _sasf_orbitals(tdobj)
-    mf = tdobj._scf; fock = mf.get_fock()
+    mf = tdobj._scf
+    fbasis = make_fock_basis(mf)
     t_beta_vo, t_alpha_vo = _ovoo_t_beta_vo_alpha_vo(tdobj, xy)
-    e  = float(lib.einsum('au,au', t_beta_vo, orbvs.T @ fock.fockb @ orbos))
-    e += float(lib.einsum('aw,aw', t_alpha_vo, orbvs.T @ fock.focka @ orbos))
+    e  = float(lib.einsum(
+        'au,au', t_beta_vo,
+        orbvs.T @ beta_from_0z(fbasis.fock0, fbasis.fockz) @ orbos
+    ))
+    e += float(lib.einsum(
+        'aw,aw', t_alpha_vo,
+        orbvs.T @ alpha_from_0z(fbasis.fock0, fbasis.fockz) @ orbos
+    ))
     hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
     if hybrid:
         e += _ovoo_hfx_energy(tdobj, xy, coeff=-2*hyb*zeta)
@@ -104,8 +117,13 @@ def ovoo_direct_grad_fock(td_grad, tdobj, xy, atmlst=None):
     eri1 = tdobj.mol.intor('int2e_ip1', comp=3)
     for k, ia in enumerate(atmlst):
         f1a, f1b = _full_spin_fock_derivs_by_atom(td_grad, tdobj, ia, eri1=eri1)
-        de[k] += lib.einsum('pq,xpq->x', p_alpha, f1a)
-        de[k] += lib.einsum('pq,xpq->x', p_beta, f1b)
+        f10, f1z = fock0z_from_alpha_beta(f1a, f1b)
+        de[k] += lib.einsum(
+            'pq,xpq->x', p_alpha, alpha_from_0z(f10, f1z)
+        )
+        de[k] += lib.einsum(
+            'pq,xpq->x', p_beta, beta_from_0z(f10, f1z)
+        )
     return de
 
 
@@ -149,14 +167,15 @@ def ovoo_direct_grad(td_grad, tdobj, xy, atmlst=None):
 def ovoo_m_matrix_fock(tdobj, xy):
     mf = tdobj._scf; mo = mf.mo_coeff; nmo = mo.shape[1]
     csidx, osidx, vsidx, _, _, _ = _sasf_orbitals(tdobj)
-    fock = mf.get_fock()
-    focka_mo = mo.T @ fock.focka @ mo; fockb_mo = mo.T @ fock.fockb @ mo
+    fbasis = make_fock_basis(mf, mo)
     q_a = np.zeros((nmo, nmo)); q_b = np.zeros_like(q_a)
     p_a = np.zeros((mf.mol.nao, mf.mol.nao)); p_b = np.zeros_like(p_a)
     t_beta_vo, t_alpha_vo = _ovoo_t_beta_vo_alpha_vo(tdobj, xy)
-    _add_fock_term(q_a, q_b, p_a, p_b, mo, focka_mo, fockb_mo,
+    _add_fock_term(q_a, q_b, p_a, p_b, mo,
+                   fbasis.fock0_mo, fbasis.fockz_mo,
                    vsidx, osidx, t_beta_vo, 'beta')
-    _add_fock_term(q_a, q_b, p_a, p_b, mo, focka_mo, fockb_mo,
+    _add_fock_term(q_a, q_b, p_a, p_b, mo,
+                   fbasis.fock0_mo, fbasis.fockz_mo,
                    vsidx, osidx, t_alpha_vo, 'alpha')
     _add_fock_response_q(tdobj, q_a, q_b, p_a, p_b)
     return q_a + q_b

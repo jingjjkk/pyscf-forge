@@ -5,6 +5,11 @@ from pyscf import lib
 from ._blocks import (
     _hybrid_coefficients, _mo_pair_dm, _sasf_orbitals, make_sasf_blocks,
 )
+from ._fock_basis import (
+    fock0z_from_alpha_beta,
+    make_fock_basis,
+    spin_from_0z,
+)
 from ._q_rhs import (
     _add_eri_term_q, _add_fock_response_q, _add_fock_term,
 )
@@ -36,9 +41,13 @@ def _cvoo_t_cv(tdobj, xy):
 def cvoo_block_energy(tdobj, xy):
     b = make_sasf_blocks(tdobj, xy); gamma = _spin_param(b.si)
     _, _, _, orbcs, orbos, orbvs = _sasf_orbitals(tdobj)
-    mf = tdobj._scf; focks = 0.5*(mf.get_fock().fockb - mf.get_fock().focka)
+    mf = tdobj._scf
+    fbasis = make_fock_basis(mf)
     t_cv = _cvoo_t_cv(tdobj, xy)
-    e = float(lib.einsum('ia,ia', t_cv, orbcs.T @ focks @ orbvs))
+    e = float(lib.einsum(
+        'ia,ia', t_cv,
+        orbcs.T @ spin_from_0z(fbasis.fock0, fbasis.fockz) @ orbvs
+    ))
     hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
     if hybrid:
         c_hfx = -(gamma-1)*hyb
@@ -98,7 +107,8 @@ def cvoo_direct_grad_fock(td_grad, tdobj, xy, atmlst=None):
         f1a, f1b = _full_spin_fock_derivs_by_atom(
             td_grad, tdobj, ia, eri1=eri1
         )
-        de[k] += 0.5*lib.einsum('pq,xpq->x', P, f1b - f1a)
+        f10, f1z = fock0z_from_alpha_beta(f1a, f1b)
+        de[k] += lib.einsum('pq,xpq->x', P, spin_from_0z(f10, f1z))
     return de
 
 
@@ -141,12 +151,12 @@ def cvoo_direct_grad(td_grad, tdobj, xy, atmlst=None):
 def cvoo_m_matrix_fock(tdobj, xy):
     mf = tdobj._scf; mo = mf.mo_coeff; nmo = mo.shape[1]
     csidx, osidx, vsidx, _, _, _ = _sasf_orbitals(tdobj)
-    fock = mf.get_fock()
-    focka_mo = mo.T @ fock.focka @ mo; fockb_mo = mo.T @ fock.fockb @ mo
+    fbasis = make_fock_basis(mf, mo)
     q_a = np.zeros((nmo, nmo)); q_b = np.zeros_like(q_a)
     p_a = np.zeros((mf.mol.nao, mf.mol.nao)); p_b = np.zeros_like(p_a)
     t_cv = _cvoo_t_cv(tdobj, xy)
-    _add_fock_term(q_a, q_b, p_a, p_b, mo, focka_mo, fockb_mo,
+    _add_fock_term(q_a, q_b, p_a, p_b, mo,
+                   fbasis.fock0_mo, fbasis.fockz_mo,
                    csidx, vsidx, t_cv, 'spin')
     _add_fock_response_q(tdobj, q_a, q_b, p_a, p_b)
     return q_a + q_b

@@ -8,6 +8,7 @@ from pyscf import lib
 from ._blocks import (
     _hybrid_coefficients, _mo_pair_dm, _sasf_orbitals, make_sasf_blocks,
 )
+from ._fock_basis import make_fock_basis
 from ._q_rhs import _add_eri_term_q, _add_fock_term, _add_fock_response_q
 from ._block_analytic_hf import (
     _add_k_bilinear_ip1,
@@ -21,10 +22,10 @@ from ._direct import _add_j_bilinear_ip1, _general_eri
 def coco_block_energy(tdobj, xy):
     b = make_sasf_blocks(tdobj, xy); _check_si(b.si)
     _, _, _, orbcs, orbos, _ = _sasf_orbitals(tdobj)
-    fock = tdobj._scf.get_fock(); focks = 0.5*(fock.fockb - fock.focka)
+    fbasis = make_fock_basis(tdobj._scf)
     c_f = 2.0/(2*b.si-1)
     t_cc = lib.einsum('iu,ju->ji', b.x_co, b.x_co)
-    focks_cc = orbcs.T @ focks @ orbcs
+    focks_cc = -orbcs.T @ fbasis.fockz @ orbcs
     e = c_f * float(lib.einsum('ji,ji', t_cc, focks_cc))
     hybrid, hyb, omega, alpha = _hybrid_coefficients(tdobj._scf)
     if hybrid:
@@ -141,15 +142,14 @@ def coco_m_matrix_fock(tdobj, xy):
     mf = tdobj._scf; mo = mf.mo_coeff; nmo = mo.shape[1]
     _, _, _, orbcs, _, _ = _sasf_orbitals(tdobj)
     b = make_sasf_blocks(tdobj, xy); _check_si(b.si)
-    fock = mf.get_fock()
-    focka_mo = mo.T @ fock.focka @ mo
-    fockb_mo = mo.T @ fock.fockb @ mo
+    fbasis = make_fock_basis(mf, mo)
     csidx = np.where(mf.mo_occ == 2)[0]
     scale = 2.0/(2*b.si-1)
     t_cc = lib.einsum('iu,ju->ji', b.x_co, b.x_co)*scale
     q_a = np.zeros((nmo, nmo)); q_b = np.zeros_like(q_a)
     p_a = np.zeros((mf.mol.nao, mf.mol.nao)); p_b = np.zeros_like(p_a)
-    _add_fock_term(q_a, q_b, p_a, p_b, mo, focka_mo, fockb_mo,
+    _add_fock_term(q_a, q_b, p_a, p_b, mo,
+                   fbasis.fock0_mo, fbasis.fockz_mo,
                    csidx, csidx, t_cc, 'spin')
     _add_fock_response_q(tdobj, q_a, q_b, p_a, p_b)
     return q_a + q_b

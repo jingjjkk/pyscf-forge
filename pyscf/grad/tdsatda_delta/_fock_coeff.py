@@ -9,6 +9,7 @@ from ._blocks import (
     _mo_pair_dm,
     make_sasf_blocks,
 )
+from ._fock_basis import make_fock_basis
 
 
 @dataclass
@@ -123,18 +124,17 @@ def sasf_fock_coefficient_energy(tdobj, xy):
     '''Evaluate the SASF Fock-like correction energy from coefficient matrices.'''
     coeff = sasf_fock_coefficients(tdobj, xy)
     _, _, _, orbcs, orbos, orbvs = _sasf_orbitals(tdobj)
-    fock = tdobj._scf.get_fock()
-    focka = fock.focka
-    fockb = fock.fockb
-    focks = 0.5 * (fockb - focka)
+    fbasis = make_fock_basis(tdobj._scf)
+    fock0 = fbasis.fock0
+    fockz = fbasis.fockz
 
-    focks_cc = orbcs.conj().T @ focks @ orbcs
-    focks_vv = orbvs.conj().T @ focks @ orbvs
-    focks_cv = orbcs.conj().T @ focks @ orbvs
-    fockb_vo = orbvs.conj().T @ fockb @ orbos
-    fockb_co = orbcs.conj().T @ fockb @ orbos
-    focka_oc = orbos.conj().T @ focka @ orbcs
-    focka_vo = orbvs.conj().T @ focka @ orbos
+    focks_cc = -orbcs.conj().T @ fockz @ orbcs
+    focks_vv = -orbvs.conj().T @ fockz @ orbvs
+    focks_cv = -orbcs.conj().T @ fockz @ orbvs
+    fockb_vo = orbvs.conj().T @ (fock0 - fockz) @ orbos
+    fockb_co = orbcs.conj().T @ (fock0 - fockz) @ orbos
+    focka_oc = orbos.conj().T @ (fock0 + fockz) @ orbcs
+    focka_vo = orbvs.conj().T @ (fock0 + fockz) @ orbos
 
     e = 0.0
     e += lib.einsum('ji,ji', coeff.t_s_cc, focks_cc)

@@ -9,6 +9,12 @@ from ._blocks import (
     _sasf_orbitals,
     make_sasf_blocks,
 )
+from ._fock_basis import (
+    alpha_from_0z,
+    beta_from_0z,
+    fock0z_from_alpha_beta,
+    make_fock_basis,
+)
 from ._q_rhs import (
     _add_eri_term_q,
     _add_fock_response_q,
@@ -48,11 +54,17 @@ def cooo_block_energy(tdobj, xy):
     zeta, _ = _spin_coefficients(b.si)
     csidx, osidx, vsidx, orbcs, orbos, orbvs = _sasf_orbitals(tdobj)
     mf = tdobj._scf
-    fock = mf.get_fock()
+    fbasis = make_fock_basis(mf)
     t_beta_co, t_alpha_oc = _cooo_t_beta_alpha(tdobj, xy)
 
-    e = float(lib.einsum('iu,iu', t_beta_co, orbcs.T @ fock.fockb @ orbos))
-    e += float(lib.einsum('wi,wi', t_alpha_oc, orbos.T @ fock.focka @ orbcs))
+    e = float(lib.einsum(
+        'iu,iu', t_beta_co,
+        orbcs.T @ beta_from_0z(fbasis.fock0, fbasis.fockz) @ orbos
+    ))
+    e += float(lib.einsum(
+        'wi,wi', t_alpha_oc,
+        orbos.T @ alpha_from_0z(fbasis.fock0, fbasis.fockz) @ orbcs
+    ))
 
     hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
     if hybrid:
@@ -131,8 +143,13 @@ def cooo_direct_grad_fock(td_grad, tdobj, xy, atmlst=None):
         f1a, f1b = _full_spin_fock_derivs_by_atom(
             td_grad, tdobj, ia, eri1=eri1
         )
-        de[k] += lib.einsum('pq,xpq->x', p_alpha, f1a)
-        de[k] += lib.einsum('pq,xpq->x', p_beta, f1b)
+        f10, f1z = fock0z_from_alpha_beta(f1a, f1b)
+        de[k] += lib.einsum(
+            'pq,xpq->x', p_alpha, alpha_from_0z(f10, f1z)
+        )
+        de[k] += lib.einsum(
+            'pq,xpq->x', p_beta, beta_from_0z(f10, f1z)
+        )
     return de
 
 
@@ -180,20 +197,20 @@ def cooo_m_matrix_fock(tdobj, xy):
     mo = mf.mo_coeff
     nmo = mo.shape[1]
     csidx, osidx, vsidx, orbcs, orbos, orbvs = _sasf_orbitals(tdobj)
-    fock = mf.get_fock()
-    focka_mo = mo.T @ fock.focka @ mo
-    fockb_mo = mo.T @ fock.fockb @ mo
+    fbasis = make_fock_basis(mf, mo)
     q_alpha = np.zeros((nmo, nmo))
     q_beta = np.zeros_like(q_alpha)
     p_alpha = np.zeros((mf.mol.nao, mf.mol.nao))
     p_beta = np.zeros_like(p_alpha)
     t_beta_co, t_alpha_oc = _cooo_t_beta_alpha(tdobj, xy)
     _add_fock_term(
-        q_alpha, q_beta, p_alpha, p_beta, mo, focka_mo, fockb_mo,
+        q_alpha, q_beta, p_alpha, p_beta, mo,
+        fbasis.fock0_mo, fbasis.fockz_mo,
         csidx, osidx, t_beta_co, 'beta'
     )
     _add_fock_term(
-        q_alpha, q_beta, p_alpha, p_beta, mo, focka_mo, fockb_mo,
+        q_alpha, q_beta, p_alpha, p_beta, mo,
+        fbasis.fock0_mo, fbasis.fockz_mo,
         osidx, csidx, t_alpha_oc, 'alpha'
     )
     _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta)

@@ -9,6 +9,11 @@ from ._blocks import (
     _sasf_orbitals,
     make_sasf_blocks,
 )
+from ._fock_basis import (
+    beta_from_0z,
+    fock0z_from_alpha_beta,
+    make_fock_basis,
+)
 from ._q_rhs import (
     _add_eri_term_q,
     _add_fock_response_q,
@@ -19,7 +24,7 @@ from ._block_analytic_hf import (
 )
 from ._direct import (
     _add_j_bilinear_ip1,
-    _full_beta_fock_deriv_by_atom,
+    _full_spin_fock_derivs_by_atom,
     _general_eri,
 )
 
@@ -36,10 +41,14 @@ def cvco_block_energy(tdobj, xy):
     eta = _eta(b.si)
     csidx, osidx, vsidx, orbcs, orbos, orbvs = _sasf_orbitals(tdobj)
     mf = tdobj._scf
-    fockb = mf.get_fock().fockb
+    fbasis = make_fock_basis(mf)
 
     t_vo = 2 * eta * lib.einsum('ia,iv->av', b.x_cv, b.x_co)
-    e = float(lib.einsum('av,av', t_vo, orbvs.T @ fockb @ orbos))
+    e = float(lib.einsum(
+        'av,av', t_vo, orbvs.T @ beta_from_0z(
+            fbasis.fock0, fbasis.fockz
+        ) @ orbos
+    ))
 
     hybrid, hyb, omega, alpha = _hybrid_coefficients(mf)
     if hybrid:
@@ -115,8 +124,13 @@ def cvco_direct_grad_fock(td_grad, tdobj, xy, atmlst=None):
     p_beta = cvco_fock_probe_density(tdobj, xy)
     eri1 = tdobj.mol.intor('int2e_ip1', comp=3)
     for k, ia in enumerate(atmlst):
-        f1b = _full_beta_fock_deriv_by_atom(td_grad, tdobj, ia, eri1=eri1)
-        de[k] += lib.einsum('pq,xpq->x', p_beta, f1b)
+        f1a, f1b = _full_spin_fock_derivs_by_atom(
+            td_grad, tdobj, ia, eri1=eri1
+        )
+        f10, f1z = fock0z_from_alpha_beta(f1a, f1b)
+        de[k] += lib.einsum(
+            'pq,xpq->x', p_beta, beta_from_0z(f10, f1z)
+        )
     return de
 
 
@@ -182,16 +196,15 @@ def cvco_m_matrix_fock(tdobj, xy):
     b = make_sasf_blocks(tdobj, xy)
     eta = _eta(b.si)
     csidx, osidx, vsidx, _, _, _ = _sasf_orbitals(tdobj)
-    fock = mf.get_fock()
-    focka_mo = mo.T @ fock.focka @ mo
-    fockb_mo = mo.T @ fock.fockb @ mo
+    fbasis = make_fock_basis(mf, mo)
     q_alpha = np.zeros((nmo, nmo))
     q_beta = np.zeros_like(q_alpha)
     p_alpha = np.zeros((mf.mol.nao, mf.mol.nao))
     p_beta = np.zeros_like(p_alpha)
     t_vo = 2 * eta * lib.einsum('ia,iv->av', b.x_cv, b.x_co)
     _add_fock_term(
-        q_alpha, q_beta, p_alpha, p_beta, mo, focka_mo, fockb_mo,
+        q_alpha, q_beta, p_alpha, p_beta, mo,
+        fbasis.fock0_mo, fbasis.fockz_mo,
         vsidx, osidx, t_vo, 'beta'
     )
     _add_fock_response_q(tdobj, q_alpha, q_beta, p_alpha, p_beta)
