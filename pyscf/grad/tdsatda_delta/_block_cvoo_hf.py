@@ -54,7 +54,7 @@ def cvoo_block_energy(tdobj, xy):
         e += _cvoo_hfx_energy(tdobj, xy, coeff=c_hfx)
         if omega != 0:
             e += _cvoo_hfx_energy(tdobj, xy, coeff=-(gamma-1)*(alpha-hyb), omega=omega)
-    return e
+    return 2.0 * e
 
 
 def _cvoo_hfx_energy(tdobj, xy, coeff, omega=None):
@@ -142,8 +142,10 @@ def cvoo_direct_grad_hfx(td_grad, tdobj, xy, atmlst=None):
 def cvoo_direct_grad(td_grad, tdobj, xy, atmlst=None):
     if atmlst is None: atmlst = range(tdobj.mol.natm)
     atmlst = tuple(atmlst)
-    return cvoo_direct_grad_fock(td_grad, tdobj, xy, atmlst) + \
-           cvoo_direct_grad_hfx(td_grad, tdobj, xy, atmlst)
+    return 2.0 * (
+        cvoo_direct_grad_fock(td_grad, tdobj, xy, atmlst)
+        + cvoo_direct_grad_hfx(td_grad, tdobj, xy, atmlst)
+    )
 
 
 # ===== M-matrix =====
@@ -183,7 +185,7 @@ def cvoo_m_matrix_hfx(tdobj, xy):
 
 
 def cvoo_m_matrix(tdobj, xy):
-    return cvoo_m_matrix_fock(tdobj, xy) + cvoo_m_matrix_hfx(tdobj, xy)
+    return 2.0 * (cvoo_m_matrix_fock(tdobj, xy) + cvoo_m_matrix_hfx(tdobj, xy))
 
 
 # ===== Orbital response =====

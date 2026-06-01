@@ -9,34 +9,32 @@ The z-vector route replaces 9 * 3 * N_atom CPHF solves with ONE linear solve.
 
 import numpy as np
 
-from ._fock_coeff import sasf_fock_coefficient_energy
-from ._exchange import sasf_hf_exchange_coefficient_energy
 from ._block_analytic_hf import (
-    cvcv_m_matrix, cvcv_direct_grad, cvcv_analytic_grad,
+    cvcv_block_energy, cvcv_m_matrix, cvcv_direct_grad, cvcv_analytic_grad,
 )
 from ._block_coco_hf import (
-    coco_m_matrix, coco_direct_grad, coco_analytic_grad,
+    coco_block_energy, coco_m_matrix, coco_direct_grad, coco_analytic_grad,
 )
 from ._block_ovov_hf import (
-    ovov_m_matrix, ovov_direct_grad, ovov_analytic_grad,
+    ovov_block_energy, ovov_m_matrix, ovov_direct_grad, ovov_analytic_grad,
 )
 from ._block_cvco_hf import (
-    cvco_m_matrix, cvco_direct_grad, cvco_analytic_grad,
+    cvco_block_energy, cvco_m_matrix, cvco_direct_grad, cvco_analytic_grad,
 )
 from ._block_cvov_hf import (
-    cvov_m_matrix, cvov_direct_grad, cvov_analytic_grad,
+    cvov_block_energy, cvov_m_matrix, cvov_direct_grad, cvov_analytic_grad,
 )
 from ._block_cooo_hf import (
-    cooo_m_matrix, cooo_direct_grad, cooo_analytic_grad,
+    cooo_block_energy, cooo_m_matrix, cooo_direct_grad, cooo_analytic_grad,
 )
 from ._block_ovoo_hf import (
-    ovoo_m_matrix, ovoo_direct_grad, ovoo_analytic_grad,
+    ovoo_block_energy, ovoo_m_matrix, ovoo_direct_grad, ovoo_analytic_grad,
 )
 from ._block_coov_hf import (
-    coov_m_matrix, coov_direct_grad, coov_analytic_grad,
+    coov_block_energy, coov_m_matrix, coov_direct_grad, coov_analytic_grad,
 )
 from ._block_cvoo_hf import (
-    cvoo_m_matrix, cvoo_direct_grad, cvoo_analytic_grad,
+    cvoo_block_energy, cvoo_m_matrix, cvoo_direct_grad, cvoo_analytic_grad,
 )
 
 from ._zvec_solver import (
@@ -52,10 +50,33 @@ from ._direct import (
     sasf_delta_fock_direct_de,
     sasf_delta_hf_exchange_direct_de,
 )
+from ._fd import _make_displaced_mf
 from ._xc_lda import (
     lda_xc_energy,
     lda_xc_direct_de,
     lda_xc_m_matrix,
+)
+
+
+_BLOCKS = (
+    ('CV-CV', cvcv_block_energy, cvcv_m_matrix, cvcv_direct_grad,
+     cvcv_analytic_grad),
+    ('CO-CO', coco_block_energy, coco_m_matrix, coco_direct_grad,
+     coco_analytic_grad),
+    ('OV-OV', ovov_block_energy, ovov_m_matrix, ovov_direct_grad,
+     ovov_analytic_grad),
+    ('CV-CO', cvco_block_energy, cvco_m_matrix, cvco_direct_grad,
+     cvco_analytic_grad),
+    ('CV-OV', cvov_block_energy, cvov_m_matrix, cvov_direct_grad,
+     cvov_analytic_grad),
+    ('CO-OO', cooo_block_energy, cooo_m_matrix, cooo_direct_grad,
+     cooo_analytic_grad),
+    ('OV-OO', ovoo_block_energy, ovoo_m_matrix, ovoo_direct_grad,
+     ovoo_analytic_grad),
+    ('CO-OV', coov_block_energy, coov_m_matrix, coov_direct_grad,
+     coov_analytic_grad),
+    ('CV-OO', cvoo_block_energy, cvoo_m_matrix, cvoo_direct_grad,
+     cvoo_analytic_grad),
 )
 
 
@@ -86,27 +107,116 @@ def _assert_cpks_delta_gradient_supported(tdobj):
         )
 
 
-def _total_delta_energy(tdobj, xy):
-    return (
-        sasf_fock_coefficient_energy(tdobj, xy)
-        + sasf_hf_exchange_coefficient_energy(tdobj, xy)
-        + lda_xc_energy(tdobj, xy)
+def _copy_td_settings(src, dst):
+    dst.deltaS = src.deltaS
+    dst.nstates = src.nstates
+    dst.conv_tol = src.conv_tol
+    dst.lindep = src.lindep
+    dst.max_cycle = src.max_cycle
+    dst.max_memory = src.max_memory
+    dst.verbose = 0
+    return dst
+
+
+def _displaced_td_like(tdobj, coords_bohr):
+    from pyscf.sftda.satda import SATDA
+
+    mol = tdobj.mol.copy()
+    mol.set_geom_(coords_bohr, unit='Bohr')
+    mf = _make_displaced_mf(tdobj._scf, mol)
+    mf.kernel()
+    if not mf.converged:
+        raise RuntimeError('Displaced ROKS/ROHF reference did not converge')
+    return _copy_td_settings(tdobj, SATDA(mf).set(deltaS=tdobj.deltaS))
+
+
+def satda_delta_block_energy(tdobj, xy, include_xc=True):
+    """Fixed-amplitude SATDA delta_A energy for this module's ledger.
+
+    This is the only finite-difference scalar paired with the block-resolved
+    gradients below.  It is the sum of the nine HF-like block energies plus the
+    implemented LDA block-kernel energy.  It deliberately does not use compact
+    Fock/HFX coefficient-energy helpers because those are separate diagnostics
+    and are not the ledger differentiated by this module.
+    """
+    e = sum(block_energy(tdobj, xy) for _, block_energy, _, _, _ in _BLOCKS)
+    if include_xc:
+        e += lda_xc_energy(tdobj, xy)
+    return float(e)
+
+
+def satda_delta_block_energies(tdobj, xy, include_xc=True):
+    """Return the per-block fixed-amplitude delta_A energy ledger."""
+    parts = {
+        name: float(block_energy(tdobj, xy))
+        for name, block_energy, _, _, _ in _BLOCKS
+    }
+    if include_xc:
+        parts['LDA-XC'] = float(lda_xc_energy(tdobj, xy))
+    return parts
+
+
+def satda_delta_finite_diff(tdobj, xy, atmlst=None, step=2e-4,
+                            include_xc=True):
+    """Relaxed-SCF, fixed-amplitude finite difference of delta_A.
+
+    The displaced geometries rebuild only the reference SCF object.  The
+    SATDA amplitude ``xy`` is kept fixed, so this checks the nuclear derivative
+    of the same block ledger used by ``satda_delta_gradient_zvec`` and
+    ``satda_delta_gradient``.
+    """
+    if atmlst is None:
+        atmlst = range(tdobj.mol.natm)
+    atmlst = tuple(atmlst)
+    coords0 = tdobj.mol.atom_coords()
+    de = np.zeros((len(atmlst), 3))
+
+    for k, ia in enumerate(atmlst):
+        for xyz in range(3):
+            coords_p = coords0.copy()
+            coords_m = coords0.copy()
+            coords_p[ia, xyz] += step
+            coords_m[ia, xyz] -= step
+            e_p = satda_delta_block_energy(
+                _displaced_td_like(tdobj, coords_p), xy, include_xc=include_xc,
+            )
+            e_m = satda_delta_block_energy(
+                _displaced_td_like(tdobj, coords_m), xy, include_xc=include_xc,
+            )
+            de[k, xyz] = (e_p - e_m) / (2 * step)
+    return de
+
+
+def satda_delta_gradient_reference(td_grad, tdobj, xy, atmlst=None,
+                                   step=2e-4, hessian_solver='dense',
+                                   include_xc=True):
+    """Return analytic and finite-difference delta_A gradients side by side.
+
+    This helper is intentionally scoped to the block-resolved delta_A scaffold.
+    It does not call ``td.Gradients().kernel()`` and must not be used as a
+    total excited-state gradient.
+    """
+    analytic, details = satda_delta_gradient_zvec(
+        td_grad, tdobj, xy, atmlst=atmlst, hessian_solver=hessian_solver,
     )
+    finite_diff = satda_delta_finite_diff(
+        tdobj, xy, atmlst=atmlst, step=step, include_xc=include_xc,
+    )
+    return {
+        'analytic': analytic,
+        'finite_diff': finite_diff,
+        'diff': analytic - finite_diff,
+        'max_abs_diff': float(np.max(np.abs(analytic - finite_diff))),
+        'details': details,
+        'block_energies': satda_delta_block_energies(
+            tdobj, xy, include_xc=include_xc,
+        ),
+    }
 
 
 def _total_m_matrix(tdobj, xy):
-    return (
-        cvcv_m_matrix(tdobj, xy) +
-        coco_m_matrix(tdobj, xy) +
-        ovov_m_matrix(tdobj, xy) +
-        cvco_m_matrix(tdobj, xy) +
-        cvov_m_matrix(tdobj, xy) +
-        cooo_m_matrix(tdobj, xy) +
-        ovoo_m_matrix(tdobj, xy) +
-        coov_m_matrix(tdobj, xy) +
-        cvoo_m_matrix(tdobj, xy) +
-        lda_xc_m_matrix(tdobj, xy)
-    )
+    m = sum(m_matrix(tdobj, xy) for _, _, m_matrix, _, _ in _BLOCKS)
+    return m + lda_xc_m_matrix(tdobj, xy)
 
 
 def _total_direct_grad(td_grad, tdobj, xy, atmlst=None):
@@ -114,15 +224,8 @@ def _total_direct_grad(td_grad, tdobj, xy, atmlst=None):
         atmlst = range(tdobj.mol.natm)
     atmlst = tuple(atmlst)
     de = np.zeros((len(atmlst), 3))
-    de += cvcv_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += coco_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += ovov_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += cvco_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += cvov_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += cooo_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += ovoo_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += coov_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
-    de += cvoo_direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
+    for _, _, _, direct_grad, _ in _BLOCKS:
+        de += direct_grad(td_grad, tdobj, xy, atmlst=atmlst)
     de += lda_xc_direct_de(td_grad, tdobj, xy, atmlst=atmlst)
     return de
 
@@ -153,21 +256,9 @@ def sasf_delta_gradient(td_grad, tdobj, xy, atmlst=None, verbose=0):
     if atmlst is None:
         atmlst = range(tdobj.mol.natm)
 
-    blocks = [
-        ('CV-CV', cvcv_analytic_grad),
-        ('CO-CO', coco_analytic_grad),
-        ('OV-OV', ovov_analytic_grad),
-        ('CV-CO', cvco_analytic_grad),
-        ('CV-OV', cvov_analytic_grad),
-        ('CO-OO', cooo_analytic_grad),
-        ('OV-OO', ovoo_analytic_grad),
-        ('CO-OV', coov_analytic_grad),
-        ('CV-OO', cvoo_analytic_grad),
-    ]
-
     de = np.zeros((len(atmlst), 3))
     parts = {}
-    for name, grad_fn in blocks:
+    for name, _, _, _, grad_fn in _BLOCKS:
         d, _ = grad_fn(td_grad, tdobj, xy, atmlst=atmlst)
         de += d
         parts[name] = d

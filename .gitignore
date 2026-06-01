@@ -141,3 +141,7 @@ multigrid/
 **/multigrid/
 examples/occri/multigrid/
 pytest.ini
+
+# Quarantined wrong/obsolete research code.  Do not import or search this path
+# during normal development.
+.codex_trash/

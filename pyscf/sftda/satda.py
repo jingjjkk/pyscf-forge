@@ -700,16 +700,18 @@ class SATDA(TDBase):
         import sys
         from pathlib import Path
 
-        name = '_pyscf_forge_grad_tdsatda'
+        name = '_pyscf_forge_grad_tdsatda_delta'
         if name in sys.modules:
-            tdsatda = sys.modules[name]
+            tdsatda_delta = sys.modules[name]
         else:
-            path = Path(__file__).resolve().parents[1] / 'grad' / 'tdsatda.py'
-            spec = importlib.util.spec_from_file_location(name, path)
-            tdsatda = importlib.util.module_from_spec(spec)
-            sys.modules[name] = tdsatda
-            spec.loader.exec_module(tdsatda)
-        return tdsatda.Gradients(self)
+            path = Path(__file__).resolve().parents[1] / 'grad' / 'tdsatda_delta'
+            spec = importlib.util.spec_from_file_location(
+                name, path / '__init__.py',
+                submodule_search_locations=[str(path)])
+            tdsatda_delta = importlib.util.module_from_spec(spec)
+            sys.modules[name] = tdsatda_delta
+            spec.loader.exec_module(tdsatda_delta)
+        return tdsatda_delta.Gradients(self)
 
     nuc_grad_method = Gradients
 

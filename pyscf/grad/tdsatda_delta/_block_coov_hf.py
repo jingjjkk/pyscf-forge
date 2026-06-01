@@ -27,7 +27,7 @@ def coov_block_energy(tdobj, xy):
         if omega != 0:
             c_rsh = (alpha-hyb)/(2*b.si-1)
             e += _coov_hfx_energy(tdobj, xy, coeff=c_rsh, omega=omega)
-    return e
+    return 2.0 * e
 
 
 def _coov_hfx_energy(tdobj, xy, coeff, omega=None):
@@ -101,7 +101,8 @@ def coov_direct_grad_hfx(td_grad, tdobj, xy, atmlst=None):
     return de
 
 
-coov_direct_grad = coov_direct_grad_hfx
+def coov_direct_grad(td_grad, tdobj, xy, atmlst=None):
+    return 2.0 * coov_direct_grad_hfx(td_grad, tdobj, xy, atmlst=atmlst)
 
 
 # ===== M-matrix =====
@@ -130,7 +131,7 @@ def coov_m_matrix_hfx(tdobj, xy):
         _add_eri_term_q(tdobj, q_a, q_b, [orbos, orbvs, orbos, orbcs],
                         [osidx, vsidx, osidx, csidx],
                         ['beta', 'beta', 'beta', 'alpha'], ct2, scale=-c2, omega=omega)
-    return q_a + q_b
+    return 2.0 * (q_a + q_b)
 
 
 coov_m_matrix = coov_m_matrix_hfx

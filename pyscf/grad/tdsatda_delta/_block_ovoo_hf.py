@@ -36,8 +36,8 @@ def _ovoo_t_beta_vo_alpha_vo(tdobj, xy):
     b = make_sasf_blocks(tdobj, xy)
     zeta, chi = _spin_coeffs(b.si)
     tr_oo = float(np.trace(b.x_oo))
-    t_beta_vo = 2*chi*tr_oo*b.x_ov.T
-    t_alpha_vo = 2*zeta*lib.einsum('ua,wu->aw', b.x_ov, b.x_oo)
+    t_beta_vo = 2*zeta*lib.einsum('ua,uv->av', b.x_ov, b.x_oo)
+    t_alpha_vo = -2*chi*tr_oo*b.x_ov.T
     return t_beta_vo, t_alpha_vo
 
 
