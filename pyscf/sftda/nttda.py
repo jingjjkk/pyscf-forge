@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Spin-Adapted TDA
+# Noncollinear-Tensor TDA
 #
 # Author: Tai Wang <wtpeter@pku.edu.cn>
 #
@@ -161,7 +161,8 @@ def gen_rohf_response_sfu(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=No
     mol = mf.mol
     if log is None:
         log = logger.new_logger(mf)
-    assert isinstance(mf, dft.roks.ROKS) or isinstance(mf, dft.rks_symm.SymAdaptedROKS)
+    if not isinstance(mf, (dft.roks.ROKS, dft.rks_symm.SymAdaptedROKS)):
+        raise TypeError('NTTDA response requires ROKS reference')
 
     ni = mf._numint
     ni.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
@@ -221,7 +222,8 @@ def gen_rohf_response_sc(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=Non
     mol = mf.mol
     if log is None:
         log = logger.new_logger(mf)
-    assert isinstance(mf, dft.roks.ROKS) or isinstance(mf, dft.rks_symm.SymAdaptedROKS)
+    if not isinstance(mf, (dft.roks.ROKS, dft.rks_symm.SymAdaptedROKS)):
+        raise TypeError('NTTDA response requires ROKS reference')
 
     s = (mol.nelec[0] - mol.nelec[1]) * 0.5
 
@@ -328,7 +330,8 @@ def gen_rohf_response_sfd(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=No
     mol = mf.mol
     if log is None:
         log = logger.new_logger(mf)
-    assert isinstance(mf, dft.roks.ROKS) or isinstance(mf, dft.rks_symm.SymAdaptedROKS)
+    if not isinstance(mf, (dft.roks.ROKS, dft.rks_symm.SymAdaptedROKS)):
+        raise TypeError('NTTDA response requires ROKS reference')
 
     s = (mol.nelec[0] - mol.nelec[1]) * 0.5
 
@@ -430,8 +433,7 @@ def gen_vind_sfu(td):
     assert mo_coeff[0].dtype == np.double
     mo_occ = mf.mo_occ
 
-    csidx = np.where(mo_occ == 2)[0]
-    vsidx = np.where(mo_occ == 0)[0]
+    csidx, _, vsidx = _orbital_indices(td)
     orbcs = mo_coeff[:, csidx]
     orbvs = mo_coeff[:, vsidx]
     ncs = orbcs.shape[1]
@@ -481,19 +483,14 @@ def gen_vind_sc(td):
     assert mo_coeff[0].dtype == np.double
     mo_occ = mf.mo_occ
 
-    csidx = np.where(mo_occ == 2)[0]
-    osidx = np.where(mo_occ == 1)[0]
-    vsidx = np.where(mo_occ == 0)[0]
+    csidx, osidx, vsidx = _orbital_indices(td)
     orbcs = mo_coeff[:, csidx]
     orbos = mo_coeff[:, osidx]
     orbvs = mo_coeff[:, vsidx]
     ncs = orbcs.shape[1]
     nos = orbos.shape[1]
     nvs = orbvs.shape[1]
-    idx1 = ncs * nos
-    idx2 = idx1 + ncs * nvs
-    idx3 = idx2 + 1
-    idx4 = idx3 + nos * nvs
+    slices = _sc_vector_slices(ncs, nos, nvs)
 
     s = nos * 0.5
     assert s >= 0.5, 'NTTDA only supports case that Sf=Si>=1/2.'
@@ -543,11 +540,11 @@ def gen_vind_sc(td):
     def vind(zs):
         time0 = time1 = (logger.process_clock(), logger.perf_counter())
         zs = np.asarray(zs)  # (nstates, ndim)
-        zs_co = zs[:, :idx1].reshape(-1, ncs, nos)
-        zs_cv = zs[:, idx1:idx2].reshape(-1, ncs, nvs)
-        zs_oo = zs[:, idx2:idx3].reshape(-1, 1)
-        zs_ov = zs[:, idx3:idx4].reshape(-1, nos, nvs)
-        zs_cv0 = zs[:, idx4:].reshape(-1, ncs, nvs)
+        zs_co = zs[:, slices['CO(1)']].reshape(-1, ncs, nos)
+        zs_cv = zs[:, slices['CV(1)']].reshape(-1, ncs, nvs)
+        zs_oo = zs[:, slices['OO(1)']].reshape(-1, 1)
+        zs_ov = zs[:, slices['OV(1)']].reshape(-1, nos, nvs)
+        zs_cv0 = zs[:, slices['CV(0)']].reshape(-1, ncs, nvs)
         dms_co = lib.einsum('xov,pv,qo->xpq', zs_co, orbos, orbcs.conj())
         dms_cv = lib.einsum('xov,pv,qo->xpq', zs_cv, orbvs, orbcs.conj())
         dms_ov = lib.einsum('xov,pv,qo->xpq', zs_ov, orbvs, orbos.conj())
@@ -561,33 +558,33 @@ def gen_vind_sc(td):
         v1mo_cv0 = lib.einsum('xpq,qo,pv->xov', v1ao_cv0, orbcs, orbvs.conj())
         time1 = log.timer('NTTDA gen_vind_sc AO->MO transform', *time1)
 
-        v1mo_co += lib.einsum('ij,uv,xjv->xiu', np.eye(ncs), fock_coco1, zs_co)
-        v1mo_co -= lib.einsum('uv,ji,xjv->xiu', np.eye(nos), fock_coco2, zs_co)
-        v1mo_co += lib.einsum('ij,ub,xjb->xiu', np.eye(ncs), fock_cocv, zs_cv) * np.sqrt((s + 1) / 2 / s)
+        v1mo_co += lib.einsum('uv,xiv->xiu', fock_coco1, zs_co)
+        v1mo_co -= lib.einsum('ji,xju->xiu', fock_coco2, zs_co)
+        v1mo_co += lib.einsum('ub,xib->xiu', fock_cocv, zs_cv) * np.sqrt((s + 1) / 2 / s)
         v1mo_co -= np.einsum('ui,xv->xiu', fock_cooo, zs_oo)
-        v1mo_co += lib.einsum('ij,ub,xjb->xiu', np.eye(ncs), fock_cocv0, zs_cv0) * np.sqrt(0.5)
+        v1mo_co += lib.einsum('ub,xib->xiu', fock_cocv0, zs_cv0) * np.sqrt(0.5)
 
-        v1mo_cv += lib.einsum('ij,av,xjv->xia', np.eye(ncs), fock_cocv.T, zs_co) * np.sqrt((s + 1) / 2 / s)
-        v1mo_cv += lib.einsum('ij,ab,xjb->xia', np.eye(ncs), fock_cvcv1, zs_cv)
-        v1mo_cv -= lib.einsum('ab,ji,xjb->xia', np.eye(nvs), fock_cvcv2, zs_cv)
+        v1mo_cv += lib.einsum('av,xiv->xia', fock_cocv.T, zs_co) * np.sqrt((s + 1) / 2 / s)
+        v1mo_cv += lib.einsum('ab,xib->xia', fock_cvcv1, zs_cv)
+        v1mo_cv -= lib.einsum('ji,xja->xia', fock_cvcv2, zs_cv)
         v1mo_cv += np.einsum('ai,xv->xia', fock_cvoo, zs_oo) * np.sqrt(2 * (s + 1) / s)
-        v1mo_cv -= lib.einsum('ab,vi,xvb->xia', np.eye(nvs), fock_cvov, zs_ov) * np.sqrt((s + 1) / 2 / s)
-        v1mo_cv -= lib.einsum('ij,ab,xjb->xia', np.eye(ncs), fock_cvcv01, zs_cv0) * np.sqrt((s + 1) / s)
-        v1mo_cv += lib.einsum('ab,ji,xjb->xia', np.eye(nvs), fock_cvcv02, zs_cv0) * np.sqrt((s + 1) / s)
+        v1mo_cv -= lib.einsum('vi,xva->xia', fock_cvov, zs_ov) * np.sqrt((s + 1) / 2 / s)
+        v1mo_cv -= lib.einsum('ab,xib->xia', fock_cvcv01, zs_cv0) * np.sqrt((s + 1) / s)
+        v1mo_cv += lib.einsum('ji,xja->xia', fock_cvcv02, zs_cv0) * np.sqrt((s + 1) / s)
 
-        v1mo_ov -= lib.einsum('ab,ju,xjb->xua', np.eye(nvs), fock_cvov.T, zs_cv) * np.sqrt((s + 1) / 2 / s)
+        v1mo_ov -= lib.einsum('ju,xja->xua', fock_cvov.T, zs_cv) * np.sqrt((s + 1) / 2 / s)
         v1mo_ov += np.einsum('au,xv->xua', fock_ovoo, zs_oo)
-        v1mo_ov += lib.einsum('uv,ab,xvb->xua', np.eye(nos), fock_ovov1, zs_ov)
-        v1mo_ov -= lib.einsum('ab,vu,xvb->xua', np.eye(nvs), fock_ovov2, zs_ov)
-        v1mo_ov += lib.einsum('ab,ju,xjb->xua', np.eye(nvs), fock_ovcv0, zs_cv0) * np.sqrt(0.5)
+        v1mo_ov += lib.einsum('ab,xub->xua', fock_ovov1, zs_ov)
+        v1mo_ov -= lib.einsum('vu,xva->xua', fock_ovov2, zs_ov)
+        v1mo_ov += lib.einsum('ju,xja->xua', fock_ovcv0, zs_cv0) * np.sqrt(0.5)
 
-        v1mo_cv0 += lib.einsum('ij,av,xjv->xia', np.eye(ncs), fock_cocv0.T, zs_co) * np.sqrt(0.5)
-        v1mo_cv0 -= lib.einsum('ij,ab,xjb->xia', np.eye(ncs), fock_cvcv01, zs_cv) * np.sqrt((s + 1) / s)
-        v1mo_cv0 += lib.einsum('ab,ji,xjb->xia', np.eye(nvs), fock_cvcv02, zs_cv) * np.sqrt((s + 1) / s)
+        v1mo_cv0 += lib.einsum('av,xiv->xia', fock_cocv0.T, zs_co) * np.sqrt(0.5)
+        v1mo_cv0 -= lib.einsum('ab,xib->xia', fock_cvcv01, zs_cv) * np.sqrt((s + 1) / s)
+        v1mo_cv0 += lib.einsum('ji,xja->xia', fock_cvcv02, zs_cv) * np.sqrt((s + 1) / s)
         v1mo_cv0 -= np.einsum('ai,xv->xia', fock_cv0oo, zs_oo) * np.sqrt(2)
-        v1mo_cv0 += lib.einsum('ab,vi,xvb->xia', np.eye(nvs), fock_ovcv0.T, zs_ov) * np.sqrt(0.5)
-        v1mo_cv0 += lib.einsum('ij,ab,xjb->xia', np.eye(ncs), fock_cv0cv01, zs_cv0)
-        v1mo_cv0 -= lib.einsum('ab,ji,xjb->xia', np.eye(nvs), fock_cv0cv02, zs_cv0)
+        v1mo_cv0 += lib.einsum('vi,xva->xia', fock_ovcv0.T, zs_ov) * np.sqrt(0.5)
+        v1mo_cv0 += lib.einsum('ab,xib->xia', fock_cv0cv01, zs_cv0)
+        v1mo_cv0 -= lib.einsum('ji,xja->xia', fock_cv0cv02, zs_cv0)
 
         v1mo_oo = np.zeros((len(zs), ))
         v1mo_oo -= lib.einsum('jv,xjv->x', fock_cooo.T, zs_co)
@@ -613,9 +610,7 @@ def gen_vind_sfd(td):
     assert mo_coeff[0].dtype == np.double
     mo_occ = mf.mo_occ
 
-    csidx = np.where(mo_occ == 2)[0]
-    osidx = np.where(mo_occ == 1)[0]
-    vsidx = np.where(mo_occ == 0)[0]
+    csidx, osidx, vsidx = _orbital_indices(td)
     orbcs = mo_coeff[:, csidx]
     orbos = mo_coeff[:, osidx]
     orbvs = mo_coeff[:, vsidx]
@@ -624,6 +619,10 @@ def gen_vind_sfd(td):
     nvs = orbvs.shape[1]
     nocc = ncs + nos
     nvir = nos + nvs
+    core_rows = slice(None, ncs)
+    open_rows = slice(ncs, None)
+    open_cols = slice(None, nos)
+    virt_cols = slice(nos, None)
 
     s = nos * 0.5
     assert s >= 0.5, 'NTTDA for Sf=Si-1 only supports case that Si>=1.'
@@ -670,14 +669,15 @@ def gen_vind_sfd(td):
     hdiag_ov = fock_ovov0.diagonal()[None, :] - fock_ovov1.diagonal()[:, None]
     hdiag_ov -= fock_ovov2.diagonal()[None, :] * 2 / (2 * s - 1)
     hdiag = np.block([[hdiag_co, hdiag_cv], [hdiag_oo, hdiag_ov]]).ravel()
+    open_diag = np.diag_indices(nos)
 
     def vind(zs):
         time0 = time1 = (logger.process_clock(), logger.perf_counter())
         zs = np.asarray(zs).reshape(-1, nocc, nvir)
-        zs_co = zs[:, :ncs, :nos]
-        zs_cv = zs[:, :ncs, nos:]
-        zs_oo = zs[:, ncs:, :nos]
-        zs_ov = zs[:, ncs:, nos:]
+        zs_co = zs[:, core_rows, open_cols]
+        zs_cv = zs[:, core_rows, virt_cols]
+        zs_oo = zs[:, open_rows, open_cols]
+        zs_ov = zs[:, open_rows, virt_cols]
         dms_co = lib.einsum('xov,pv,qo->xpq', zs_co, orbos, orbcs.conj())
         dms_cv = lib.einsum('xov,pv,qo->xpq', zs_cv, orbvs, orbcs.conj())
         dms_oo = lib.einsum('xov,pv,qo->xpq', zs_oo, orbos, orbos.conj())
@@ -691,43 +691,51 @@ def gen_vind_sfd(td):
         v1mo_ov = lib.einsum('xpq,qo,pv->xov', v1ao_ov, orbos, orbvs.conj())
         time1 = log.timer('NTTDA gen_vind_sfd AO->MO transform', *time1)
 
-        v1mo_co += lib.einsum('ij,uv,xjv->xiu', np.eye(ncs), fock_coco0, zs_co)
-        v1mo_co -= lib.einsum('uv,ji,xjv->xiu', np.eye(nos), fock_coco1, zs_co)
-        v1mo_co -= lib.einsum('uv,ji,xjv->xiu', np.eye(nos), fock_coco2, zs_co) * 2 / (2 * s - 1)
-        v1mo_co += lib.einsum('ij,ub,xjb->xiu', np.eye(ncs), fock_cocv, zs_cv) * np.sqrt((2 * s + 1) / 2 / s)
-        v1mo_co -= lib.einsum('uv,wi,xwv->xiu', np.eye(nos), fock_cooo0, zs_oo) * np.sqrt(2 * s / (2 * s - 1))
-        v1mo_co += lib.einsum('vw,ui,xwv->xiu', np.eye(nos), fock_cooo1, zs_oo) / np.sqrt(2 * s * (2 * s - 1))
+        v1mo_co += lib.einsum('uv,xiv->xiu', fock_coco0, zs_co)
+        v1mo_co -= lib.einsum('ji,xju->xiu', fock_coco1, zs_co)
+        v1mo_co -= lib.einsum('ji,xju->xiu', fock_coco2, zs_co) * 2 / (2 * s - 1)
+        v1mo_co += lib.einsum('ub,xib->xiu', fock_cocv, zs_cv) * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_co -= lib.einsum('wi,xwu->xiu', fock_cooo0, zs_oo) * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_co += lib.einsum('ui,xvv->xiu', fock_cooo1, zs_oo) / np.sqrt(2 * s * (2 * s - 1))
 
-        v1mo_cv += lib.einsum('ij,av,xjv->xia', np.eye(ncs), fock_cocv.T, zs_co) * np.sqrt((2 * s + 1) / 2 / s)
-        v1mo_cv += lib.einsum('ij,ab,xjb->xia', np.eye(ncs), fock_cvcv0, zs_cv)
-        v1mo_cv -= lib.einsum('ab,ji,xjb->xia', np.eye(nvs), fock_cvcv1, zs_cv)
-        v1mo_cv -= lib.einsum('ij,ab,xjb->xia', np.eye(ncs), fock_cvcv2, zs_cv) / s
-        v1mo_cv -= lib.einsum('ab,ji,xjb->xia', np.eye(nvs), fock_cvcv3, zs_cv) / s
-        v1mo_cv -= lib.einsum('vw,ai,xwv->xia', np.eye(nos), fock_cvoo, zs_oo) / s * np.sqrt((2 * s + 1) / (2 * s - 1))
-        v1mo_cv -= lib.einsum('ab,vi,xvb->xia', np.eye(nvs), fock_cvov, zs_ov) * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_cv += lib.einsum('av,xiv->xia', fock_cocv.T, zs_co) * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_cv += lib.einsum('ab,xib->xia', fock_cvcv0, zs_cv)
+        v1mo_cv -= lib.einsum('ji,xja->xia', fock_cvcv1, zs_cv)
+        v1mo_cv -= lib.einsum('ab,xib->xia', fock_cvcv2, zs_cv) / s
+        v1mo_cv -= lib.einsum('ji,xja->xia', fock_cvcv3, zs_cv) / s
+        v1mo_cv -= lib.einsum('ai,xvv->xia', fock_cvoo, zs_oo) / s * np.sqrt((2 * s + 1) / (2 * s - 1))
+        v1mo_cv -= lib.einsum('vi,xva->xia', fock_cvov, zs_ov) * np.sqrt((2 * s + 1) / 2 / s)
 
-        v1mo_oo -= lib.einsum('vt,ju,xjv->xut', np.eye(nos), fock_cooo0.T, zs_co) * np.sqrt(2 * s / (2 * s - 1))
-        v1mo_oo += lib.einsum('ut,jv,xjv->xut', np.eye(nos), fock_cooo1.T, zs_co) / np.sqrt(2 * s * (2 * s - 1))
-        v1mo_oo -= lib.einsum('ut,jb,xjb->xut', np.eye(nos), fock_cvoo.T, zs_cv) / \
-                              s * np.sqrt((2 * s + 1) / (2 * s - 1))
-        v1mo_oo += lib.einsum('wu,tv,xwv->xut', np.eye(nos), fock_oooo0, zs_oo)
-        v1mo_oo -= lib.einsum('tv,wu,xwv->xut', np.eye(nos), fock_oooo1, zs_oo)
-        v1mo_oo += lib.einsum('uv,tb,xvb->xut', np.eye(nos), fock_ooov0, zs_ov) * np.sqrt(2 * s / (2 * s - 1))
-        v1mo_oo -= lib.einsum('tu,vb,xvb->xut', np.eye(nos), fock_ooov1, zs_ov) / np.sqrt(2 * s * (2 * s - 1))
+        v1mo_oo -= lib.einsum('ju,xjt->xut', fock_cooo0.T, zs_co) * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_oo[:, open_diag[0], open_diag[1]] += (
+            lib.einsum('jv,xjv->x', fock_cooo1.T, zs_co) /
+            np.sqrt(2 * s * (2 * s - 1))
+        )[:, None]
+        v1mo_oo[:, open_diag[0], open_diag[1]] -= (
+            lib.einsum('jb,xjb->x', fock_cvoo.T, zs_cv) /
+            s * np.sqrt((2 * s + 1) / (2 * s - 1))
+        )[:, None]
+        v1mo_oo += lib.einsum('tv,xuv->xut', fock_oooo0, zs_oo)
+        v1mo_oo -= lib.einsum('wu,xwt->xut', fock_oooo1, zs_oo)
+        v1mo_oo += lib.einsum('tb,xub->xut', fock_ooov0, zs_ov) * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_oo[:, open_diag[0], open_diag[1]] -= (
+            lib.einsum('vb,xvb->x', fock_ooov1, zs_ov) /
+            np.sqrt(2 * s * (2 * s - 1))
+        )[:, None]
 
-        v1mo_ov -= lib.einsum('ab,ju,xjb->xua', np.eye(nvs), fock_cvov.T, zs_cv) * np.sqrt((2 * s + 1) / 2 / s)
-        v1mo_ov += lib.einsum('uw,av,xwv->xua', np.eye(nos), fock_ooov0.T, zs_oo) * np.sqrt(2 * s / (2 * s - 1))
-        v1mo_ov -= lib.einsum('vw,au,xwv->xua', np.eye(nos), fock_ooov1.T, zs_oo) / np.sqrt(2 * s * (2 * s - 1))
-        v1mo_ov += lib.einsum('uv,ab,xvb->xua', np.eye(nos), fock_ovov0, zs_ov)
-        v1mo_ov -= lib.einsum('ab,vu,xvb->xua', np.eye(nvs), fock_ovov1, zs_ov)
-        v1mo_ov -= lib.einsum('uv,ab,xvb->xua', np.eye(nos), fock_ovov2, zs_ov) * 2 / (2 * s - 1)
+        v1mo_ov -= lib.einsum('ju,xja->xua', fock_cvov.T, zs_cv) * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_ov += lib.einsum('av,xuv->xua', fock_ooov0.T, zs_oo) * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_ov -= lib.einsum('au,xvv->xua', fock_ooov1.T, zs_oo) / np.sqrt(2 * s * (2 * s - 1))
+        v1mo_ov += lib.einsum('ab,xub->xua', fock_ovov0, zs_ov)
+        v1mo_ov -= lib.einsum('vu,xva->xua', fock_ovov1, zs_ov)
+        v1mo_ov -= lib.einsum('ab,xub->xua', fock_ovov2, zs_ov) * 2 / (2 * s - 1)
         time1 = log.timer('NTTDA gen_vind_sfd Fock part', *time1)
 
         v1mo = np.zeros_like(zs)
-        v1mo[:, :ncs, :nos] = v1mo_co
-        v1mo[:, :ncs, nos:] = v1mo_cv
-        v1mo[:, ncs:, :nos] = v1mo_oo
-        v1mo[:, ncs:, nos:] = v1mo_ov
+        v1mo[:, core_rows, open_cols] = v1mo_co
+        v1mo[:, core_rows, virt_cols] = v1mo_cv
+        v1mo[:, open_rows, open_cols] = v1mo_oo
+        v1mo[:, open_rows, virt_cols] = v1mo_ov
         assert v1mo.shape == zs.shape
         time1 = log.timer('NTTDA gen_vind_sfd pack result', *time1)
         log.timer('NTTDA gen_vind_sfd total', *time0)
@@ -779,13 +787,13 @@ class NTTDA(TDBase):
         elif self.deltaS == -1:
             vind, hdiag = self.gen_vind_sfd()
             precond = self.get_precond(hdiag)
-            csidx, osidx, vsidx = _NTTDA_orbital_indices(self)
+            csidx, osidx, vsidx = _orbital_indices(self)
             nocc = len(csidx) + len(osidx)
             nvir = len(osidx) + len(vsidx)
         elif self.deltaS == 1:
             vind, hdiag = self.gen_vind_sfu()
             precond = self.get_precond(hdiag)
-            csidx, _, vsidx = _NTTDA_orbital_indices(self)
+            csidx, _, vsidx = _orbital_indices(self)
             ncs = len(csidx)
             nvs = len(vsidx)
         else:
@@ -851,10 +859,10 @@ def _safe_irrep_id2name(groupname, irrep_id):
         return '???'
 
 
-def _NTTDA_block_slices(nc, no, nv, deltaS):
+def _sc_vector_slices(nc, no, nv):
     co = nc * no
     cv = nc * nv
-    oo = no * no if deltaS == -1 else 1
+    oo = 1
     ov = no * nv
     p_co = 0
     p_cv = p_co + co
@@ -867,12 +875,11 @@ def _NTTDA_block_slices(nc, no, nv, deltaS):
         'OO(1)': slice(p_oo, p_ov),
         'OV(1)': slice(p_ov, p_cv0),
     }
-    if deltaS == 0:
-        blocks['CV(0)'] = slice(p_cv0, p_cv0 + cv)
+    blocks['CV(0)'] = slice(p_cv0, p_cv0 + cv)
     return blocks
 
 
-def _NTTDA_orbital_indices(tdobj):
+def _orbital_indices(tdobj):
     mo_occ = np.asarray(tdobj._scf.mo_occ)
     csidx = np.where(mo_occ == 2)[0]
     osidx = np.where(mo_occ == 1)[0]
@@ -911,11 +918,11 @@ def _analyze_sc(tdobj, verbose=None):
     log = logger.new_logger(tdobj, verbose)
     mol = tdobj.mol
     mf = tdobj._scf
-    csidx, osidx, vsidx = _NTTDA_orbital_indices(tdobj)
+    csidx, osidx, vsidx = _orbital_indices(tdobj)
     nc = len(csidx)
     no = len(osidx)
     nv = len(vsidx)
-    slices = _NTTDA_block_slices(nc, no, nv, deltaS=0)
+    slices = _sc_vector_slices(nc, no, nv)
 
     if mol.symmetry and mol.groupname != 'C1':
         orbsym = mf.get_orbsym(mf.mo_coeff)
@@ -965,11 +972,11 @@ def _analyze_sc(tdobj, verbose=None):
     return tdobj
 
 
-def _analyze_sf(tdobj, verbose=None):
+def _analyze_sfd(tdobj, verbose=None):
     log = logger.new_logger(tdobj, verbose)
     mol = tdobj.mol
     mf = tdobj._scf
-    csidx, osidx, vsidx = _NTTDA_orbital_indices(tdobj)
+    csidx, osidx, vsidx = _orbital_indices(tdobj)
     nc = len(csidx)
     no = len(osidx)
     nv = len(vsidx)
@@ -1026,7 +1033,7 @@ def _analyze_sfu(tdobj, verbose=None):
     log = logger.new_logger(tdobj, verbose)
     mol = tdobj.mol
     mf = tdobj._scf
-    csidx, osidx, vsidx = _NTTDA_orbital_indices(tdobj)
+    csidx, osidx, vsidx = _orbital_indices(tdobj)
     nc = len(csidx)
     nv = len(vsidx)
 
@@ -1051,7 +1058,7 @@ def _analyze_sfu(tdobj, verbose=None):
 
         if log.verbose >= logger.INFO:
             for c, v in zip(*np.where(np.abs(x_cv) > 0.1)):
-                log.info('    CV(+1) %4d -> %4d %12.5f',
+                log.info('    CV(1) %4d -> %4d %12.5f',
                          csidx[c] + MO_BASE, vsidx[v] + MO_BASE, x_cv[c, v])
     return tdobj
 
@@ -1060,7 +1067,7 @@ def analyze(tdobj, verbose=None):
     if tdobj.deltaS == 0:
         return _analyze_sc(tdobj, verbose)
     if tdobj.deltaS == -1:
-        return _analyze_sf(tdobj, verbose)
+        return _analyze_sfd(tdobj, verbose)
     if tdobj.deltaS == 1:
         return _analyze_sfu(tdobj, verbose)
     raise ValueError('deltaS should be -1, 0, or 1')
@@ -1097,12 +1104,8 @@ def transition_dipole(tdobj, ref=1, state=None):
     assert s >= 1
 
     mo_coeff = mf.mo_coeff
-    mo_occ = mf.mo_occ
-    assert mo_occ.ndim == 1
-
-    csidx = np.where(mo_occ == 2)[0]
-    osidx = np.where(mo_occ == 1)[0]
-    vsidx = np.where(mo_occ == 0)[0]
+    assert mf.mo_occ.ndim == 1
+    csidx, osidx, vsidx = _orbital_indices(tdobj)
 
     ncs = len(csidx)
     nos = len(osidx)
