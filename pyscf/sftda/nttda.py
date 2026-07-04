@@ -22,6 +22,7 @@ import numpy as np
 from pyscf import lib
 from pyscf import dft
 from pyscf.lib import logger
+from pyscf.scf import hf_symm
 from pyscf.tdscf.uhf import TDBase
 from pyscf.dft.gen_grid import NBINS
 from pyscf import __config__
@@ -841,22 +842,20 @@ class NTTDA(TDBase):
     gen_vind_sfd = gen_vind_sfd
 
 
-def _analyze_wfnsym(tdobj, x_sym, x):
-    possible_sym = np.asarray(x_sym)[np.abs(np.asarray(x)) > 0.1]
+def _guess_wfnsym_id(tdobj, x_sym, x):
+    possible_sym = np.asarray(x_sym)[np.abs(np.asarray(x)) > 1e-7]
     wfnsym = symm.MULTI_IRREPS
     ids = possible_sym[possible_sym != symm.MULTI_IRREPS]
     if len(ids) > 0 and np.all(ids == ids[0]):
         wfnsym = int(ids[0])
+    return wfnsym
+
+
+def _analyze_wfnsym(tdobj, x_sym, x):
+    wfnsym = _guess_wfnsym_id(tdobj, x_sym, x)
     if wfnsym == symm.MULTI_IRREPS:
         return wfnsym, '???'
-    return wfnsym, _safe_irrep_id2name(tdobj.mol.groupname, wfnsym)
-
-
-def _safe_irrep_id2name(groupname, irrep_id):
-    try:
-        return symm.irrep_id2name(groupname, int(irrep_id))
-    except KeyError:
-        return '???'
+    return wfnsym, symm.irrep_id2name(tdobj.mol.groupname, wfnsym)
 
 
 def _sc_vector_slices(nc, no, nv):
@@ -887,17 +886,15 @@ def _orbital_indices(tdobj):
     return csidx, osidx, vsidx
 
 
-def _log_state(log, tdobj, istate, e_ev, wfnsymid=None, wfnsymlabel=None):
+def _log_state(log, tdobj, istate, e_ev, wfnsymid=None):
     mol = tdobj.mol
     mf = tdobj._scf
     if wfnsymid is None:
         log.note('Excited State %3d: %12.5f eV', istate + 1, e_ev)
         return
-    refsym = mf.get_wfnsym()
-    if isinstance(refsym, str):
-        refsym = symm.irrep_name2id(mol.groupname, refsym)
-    else:
-        refsym = int(np.asarray(refsym).ravel()[0])
+    orbsym = hf_symm.get_orbsym(mol, mf.mo_coeff)
+    refsym = hf_symm.get_wfnsym(mf, mf.mo_coeff, mf.mo_occ, orbsym)
+    refsym = int(np.asarray(refsym).ravel()[0])
     if refsym == symm.MULTI_IRREPS or wfnsymid == symm.MULTI_IRREPS:
         statesymlabel = '???'
     else:
@@ -907,10 +904,10 @@ def _log_state(log, tdobj, istate, e_ev, wfnsymid=None, wfnsymlabel=None):
         if statesymid == symm.MULTI_IRREPS:
             statesymlabel = '???'
         else:
-            statesymlabel = _safe_irrep_id2name(mol.groupname, statesymid)
+            statesymlabel = symm.irrep_id2name(mol.groupname, int(statesymid))
     log.note(
-        'Excited State %3d: %4s (State: %4s) %12.5f eV',
-        istate + 1, wfnsymlabel, statesymlabel, e_ev,
+        'Excited State %3d: %4s %12.5f eV',
+        istate + 1, statesymlabel, e_ev,
     )
 
 
@@ -924,34 +921,31 @@ def _analyze_sc(tdobj, verbose=None):
     nv = len(vsidx)
     slices = _sc_vector_slices(nc, no, nv)
 
-    if mol.symmetry and mol.groupname != 'C1':
-        orbsym = mf.get_orbsym(mf.mo_coeff)
-        x_syms = {
-            'CO(1)': symm.direct_prod(orbsym[csidx], orbsym[osidx], mol.groupname),
-            'CV(1)': symm.direct_prod(orbsym[csidx], orbsym[vsidx], mol.groupname),
-            'OV(1)': symm.direct_prod(orbsym[osidx], orbsym[vsidx], mol.groupname),
-            'CV(0)': symm.direct_prod(orbsym[csidx], orbsym[vsidx], mol.groupname),
-        }
+    if mol.symmetry:
+        orbsym = hf_symm.get_orbsym(mol, mf.mo_coeff)
+        x_sym = np.empty(slices['CV(0)'].stop, dtype=orbsym.dtype)
+        x_sym[slices['CO(1)']] = symm.direct_prod(
+            orbsym[csidx], orbsym[osidx], mol.groupname).ravel()
+        x_sym[slices['CV(1)']] = symm.direct_prod(
+            orbsym[csidx], orbsym[vsidx], mol.groupname).ravel()
+        x_sym[slices['OO(1)']] = 0
+        x_sym[slices['OV(1)']] = symm.direct_prod(
+            orbsym[osidx], orbsym[vsidx], mol.groupname).ravel()
+        x_sym[slices['CV(0)']] = symm.direct_prod(
+            orbsym[csidx], orbsym[vsidx], mol.groupname).ravel()
     else:
-        x_syms = None
+        x_sym = None
 
     for i in range(tdobj.nstates):
         x, y = tdobj.xy[i]
         x = np.asarray(x).reshape(-1)
         e_ev = np.asarray(tdobj.e[i]) * nist.HARTREE2EV
 
-        if x_syms is None:
+        if x_sym is None:
             _log_state(log, tdobj, i, e_ev)
         else:
-            syms = []
-            vals = []
-            for key in ('CO(1)', 'CV(1)', 'OV(1)', 'CV(0)'):
-                x_block = x[slices[key]]
-                vals.append(np.max(np.abs(x_block), initial=0.0))
-                syms.append((key, x_block.reshape(x_syms[key].shape)))
-            key, x_block = syms[int(np.argmax(vals))]
-            wfnsymid, wfnsymlabel = _analyze_wfnsym(tdobj, x_syms[key], x_block)
-            _log_state(log, tdobj, i, e_ev, wfnsymid, wfnsymlabel)
+            wfnsymid, _ = _analyze_wfnsym(tdobj, x_sym, x)
+            _log_state(log, tdobj, i, e_ev, wfnsymid)
 
         if log.verbose >= logger.INFO:
             x_co1 = x[slices['CO(1)']].reshape(nc, no)
@@ -983,16 +977,19 @@ def _analyze_sfd(tdobj, verbose=None):
     nocc = nc + no
     nvir = no + nv
 
-    if mol.symmetry and mol.groupname != 'C1':
-        orbsym = mf.get_orbsym(mf.mo_coeff)
-        x_syms = {
-            'CO(1)': symm.direct_prod(orbsym[csidx], orbsym[osidx], mol.groupname),
-            'CV(1)': symm.direct_prod(orbsym[csidx], orbsym[vsidx], mol.groupname),
-            'OO(1)': symm.direct_prod(orbsym[osidx], orbsym[osidx], mol.groupname),
-            'OV(1)': symm.direct_prod(orbsym[osidx], orbsym[vsidx], mol.groupname),
-        }
+    if mol.symmetry:
+        orbsym = hf_symm.get_orbsym(mol, mf.mo_coeff)
+        x_sym = np.empty((nocc, nvir), dtype=orbsym.dtype)
+        x_sym[:nc, :no] = symm.direct_prod(
+            orbsym[csidx], orbsym[osidx], mol.groupname)
+        x_sym[:nc, no:] = symm.direct_prod(
+            orbsym[csidx], orbsym[vsidx], mol.groupname)
+        x_sym[nc:, :no] = symm.direct_prod(
+            orbsym[osidx], orbsym[osidx], mol.groupname)
+        x_sym[nc:, no:] = symm.direct_prod(
+            orbsym[osidx], orbsym[vsidx], mol.groupname)
     else:
-        x_syms = None
+        x_sym = None
 
     for i in range(tdobj.nstates):
         x, y = tdobj.xy[i]
@@ -1004,18 +1001,11 @@ def _analyze_sfd(tdobj, verbose=None):
         x_oo1 = x[nc:, :no]
         x_ov1 = x[nc:, no:]
 
-        if x_syms is None:
+        if x_sym is None:
             _log_state(log, tdobj, i, e_ev)
         else:
-            x_blocks = {
-                'CO(1)': x_co1,
-                'CV(1)': x_cv1,
-                'OO(1)': x_oo1,
-                'OV(1)': x_ov1,
-            }
-            key = max(x_blocks, key=lambda k: np.max(np.abs(x_blocks[k]), initial=0.0))
-            wfnsymid, wfnsymlabel = _analyze_wfnsym(tdobj, x_syms[key], x_blocks[key])
-            _log_state(log, tdobj, i, e_ev, wfnsymid, wfnsymlabel)
+            wfnsymid, _ = _analyze_wfnsym(tdobj, x_sym, x)
+            _log_state(log, tdobj, i, e_ev, wfnsymid)
 
         if log.verbose >= logger.INFO:
             for c, o in zip(*np.where(np.abs(x_co1) > 0.1)):
@@ -1037,8 +1027,8 @@ def _analyze_sfu(tdobj, verbose=None):
     nc = len(csidx)
     nv = len(vsidx)
 
-    if mol.symmetry and mol.groupname != 'C1':
-        orbsym = mf.get_orbsym(mf.mo_coeff)
+    if mol.symmetry:
+        orbsym = hf_symm.get_orbsym(mol, mf.mo_coeff)
         x_sym = symm.direct_prod(orbsym[csidx], orbsym[vsidx],
                                  mol.groupname)
     else:
@@ -1053,8 +1043,8 @@ def _analyze_sfu(tdobj, verbose=None):
         if x_sym is None:
             _log_state(log, tdobj, i, e_ev)
         else:
-            wfnsymid, wfnsymlabel = _analyze_wfnsym(tdobj, x_sym, x_cv)
-            _log_state(log, tdobj, i, e_ev, wfnsymid, wfnsymlabel)
+            wfnsymid, _ = _analyze_wfnsym(tdobj, x_sym, x_cv)
+            _log_state(log, tdobj, i, e_ev, wfnsymid)
 
         if log.verbose >= logger.INFO:
             for c, v in zip(*np.where(np.abs(x_cv) > 0.1)):

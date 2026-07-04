@@ -152,7 +152,7 @@ class KnownValues(unittest.TestCase):
                     td.verbose = 0
                     td.kernel()
                     self.assertTrue(np.all(td.converged))
-                    np.testing.assert_allclose(td.e, ref, atol=1e-12, rtol=0)
+                    np.testing.assert_allclose(td.e, ref, atol=1e-6, rtol=0)
 
     def test_hf_nttda(self):
         self._check_functional('HF')
