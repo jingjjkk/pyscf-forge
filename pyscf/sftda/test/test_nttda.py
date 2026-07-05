@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 import numpy as np
 from pyscf import gto
 from pyscf.sftda import nttda
@@ -165,6 +166,28 @@ class KnownValues(unittest.TestCase):
 
     def test_cam_b3lyp_nttda(self):
         self._check_functional('CAM-B3LYP')
+
+    def test_mo_grid_fxc1_vind_matches_ao(self):
+        rng = np.random.default_rng(12)
+        for xc in ('BLYP', 'TPSS'):
+            mf = self.mol.ROKS(xc=xc).run()
+            for delta_s in (0, -1):
+                with self.subTest(xc=xc, deltaS=delta_s):
+                    td0 = nttda.NTTDA(mf)
+                    td0.deltaS = delta_s
+                    td0.verbose = 0
+                    td1 = nttda.NTTDA(mf)
+                    td1.deltaS = delta_s
+                    td1.verbose = 0
+                    with mock.patch.object(nttda, 'MO_GRID_FXC1', False):
+                        vind0, hdiag0 = (td0.gen_vind_sc() if delta_s == 0
+                                         else td0.gen_vind_sfd())
+                    with mock.patch.object(nttda, 'MO_GRID_FXC1', True):
+                        vind1, hdiag1 = (td1.gen_vind_sc() if delta_s == 0
+                                         else td1.gen_vind_sfd())
+                    np.testing.assert_allclose(hdiag1, hdiag0, atol=1e-10, rtol=0)
+                    zs = rng.standard_normal((2, hdiag0.size))
+                    np.testing.assert_allclose(vind1(zs), vind0(zs), atol=1e-9, rtol=0)
 
 
 if __name__ == "__main__":
