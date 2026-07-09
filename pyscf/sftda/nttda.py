@@ -582,11 +582,15 @@ def gen_vind_sfu(td):
     vresp, fockz = gen_rohf_response_sfu(mf, mo_coeff=mo_coeff, mo_occ=mo_occ, hermi=0,
                                          max_memory=td.max_memory, log=log)
 
-    fock = mf.get_fock()
     if td.nobeta:
-        focka = fock.focka
-        fockb = focka - 2 * fockz
+        dma, dmb = mf.make_rdm1()
+        dm0 = 0.5 * (dma + dmb)
+        fock = mf.get_fock(dm=np.array([dm0, dm0]))
+        fock0 = 0.5 * (fock.focka + fock.fockb)
+        focka = fock0 + fockz
+        fockb = fock0 - fockz
     else:
+        fock = mf.get_fock()
         fock0 = 0.5 * (fock.focka + fock.fockb)
         focka = fock0 + fockz
         fockb = fock0 - fockz
@@ -650,12 +654,15 @@ def gen_vind_sc(td):
                                         fxc_ref=fxc_ref,
                                         skip_xc_vref1=use_mo_grid_fxc1)
 
-    fock = mf.get_fock()
     if td.nobeta:
-        focka = fock.focka
-        fock0 = focka - fockz
-        fockb = focka - 2 * fockz
+        dma, dmb = mf.make_rdm1()
+        dm0 = 0.5 * (dma + dmb)
+        fock = mf.get_fock(dm=np.array([dm0, dm0]))
+        fock0 = 0.5 * (fock.focka + fock.fockb)
+        focka = fock0 + fockz
+        fockb = fock0 - fockz
     else:
+        fock = mf.get_fock()
         fock0 = 0.5 * (fock.focka + fock.fockb)
         focka = fock0 + fockz
         fockb = fock0 - fockz
@@ -824,13 +831,14 @@ def gen_vind_sfd(td):
                                          fxc_ref=fxc_ref,
                                          skip_xc_vref1=use_mo_grid_fxc1)
 
-    fock = mf.get_fock()
     if td.nobeta:
-        focka = fock.focka
-        fock0 = focka - fockz
-    else:
+        dma, dmb = mf.make_rdm1()
+        dm0 = 0.5 * (dma + dmb)
+        fock = mf.get_fock(dm=np.array([dm0, dm0]))
         fock0 = 0.5 * (fock.focka + fock.fockb)
-        focka = fock0 + fockz
+    else:
+        fock = mf.get_fock()
+        fock0 = 0.5 * (fock.focka + fock.fockb)
 
     fock_coco0 = orbos.T @ (fock0 - fockz) @ orbos
     fock_coco1 = orbcs.T @ (fock0 + fockz) @ orbcs
