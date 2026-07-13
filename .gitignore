@@ -141,3 +141,6 @@ multigrid/
 **/multigrid/
 examples/occri/multigrid/
 pytest.ini
+
+# Quarantined research-code archaeology; never import or test as production.
+.codex_trash/

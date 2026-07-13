@@ -1,0 +1,1019 @@
+"""Analytic gradient for current NTTDA ``deltaS=-1``.
+
+This module owns the complete spin-lowering amplitude, Fock, response, and
+AO derivative formulas.  It does not import the ``deltaS=0`` channel.
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from pyscf import dft, lib
+from pyscf.sftda import nttda as nttda_mod
+from pyscf.sftda.nttda import gen_rohf_response_sfd
+
+from . import xc as xc_backend
+from .roks import finish_gradient
+
+
+
+# Orbital spaces and native amplitudes
+
+@dataclass(frozen=True)
+class OrbitalSpaces:
+    """Closed, open, and virtual spatial-orbital partitions."""
+
+    closed: np.ndarray
+    open: np.ndarray
+    virtual: np.ndarray
+    c_closed: np.ndarray
+    c_open: np.ndarray
+    c_virtual: np.ndarray
+
+    @property
+    def spin(self):
+        return 0.5 * len(self.open)
+
+
+@dataclass(frozen=True)
+class SpinLoweringAmplitudes:
+    """Four native blocks used by ``NTTDA(deltaS=-1)``."""
+
+    co: np.ndarray
+    cv: np.ndarray
+    oo: np.ndarray
+    ov: np.ndarray
+
+
+def orbital_spaces(tdobj):
+    """Return the ROKS ``C/O/V`` orbital partition used by NTTDA."""
+    mf = tdobj._scf
+    occ = np.asarray(mf.mo_occ)
+    if occ.ndim != 1:
+        raise ValueError("NTTDA gradients require spatial ROKS orbitals")
+    closed = np.flatnonzero(occ == 2)
+    open_ = np.flatnonzero(occ == 1)
+    virtual = np.flatnonzero(occ == 0)
+    coeff = np.asarray(mf.mo_coeff)
+    return OrbitalSpaces(
+        closed=closed,
+        open=open_,
+        virtual=virtual,
+        c_closed=coeff[:, closed],
+        c_open=coeff[:, open_],
+        c_virtual=coeff[:, virtual],
+    )
+
+
+def pair_density(c_left, coefficient, c_right):
+    """Build ``C_left coefficient C_right^T`` without symmetrizing it."""
+    return c_left @ np.asarray(coefficient) @ c_right.conj().T
+
+
+def split_spin_lowering(tdobj, xy):
+    """Split a lowering-channel amplitude into ``CO/CV/OO/OV`` blocks."""
+    spaces = orbital_spaces(tdobj)
+    if spaces.spin < 1.0:
+        raise ValueError("NTTDA deltaS=-1 requires reference spin Si >= 1")
+    vector = xy[0] if isinstance(xy, (tuple, list)) else xy
+    vector = np.asarray(vector)
+    nc = len(spaces.closed)
+    no = len(spaces.open)
+    nv = len(spaces.virtual)
+    expected = (nc + no, no + nv)
+    if vector.size != expected[0] * expected[1]:
+        raise ValueError(
+            "deltaS=-1 amplitude has size %d; expected %d" %
+            (vector.size, expected[0] * expected[1])
+        )
+    vector = vector.reshape(expected)
+    return spaces, SpinLoweringAmplitudes(
+        co=vector[:nc, :no],
+        cv=vector[:nc, no:],
+        oo=vector[nc:, :no],
+        ov=vector[nc:, no:],
+    )
+
+
+def spin_lowering_transition_densities(tdobj, xy):
+    """Directed alpha-occupied to beta-target transition densities."""
+    spaces, amp = split_spin_lowering(tdobj, xy)
+    return spaces, amp, {
+        "CO": pair_density(spaces.c_open, amp.co.T, spaces.c_closed),
+        "CV": pair_density(spaces.c_virtual, amp.cv.T, spaces.c_closed),
+        "OO": pair_density(spaces.c_open, amp.oo.T, spaces.c_open),
+        "OV": pair_density(spaces.c_virtual, amp.ov.T, spaces.c_open),
+    }
+
+
+def spin_lowering_block_data(spaces, amplitudes):
+    """MO index/factor map for variations of lowering transition densities."""
+    return {
+        "CO": (spaces.open, spaces.closed, amplitudes.co.T),
+        "CV": (spaces.virtual, spaces.closed, amplitudes.cv.T),
+        "OO": (spaces.open, spaces.open, amplitudes.oo.T),
+        "OV": (spaces.virtual, spaces.open, amplitudes.ov.T),
+    }
+
+
+# Channel-local immutable records
+
+@dataclass(frozen=True)
+class FockProjection:
+    """One scalar term ``Tr[P (weight_f0 F0 + weight_fz Fz)]``."""
+
+    name: str
+    left_indices: np.ndarray
+    left_orbitals: np.ndarray
+    coefficient: np.ndarray
+    right_indices: np.ndarray
+    right_orbitals: np.ndarray
+    weight_f0: float
+    weight_fz: float
+
+    def density(self):
+        return pair_density(
+            self.left_orbitals, self.coefficient, self.right_orbitals,
+        )
+
+
+@dataclass(frozen=True)
+class ResponseTerm:
+    """Directed response term from one source density to one target block."""
+
+    target: str
+    source: str
+    vref0: float
+    vref1: float
+
+
+# Shared-response evaluators copied into the lowering channel
+
+def _fxc_reference(tdobj):
+    mf = tdobj._scf
+    ni = mf._numint
+    fxc = ni.cache_xc_kernel(
+        mf.mol, mf.grids, mf.xc, mf.mo_coeff, mf.mo_occ, 1,
+    )[2]
+    return 0.5 * (
+        fxc[0, :, 0] - fxc[0, :, 1]
+        - fxc[1, :, 0] + fxc[1, :, 1]
+    )
+
+
+def _apply_reference_responses(tdobj, densities, max_memory=None):
+    """Return separate ``vref0`` and ``vref1`` actions for each density."""
+    mf = tdobj._scf
+    mol = mf.mol
+    ni = mf._numint
+    if max_memory is None:
+        max_memory = tdobj.max_memory
+    labels = tuple(densities)
+    dms = np.asarray([densities[label] for label in labels])
+    xctype = ni._xc_type(mf.xc)
+    if xctype == "HF":
+        vref0 = np.zeros_like(dms)
+        vref1 = np.zeros_like(dms)
+    else:
+        fxc_ref = _fxc_reference(tdobj)
+        vref0 = ni.nr_rks_fxc(
+            mol, mf.grids, mf.xc, None, dms, 0, 0,
+            None, None, fxc_ref, max_memory=max_memory,
+        )
+        if xctype == "LDA":
+            vref1 = ni.nr_rks_fxc(
+                mol, mf.grids, mf.xc, None, dms, 0, 0,
+                None, None, fxc_ref, max_memory=max_memory,
+            )
+        elif xctype == "GGA":
+            vref1 = nttda_mod.nr_rks_fxc1_gga(
+                ni, mol, mf.grids, mf.xc, dms, fxc_ref,
+                max_memory=max_memory,
+            )
+        elif xctype == "MGGA":
+            vref1 = nttda_mod.nr_rks_fxc1_mgga(
+                ni, mol, mf.grids, mf.xc, dms, fxc_ref,
+                max_memory=max_memory,
+            )
+        else:
+            raise NotImplementedError(
+                "NTTDA spin-lowering response does not support XC type %s" %
+                xctype
+            )
+
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    if ni.libxc.is_hybrid_xc(mf.xc):
+        vref0 -= hyb * mf.get_k(mol, dms, hermi=0)
+        vref1 -= hyb * mf.get_j(mol, dms, hermi=0)
+        if omega != 0:
+            scale = alpha - hyb
+            vref0 -= scale * mf.get_k(mol, dms, hermi=0, omega=omega)
+            vref1 -= scale * mf.get_j(mol, dms, hermi=0, omega=omega)
+    return (
+        {label: value for label, value in zip(labels, vref0)},
+        {label: value for label, value in zip(labels, vref1)},
+    )
+
+
+def _apply_hfx_responses(tdobj, densities):
+    """Return only the hybrid/RSH J/K portions of ``vref0/vref1``."""
+    mf = tdobj._scf
+    labels = tuple(densities)
+    dms = np.asarray([densities[label] for label in labels])
+    vref0 = np.zeros_like(dms)
+    vref1 = np.zeros_like(dms)
+    ni = mf._numint
+    omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(mf.xc, mf.mol.spin)
+    if ni.libxc.is_hybrid_xc(mf.xc):
+        vref0 -= hybrid * mf.get_k(mf.mol, dms, hermi=0)
+        vref1 -= hybrid * mf.get_j(mf.mol, dms, hermi=0)
+        if omega != 0:
+            scale = alpha - hybrid
+            vref0 -= scale * mf.get_k(
+                mf.mol, dms, hermi=0, omega=omega,
+            )
+            vref1 -= scale * mf.get_j(
+                mf.mol, dms, hermi=0, omega=omega,
+            )
+    return (
+        {label: value for label, value in zip(labels, vref0)},
+        {label: value for label, value in zip(labels, vref1)},
+    )
+
+
+# Reference Fock response helper
+
+def _fock_response_q(tdobj, p_alpha, p_beta):
+    """Reference-density derivative of a spin-resolved Fock scalar."""
+    mf = tdobj._scf
+    mo = np.asarray(mf.mo_coeff)
+    occ_alpha = np.flatnonzero(mf.mo_occ > 0)
+    occ_beta = np.flatnonzero(mf.mo_occ == 2)
+    if (isinstance(mf, dft.KohnShamDFT)
+            and mf._numint._xc_type(mf.xc) != "HF"):
+        unrestricted = mf.to_uks()
+        unrestricted.verbose = 0
+        v_alpha, v_beta = unrestricted.gen_response(hermi=0)(
+            np.asarray((p_alpha.T, p_beta.T))
+        )
+    else:
+        p_total = p_alpha + p_beta
+        coulomb = mf.get_j(mf.mol, p_total.T, hermi=0)
+        v_alpha = coulomb - mf.get_k(mf.mol, p_alpha.T, hermi=0)
+        v_beta = coulomb - mf.get_k(mf.mol, p_beta.T, hermi=0)
+    q_alpha = np.zeros((mo.shape[1], mo.shape[1]))
+    q_beta = np.zeros_like(q_alpha)
+    q_alpha[:, occ_alpha] = (
+        mo.conj().T @ (v_alpha + v_alpha.T) @ mo[:, occ_alpha]
+    )
+    q_beta[:, occ_beta] = (
+        mo.conj().T @ (v_beta + v_beta.T) @ mo[:, occ_beta]
+    )
+    return q_alpha, q_beta
+
+
+# Complete lowering scalar and M-matrix ledger
+
+def spin_lowering_response_terms(spin):
+    """Directed ``vref0/vref1`` coefficients in ``gen_rohf_response_sfd``."""
+    denominator = 2.0 * spin - 1.0
+    a = np.sqrt((2.0 * spin + 1.0) / (2.0 * spin))
+    b = np.sqrt(2.0 * spin / denominator)
+    c = np.sqrt((2.0 * spin + 1.0) / denominator)
+    return (
+        ResponseTerm("CO", "CO", 1.0, 1.0 / denominator),
+        ResponseTerm("CO", "CV", a, 0.0),
+        ResponseTerm("CO", "OO", b, 0.0),
+        ResponseTerm(
+            "CO", "OV", 2.0 * spin / denominator,
+            -1.0 / denominator,
+        ),
+        ResponseTerm("CV", "CO", a, 0.0),
+        ResponseTerm("CV", "CV", 1.0, 0.0),
+        ResponseTerm("CV", "OO", c, 0.0),
+        ResponseTerm("CV", "OV", a, 0.0),
+        ResponseTerm("OO", "CO", b, 0.0),
+        ResponseTerm("OO", "CV", c, 0.0),
+        ResponseTerm("OO", "OO", 1.0, 0.0),
+        ResponseTerm("OO", "OV", b, 0.0),
+        ResponseTerm(
+            "OV", "CO", 2.0 * spin / denominator,
+            -1.0 / denominator,
+        ),
+        ResponseTerm("OV", "CV", a, 0.0),
+        ResponseTerm("OV", "OO", b, 0.0),
+        ResponseTerm("OV", "OV", 1.0, 1.0 / denominator),
+    )
+
+
+def spin_lowering_fock0_fockz(tdobj, max_memory=None):
+    """Operators used by the current lowering-channel action."""
+    mf = tdobj._scf
+    if max_memory is None:
+        max_memory = tdobj.max_memory
+    _response, fockz = gen_rohf_response_sfd(
+        mf,
+        mo_coeff=mf.mo_coeff,
+        mo_occ=mf.mo_occ,
+        hermi=0,
+        max_memory=max_memory,
+    )
+    if tdobj.nobeta:
+        density_alpha, density_beta = mf.make_rdm1()
+        density0 = 0.5 * (density_alpha + density_beta)
+        fock = mf.get_fock(dm=np.asarray((density0, density0)))
+    else:
+        fock = mf.get_fock()
+    return 0.5 * (fock.focka + fock.fockb), fockz
+
+
+def spin_lowering_fock_projections(tdobj, xy):
+    """Complete explicit-Fock ledger of ``X.T A_sfd X``."""
+    spaces, amplitudes = split_spin_lowering(tdobj, xy)
+    c = spaces.c_closed
+    o = spaces.c_open
+    v = spaces.c_virtual
+    block_data = (
+        ("C", "O", amplitudes.co),
+        ("C", "V", amplitudes.cv),
+        ("O", "O", amplitudes.oo),
+        ("O", "V", amplitudes.ov),
+    )
+    orbital_data = {
+        "C": (spaces.closed, c),
+        "O": (spaces.open, o),
+        "V": (spaces.virtual, v),
+    }
+    terms = []
+
+    def add(name, left_label, coefficient, right_label, f0, fz):
+        left_indices, left_orbitals = orbital_data[left_label]
+        right_indices, right_orbitals = orbital_data[right_label]
+        coefficient = np.asarray(coefficient)
+        if coefficient.size:
+            terms.append(FockProjection(
+                name=name,
+                left_indices=left_indices,
+                left_orbitals=left_orbitals,
+                coefficient=coefficient,
+                right_indices=right_indices,
+                right_orbitals=right_orbitals,
+                weight_f0=float(f0),
+                weight_fz=float(fz),
+            ))
+
+    # Ordinary alpha-to-beta spin-flip Fock difference.
+    for row_left, column_left, x_left in block_data:
+        for row_right, column_right, x_right in block_data:
+            if row_left == row_right:
+                add(
+                    "base-beta-%s%s-%s%s" % (
+                        row_left, column_left, row_right, column_right,
+                    ),
+                    column_left,
+                    x_left.T @ x_right,
+                    column_right,
+                    1.0,
+                    -1.0,
+                )
+            if column_left == column_right:
+                add(
+                    "base-alpha-%s%s-%s%s" % (
+                        row_left, column_left, row_right, column_right,
+                    ),
+                    row_right,
+                    -(x_right @ x_left.T),
+                    row_left,
+                    1.0,
+                    1.0,
+                )
+
+    # Tensor spin-adaptation correction, expressed in the same F0/Fz basis.
+    spin = spaces.spin
+    trace_oo = float(np.trace(amplitudes.oo))
+    eta = np.sqrt((2.0 * spin + 1.0) / (2.0 * spin)) - 1.0
+    gamma = np.sqrt((2.0 * spin + 1.0) / (2.0 * spin - 1.0))
+    zeta = np.sqrt(2.0 * spin / (2.0 * spin - 1.0)) - 1.0
+    chi = 1.0 / np.sqrt(2.0 * spin * (2.0 * spin - 1.0))
+    t_cc = (
+        amplitudes.cv @ amplitudes.cv.T / spin
+        + amplitudes.co @ amplitudes.co.T * 2.0 / (2.0 * spin - 1.0)
+    )
+    t_vv = (
+        amplitudes.cv.T @ amplitudes.cv / spin
+        + amplitudes.ov.T @ amplitudes.ov * 2.0 / (2.0 * spin - 1.0)
+    )
+    t_cv = gamma * (1.0 + 1.0 / spin) * trace_oo * amplitudes.cv
+    t_beta_vo = (
+        2.0 * eta * amplitudes.cv.T @ amplitudes.co
+        + 2.0 * zeta * amplitudes.ov.T @ amplitudes.oo
+    )
+    t_beta_co = 2.0 * chi * trace_oo * amplitudes.co
+    t_alpha_oc = (
+        -2.0 * eta * amplitudes.cv @ amplitudes.ov.T
+        - 2.0 * zeta * amplitudes.co @ amplitudes.oo.T
+    ).T
+    t_alpha_vo = -2.0 * chi * trace_oo * amplitudes.ov.T
+
+    add("adapt-spin-cc", "C", t_cc, "C", 0.0, -1.0)
+    add("adapt-spin-vv", "V", t_vv, "V", 0.0, -1.0)
+    add("adapt-spin-cv", "C", t_cv, "V", 0.0, -1.0)
+    add("adapt-beta-vo", "V", t_beta_vo, "O", 1.0, -1.0)
+    add("adapt-beta-co", "C", t_beta_co, "O", 1.0, -1.0)
+    add("adapt-alpha-oc", "O", t_alpha_oc, "C", 1.0, 1.0)
+    add("adapt-alpha-vo", "V", t_alpha_vo, "O", 1.0, 1.0)
+    return tuple(terms)
+
+
+def spin_lowering_fock_probes(tdobj, xy):
+    """Return AO probes ``P0,Pz`` for the lowering Fock ledger."""
+    nao = tdobj.mol.nao_nr()
+    p0 = np.zeros((nao, nao))
+    pz = np.zeros_like(p0)
+    for term in spin_lowering_fock_projections(tdobj, xy):
+        density = term.density()
+        p0 += term.weight_f0 * density
+        pz += term.weight_fz * density
+    return p0, pz
+
+
+def spin_lowering_fock_scalar(tdobj, xy, max_memory=None):
+    fock0, fockz = spin_lowering_fock0_fockz(
+        tdobj, max_memory=max_memory,
+    )
+    p0, pz = spin_lowering_fock_probes(tdobj, xy)
+    return float(
+        lib.einsum("pq,pq->", p0, fock0)
+        + lib.einsum("pq,pq->", pz, fockz)
+    )
+
+
+def spin_lowering_response_scalar(tdobj, xy, max_memory=None):
+    spaces, _amplitudes, densities = spin_lowering_transition_densities(
+        tdobj, xy,
+    )
+    vref0, vref1 = _apply_reference_responses(
+        tdobj, densities, max_memory=max_memory,
+    )
+    value = 0.0
+    for term in spin_lowering_response_terms(spaces.spin):
+        target = densities[term.target]
+        if term.vref0:
+            value += term.vref0 * lib.einsum(
+                "pq,pq->", target, vref0[term.source],
+            )
+        if term.vref1:
+            value += term.vref1 * lib.einsum(
+                "pq,pq->", target, vref1[term.source],
+            )
+    return float(value)
+
+
+def spin_lowering_ledger_scalar(tdobj, xy, max_memory=None):
+    """Independent reconstruction of ``X.T gen_vind_sfd(X)``."""
+    return (
+        spin_lowering_fock_scalar(tdobj, xy, max_memory=max_memory)
+        + spin_lowering_response_scalar(tdobj, xy, max_memory=max_memory)
+    )
+
+
+def spin_lowering_action_scalar(tdobj, xy):
+    vector = xy[0] if isinstance(xy, (tuple, list)) else xy
+    vector = np.asarray(vector)
+    vind, _diagonal = tdobj.gen_vind_sfd()
+    action = vind(vector.reshape(1, -1)).reshape(vector.shape)
+    return float(np.vdot(vector, action).real)
+
+
+def _response_potentials(densities, vref0, vref1, terms):
+    potentials = {label: np.zeros_like(dm) for label, dm in densities.items()}
+    for term in terms:
+        if term.vref0:
+            potentials[term.target] += term.vref0 * vref0[term.source]
+            potentials[term.source] += term.vref0 * vref0[term.target]
+        if term.vref1:
+            potentials[term.target] += term.vref1 * vref1[term.source]
+            potentials[term.source] += term.vref1 * vref1[term.target]
+    return potentials
+
+
+def _project_transition_potentials(tdobj, blocks, potentials):
+    mo = np.asarray(tdobj._scf.mo_coeff)
+    q_alpha = np.zeros((mo.shape[1], mo.shape[1]))
+    q_beta = np.zeros_like(q_alpha)
+    for label, (target, source, coefficient) in blocks.items():
+        potential = mo.conj().T @ potentials[label] @ mo
+        q_beta[:, target] += potential[:, source] @ coefficient.T
+        q_alpha[:, source] += potential[target, :].T @ coefficient
+    return q_alpha, q_beta
+
+
+def spin_lowering_response_projection_q(
+        tdobj, xy, max_memory=None, hfx_only=False):
+    """Transition-factor derivative of the lowering response scalar."""
+    spaces, amplitudes, densities = spin_lowering_transition_densities(
+        tdobj, xy,
+    )
+    blocks = spin_lowering_block_data(spaces, amplitudes)
+    if hfx_only:
+        vref0, vref1 = _apply_hfx_responses(tdobj, densities)
+    else:
+        vref0, vref1 = _apply_reference_responses(
+            tdobj, densities, max_memory=max_memory,
+        )
+    potentials = _response_potentials(
+        densities,
+        vref0,
+        vref1,
+        spin_lowering_response_terms(spaces.spin),
+    )
+    return _project_transition_potentials(tdobj, blocks, potentials)
+
+
+def spin_lowering_fock_q(tdobj, xy, max_memory=None):
+    """Explicit-Fock projection and reference-density response M matrices."""
+    mf = tdobj._scf
+    mo = np.asarray(mf.mo_coeff)
+    nmo = mo.shape[1]
+    fock0, fockz = spin_lowering_fock0_fockz(
+        tdobj, max_memory=max_memory,
+    )
+    fock0_mo = mo.conj().T @ fock0 @ mo
+    fockz_mo = mo.conj().T @ fockz @ mo
+    q_alpha = np.zeros((nmo, nmo))
+    q_beta = np.zeros_like(q_alpha)
+    is_hf = mf._numint._xc_type(mf.xc) == "HF"
+
+    for term in spin_lowering_fock_projections(tdobj, xy):
+        left = term.left_indices
+        right = term.right_indices
+        coefficient = term.coefficient
+
+        def project(target, operator, scale):
+            if scale:
+                target[:, left] += (
+                    scale * operator[:, right] @ coefficient.T
+                )
+                target[:, right] += (
+                    scale * operator[:, left] @ coefficient
+                )
+
+        project(q_alpha, fock0_mo, 0.5 * term.weight_f0)
+        project(q_beta, fock0_mo, 0.5 * term.weight_f0)
+        if is_hf:
+            project(q_alpha, fockz_mo, 0.5 * term.weight_fz)
+            project(q_beta, fockz_mo, 0.5 * term.weight_fz)
+        else:
+            project(q_alpha, fockz_mo, term.weight_fz)
+
+    p0, pz = spin_lowering_fock_probes(tdobj, xy)
+    p_alpha = 0.5 * p0
+    p_beta = 0.5 * p0
+    if is_hf:
+        p_alpha = p_alpha + 0.5 * pz
+        p_beta = p_beta - 0.5 * pz
+    response_alpha, response_beta = _fock_response_q(
+        tdobj, p_alpha, p_beta,
+    )
+    q_alpha += response_alpha
+    q_beta += response_beta
+    return q_alpha, q_beta
+
+
+# AO J/K nuclear derivatives
+
+def _as_stack(array):
+    array = np.asarray(array)
+    if array.ndim == 2:
+        array = array[None]
+    return array
+
+
+def _as_derivative_stack(array):
+    array = np.asarray(array)
+    if array.ndim == 3:
+        array = array[None]
+    return array
+
+
+def _add_j_derivative(
+        gradient, gradient_driver, mol, left, right, atoms, offsets,
+        scale=1.0, omega=None):
+    """Differentiate ``scale * left:J(right)`` at fixed AO coefficients."""
+    if scale == 0.0:
+        return
+    left = _as_stack(left)
+    right = _as_stack(right)
+    if omega is None:
+        j_right = gradient_driver.get_j(mol, right, hermi=0)
+        j_left = gradient_driver.get_j(mol, left, hermi=0)
+    else:
+        j_right = gradient_driver.get_j(mol, right, hermi=0, omega=omega)
+        j_left = gradient_driver.get_j(mol, left, hermi=0, omega=omega)
+    j_right = _as_derivative_stack(j_right)
+    j_left = _as_derivative_stack(j_left)
+    for k, atom in enumerate(atoms):
+        p0, p1 = offsets[atom][2:]
+        value = lib.einsum(
+            "nxpq,npq->x", j_right[:, :, p0:p1], left[:, p0:p1],
+        )
+        value += lib.einsum(
+            "nxpq,nqp->x", j_right[:, :, p0:p1], left[:, :, p0:p1],
+        )
+        value += lib.einsum(
+            "nxpq,npq->x", j_left[:, :, p0:p1], right[:, p0:p1],
+        )
+        value += lib.einsum(
+            "nxpq,nqp->x", j_left[:, :, p0:p1], right[:, :, p0:p1],
+        )
+        gradient[k] += scale * value
+
+
+def _get_k_derivative(gradient_driver, mol, densities, omega):
+    if omega is None:
+        value = gradient_driver.get_k(mol, densities, hermi=0)
+    else:
+        value = gradient_driver.get_k(
+            mol, densities, hermi=0, omega=omega,
+        )
+    return _as_derivative_stack(value)
+
+
+def _add_k_derivative(
+        gradient, gradient_driver, mol, left, right, atoms, offsets,
+        scale=1.0, omega=None):
+    """Differentiate ``scale * left:K(right)`` at fixed AO coefficients."""
+    if scale == 0.0:
+        return
+    left = _as_stack(left)
+    right = _as_stack(right)
+    right_t = np.swapaxes(right, -1, -2)
+    left_t = np.swapaxes(left, -1, -2)
+    k_right = _get_k_derivative(gradient_driver, mol, right, omega)
+    k_right_t = _get_k_derivative(gradient_driver, mol, right_t, omega)
+    k_left = _get_k_derivative(gradient_driver, mol, left, omega)
+    k_left_t = _get_k_derivative(gradient_driver, mol, left_t, omega)
+    for k, atom in enumerate(atoms):
+        p0, p1 = offsets[atom][2:]
+        value = lib.einsum(
+            "nxpq,npq->x", k_right[:, :, p0:p1, :], left[:, p0:p1, :],
+        )
+        value += lib.einsum(
+            "nxqp,npq->x", k_right_t[:, :, p0:p1, :], left[:, :, p0:p1],
+        )
+        value += lib.einsum(
+            "nxpq,npq->x", k_left[:, :, p0:p1, :], right[:, p0:p1, :],
+        )
+        value += lib.einsum(
+            "nxqp,npq->x", k_left_t[:, :, p0:p1, :], right[:, :, p0:p1],
+        )
+        gradient[k] += scale * value
+
+
+def _reference_spin_densities(tdobj):
+    mf = tdobj._scf
+    mo = np.asarray(mf.mo_coeff)
+    return (
+        mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T,
+        mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T,
+    )
+
+
+def spin_fock_direct_dft(
+        gradient_driver, tdobj, p_alpha, p_beta, atmlst=None):
+    """Differentiate an ordinary UKS Fock scalar for LDA/GGA/MGGA."""
+    mf = tdobj._scf
+    mol = tdobj.mol
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+    offsets = mol.offset_nr_by_atom()
+    p_alpha = np.asarray(p_alpha)
+    p_beta = np.asarray(p_beta)
+    p_total = p_alpha + p_beta
+    density_alpha, density_beta = _reference_spin_densities(tdobj)
+    gradient = np.zeros((len(atmlst), 3))
+    hcore_derivative = mf.nuc_grad_method().hcore_generator(mol)
+    for k, atom in enumerate(atmlst):
+        gradient[k] += lib.einsum(
+            "pq,xpq->x", p_total, hcore_derivative(atom),
+        )
+    _add_j_derivative(
+        gradient, gradient_driver, mol, p_total, density_alpha,
+        atmlst, offsets,
+    )
+    _add_j_derivative(
+        gradient, gradient_driver, mol, p_total, density_beta,
+        atmlst, offsets,
+    )
+    ni = mf._numint
+    omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    if ni.libxc.is_hybrid_xc(mf.xc):
+        _add_k_derivative(
+            gradient, gradient_driver, mol, p_alpha, density_alpha,
+            atmlst, offsets, scale=-hybrid,
+        )
+        _add_k_derivative(
+            gradient, gradient_driver, mol, p_beta, density_beta,
+            atmlst, offsets, scale=-hybrid,
+        )
+        if omega != 0:
+            long_range = -(alpha - hybrid)
+            _add_k_derivative(
+                gradient, gradient_driver, mol, p_alpha, density_alpha,
+                atmlst, offsets, scale=long_range, omega=omega,
+            )
+            _add_k_derivative(
+                gradient, gradient_driver, mol, p_beta, density_beta,
+                atmlst, offsets, scale=long_range, omega=omega,
+            )
+    xctype = ni._xc_type(mf.xc)
+    if xctype == "LDA":
+        derivative_builder = xc_backend.full_lda_vxc_derivative_atom
+    elif xctype == "GGA":
+        derivative_builder = xc_backend.full_gga_vxc_derivative_atom
+    elif xctype == "MGGA":
+        derivative_builder = xc_backend.full_mgga_vxc_derivative_atom
+    else:
+        raise NotImplementedError(
+            "ordinary Fock direct derivative is not implemented for %s" %
+            xctype
+        )
+    for k, atom in enumerate(atmlst):
+        vxc_alpha, vxc_beta = derivative_builder(
+            mf,
+            density_alpha,
+            density_beta,
+            atom,
+            max_memory=gradient_driver.max_memory,
+        )
+        gradient[k] += lib.einsum("pq,xpq->x", p_alpha, vxc_alpha)
+        gradient[k] += lib.einsum("pq,xpq->x", p_beta, vxc_beta)
+    return gradient
+
+
+def spin_fock_direct_hf(
+        gradient_driver, tdobj, p_alpha, p_beta, atmlst=None):
+    """Differentiate an arbitrary spin-resolved HF Fock scalar."""
+    mol = tdobj.mol
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+    offsets = mol.offset_nr_by_atom()
+    p_alpha = np.asarray(p_alpha)
+    p_beta = np.asarray(p_beta)
+    p_total = p_alpha + p_beta
+    dm_alpha, dm_beta = _reference_spin_densities(tdobj)
+    gradient = np.zeros((len(atmlst), 3))
+
+    hcore_derivative = tdobj._scf.nuc_grad_method().hcore_generator(mol)
+    for k, atom in enumerate(atmlst):
+        gradient[k] += lib.einsum(
+            "pq,xpq->x", p_total, hcore_derivative(atom),
+        )
+    _add_j_derivative(
+        gradient, gradient_driver, mol, p_total, dm_alpha,
+        atmlst, offsets,
+    )
+    _add_j_derivative(
+        gradient, gradient_driver, mol, p_total, dm_beta,
+        atmlst, offsets,
+    )
+    _add_k_derivative(
+        gradient, gradient_driver, mol, p_alpha, dm_alpha,
+        atmlst, offsets, scale=-1.0,
+    )
+    _add_k_derivative(
+        gradient, gradient_driver, mol, p_beta, dm_beta,
+        atmlst, offsets, scale=-1.0,
+    )
+    return gradient
+
+
+def response_direct_hfx(
+        gradient_driver, tdobj, densities, response_terms, atmlst=None):
+    """J/K skeleton derivative for a channel response-term ledger."""
+    mol = tdobj.mol
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+    offsets = mol.offset_nr_by_atom()
+    gradient = np.zeros((len(atmlst), 3))
+    ni = tdobj._scf._numint
+    omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(
+        tdobj._scf.xc, mol.spin,
+    )
+    if not ni.libxc.is_hybrid_xc(tdobj._scf.xc):
+        return gradient
+
+    scales = [(hybrid, None)]
+    if omega != 0:
+        scales.append((alpha - hybrid, omega))
+    for term in response_terms:
+        target = densities[term.target]
+        source = densities[term.source]
+        for coefficient, range_omega in scales:
+            if term.vref0:
+                _add_k_derivative(
+                    gradient, gradient_driver, mol, target, source,
+                    atmlst, offsets,
+                    scale=-coefficient * term.vref0,
+                    omega=range_omega,
+                )
+            if term.vref1:
+                _add_j_derivative(
+                    gradient, gradient_driver, mol, target, source,
+                    atmlst, offsets,
+                    scale=-coefficient * term.vref1,
+                    omega=range_omega,
+                )
+    return gradient
+
+
+# Hybrid/RSH Fz correction
+
+def spin_lowering_fockz_hfx_terms(
+        gradient_driver, tdobj, pz, atmlst=None, with_direct=True):
+    """Differentiate ``-1/2 Pz:K(D_OO)`` excluding the Pz projection."""
+    mf = tdobj._scf
+    mol = mf.mol
+    ni = mf._numint
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+    mo = np.asarray(mf.mo_coeff)
+    q_alpha = np.zeros((mo.shape[1], mo.shape[1]))
+    q_beta = np.zeros_like(q_alpha)
+    direct = np.zeros((len(atmlst), 3))
+    if not ni.libxc.is_hybrid_xc(mf.xc):
+        return xc_backend.XCGradientTerms(q_alpha, q_beta, direct)
+
+    spaces = orbital_spaces(tdobj)
+    density_open = spaces.c_open @ spaces.c_open.T
+    omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    scales = [(hybrid, None)]
+    if omega != 0:
+        scales.append((alpha - hybrid, omega))
+    offsets = mol.offset_nr_by_atom()
+    for coefficient, range_omega in scales:
+        if coefficient == 0.0:
+            continue
+        if range_omega is None:
+            potential = mf.get_k(mol, pz, hermi=0)
+        else:
+            potential = mf.get_k(
+                mol, pz, hermi=0, omega=range_omega,
+            )
+        q_alpha[:, spaces.open] -= 0.5 * coefficient * (
+            mo.conj().T @ (potential + potential.T) @ spaces.c_open
+        )
+        if with_direct:
+            _add_k_derivative(
+                direct,
+                gradient_driver,
+                mol,
+                pz,
+                density_open,
+                atmlst,
+                offsets,
+                scale=-0.5 * coefficient,
+                omega=range_omega,
+            )
+    return xc_backend.XCGradientTerms(q_alpha, q_beta, direct)
+
+# Channel assembly
+
+def grad_elec(
+        gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12,
+        max_cycle=None):
+    """Build the complete analytic excitation gradient for deltaS=-1."""
+    if tdobj.deltaS != -1:
+        raise ValueError("deltaS=-1 gradient received a different spin channel")
+    if atmlst is None:
+        atmlst = range(tdobj.mol.natm)
+    atmlst = tuple(atmlst)
+    mf = tdobj._scf
+    xctype = mf._numint._xc_type(mf.xc)
+
+    # 1. Native amplitudes, transition densities, and explicit Fock probes.
+    spaces, amplitudes, densities = spin_lowering_transition_densities(
+        tdobj, xy,
+    )
+    blocks = spin_lowering_block_data(spaces, amplitudes)
+    response_terms = spin_lowering_response_terms(spaces.spin)
+    channel_data = (spaces, amplitudes, densities, blocks, response_terms)
+    p0, pz = spin_lowering_fock_probes(tdobj, xy)
+
+    # 2. Explicit Fock contribution to the orbital-rotation M matrix.
+    fock_alpha, fock_beta = spin_lowering_fock_q(tdobj, xy)
+    hfx_alpha, hfx_beta = spin_lowering_response_projection_q(
+        tdobj, xy, hfx_only=True,
+    )
+
+    if xctype == "HF":
+        # 3a. HF response and fixed-orbital AO derivative.
+        m_matrix = (
+            fock_alpha + fock_beta + hfx_alpha + hfx_beta
+        )
+        direct = spin_fock_direct_hf(
+            gradient_driver,
+            tdobj,
+            0.5 * (p0 + pz),
+            0.5 * (p0 - pz),
+            atmlst=atmlst,
+        )
+        direct += response_direct_hfx(
+            gradient_driver,
+            tdobj,
+            densities,
+            response_terms,
+            atmlst=atmlst,
+        )
+        fock_direct = spin_fock_direct_hf
+    else:
+        # 3b. Semilocal XC, hybrid/RSH, Fz, and nobeta contributions.
+        try:
+            response_builder, fockz_builder, nobeta_q_builder, nobeta_direct = {
+                "LDA": (
+                    xc_backend.lda_response_terms,
+                    xc_backend.lda_fockz_terms,
+                    xc_backend.lda_nobeta_reference_q,
+                    xc_backend.nobeta_common_direct_lda,
+                ),
+                "GGA": (
+                    xc_backend.gga_response_terms,
+                    xc_backend.gga_fockz_terms,
+                    xc_backend.gga_nobeta_reference_q,
+                    xc_backend.nobeta_common_direct_gga,
+                ),
+                "MGGA": (
+                    xc_backend.mgga_response_terms,
+                    xc_backend.mgga_fockz_terms,
+                    xc_backend.mgga_nobeta_reference_q,
+                    xc_backend.nobeta_common_direct_mgga,
+                ),
+            }[xctype]
+        except KeyError as error:
+            raise NotImplementedError(
+                "NTTDA deltaS=-1 gradient does not support XC type %s" % xctype
+            ) from error
+
+        response_xc = response_builder(
+            gradient_driver,
+            tdobj,
+            channel_data,
+            atmlst=atmlst,
+        )
+        fockz_xc = fockz_builder(
+            gradient_driver,
+            tdobj,
+            spaces,
+            pz,
+            atmlst=atmlst,
+        )
+        fockz_hfx = spin_lowering_fockz_hfx_terms(
+            gradient_driver, tdobj, pz, atmlst=atmlst,
+        )
+        common_alpha, common_beta = nobeta_q_builder(tdobj, p0)
+        m_matrix = (
+            fock_alpha + fock_beta
+            + hfx_alpha + hfx_beta
+            + response_xc.q_alpha + response_xc.q_beta
+            + fockz_xc.q_alpha + fockz_xc.q_beta
+            + fockz_hfx.q_alpha + fockz_hfx.q_beta
+            + common_alpha + common_beta
+        )
+
+        direct = spin_fock_direct_dft(
+            gradient_driver,
+            tdobj,
+            0.5 * p0,
+            0.5 * p0,
+            atmlst=atmlst,
+        )
+        direct += response_direct_hfx(
+            gradient_driver,
+            tdobj,
+            densities,
+            response_terms,
+            atmlst=atmlst,
+        )
+        direct += response_xc.direct
+        direct += fockz_xc.direct
+        direct += fockz_hfx.direct
+        direct += nobeta_direct(
+            gradient_driver, tdobj, p0, atmlst=atmlst,
+        )
+        fock_direct = spin_fock_direct_dft
+
+    # 4-5. ROKS transpose-Hessian adjoint, Dz Fock derivative, and Pulay term.
+    return finish_gradient(
+        gradient_driver,
+        tdobj,
+        m_matrix,
+        direct,
+        atmlst,
+        tolerance,
+        max_cycle,
+        fock_direct,
+    )

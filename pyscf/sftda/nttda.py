@@ -979,6 +979,21 @@ class NTTDA(TDBase):
 
     _keys = {'deltaS', 'nobeta'}
 
+    def nuc_grad_method(self):
+        """Return the independent NTTDA nuclear-gradient driver."""
+        import os
+        import pyscf.grad
+
+        grad_path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), os.pardir, 'grad',
+        ))
+        if grad_path not in pyscf.grad.__path__:
+            pyscf.grad.__path__.insert(0, grad_path)
+        from pyscf.grad.nttda import Gradients
+        return Gradients(self)
+
+    Gradients = nuc_grad_method
+
     def init_guess(self, hdiag, nstates=None):
         if nstates is None:
             nstates = self.nstates
