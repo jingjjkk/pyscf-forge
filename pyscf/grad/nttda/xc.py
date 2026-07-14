@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from pyscf import lib
-from pyscf.dft import numint
 from pyscf.dft.gen_grid import NBINS
 from pyscf.dft.numint import _dot_ao_ao_sparse, _scale_ao_sparse
 from pyscf.grad import tdrks as tdrks_grad
@@ -277,42 +276,6 @@ def mgga_eval_matrix(mol, ao, weights, mask):
     return output[0]
 
 
-def gga_matrix_derivative_fixed_weights(mol, ao, weights, p0, p1):
-    """AO-center derivative of a GGA matrix with frozen feature weights."""
-    output = np.zeros((3, mol.nao_nr(), mol.nao_nr()))
-    scaled = numint._scale_ao(ao[:4], weights[:4])
-    for xyz in range(3):
-        delta = delta_ao(ao, p0, p1, xyz)
-        scaled_delta = numint._scale_ao(delta, weights[:4])
-        output[xyz] += delta[0].T @ scaled
-        output[xyz] += ao[0].T @ scaled_delta
-        output[xyz] += scaled_delta.T @ ao[0]
-        output[xyz] += scaled.T @ delta[0]
-    return output
-
-
-def mgga_matrix_derivative_fixed_weights(mol, ao, weights, p0, p1):
-    """AO-center derivative of a meta-GGA matrix at frozen weights."""
-    output = np.zeros((3, mol.nao_nr(), mol.nao_nr()))
-    gga_weights = np.array(weights[:4], copy=True)
-    gga_weights[0] *= 0.5
-    scaled = numint._scale_ao(ao[:4], gga_weights)
-    tau_weight = 0.5 * weights[4]
-    for xyz in range(3):
-        delta = delta_ao(ao, p0, p1, xyz)
-        scaled_delta = numint._scale_ao(delta, gga_weights)
-        output[xyz] += delta[0].T @ scaled
-        output[xyz] += ao[0].T @ scaled_delta
-        output[xyz] += scaled_delta.T @ ao[0]
-        output[xyz] += scaled.T @ delta[0]
-        for feature in range(1, 4):
-            delta_feature = delta[feature, :, p0:p1]
-            tau_scaled = ao[feature] * tau_weight[:, None]
-            output[xyz, p0:p1] += delta_feature.T @ tau_scaled
-            output[xyz, :, p0:p1] += tau_scaled.T @ delta_feature
-    return output
-
-
 # LDA quadrature
 
 def _lda_fref_kref(mf, ao0, mask):
@@ -377,6 +340,216 @@ def _add_reference_q(tdobj, q_alpha, q_beta, matrix_alpha, matrix_beta):
     q_beta[:, occupied_beta] += (
         mo.conj().T @ (matrix_beta + matrix_beta.T)
         @ mo[:, occupied_beta]
+    )
+
+
+def _spin_probe_stacks(probe_alpha, probe_beta):
+    probe_alpha = np.asarray(probe_alpha)
+    probe_beta = np.asarray(probe_beta)
+    single_probe = probe_alpha.ndim == 2
+    if single_probe:
+        probe_alpha = probe_alpha[None]
+        probe_beta = probe_beta[None]
+    probe_alpha = 0.5 * (
+        probe_alpha + probe_alpha.swapaxes(-1, -2)
+    )
+    probe_beta = 0.5 * (
+        probe_beta + probe_beta.swapaxes(-1, -2)
+    )
+    return probe_alpha, probe_beta, single_probe
+
+
+def _xc_density(ni, mol, ao, density, mask, xctype):
+    ao_values = ao[0] if xctype == "LDA" else ao
+    rho = ni.eval_rho(
+        mol, ao_values, density, mask, xctype, hermi=1,
+        with_lapl=False,
+    )
+    return rho[None] if rho.ndim == 1 else rho
+
+
+def _xc_density_derivatives(ao, densities, p0, p1, xyz, xctype):
+    """AO-center derivatives for a stack of probe/reference densities."""
+    densities = np.asarray(densities)
+    if xctype == "LDA":
+        delta0 = -ao[xyz + 1][:, p0:p1]
+        output = lib.einsum(
+            "ga,nau,gu->ng",
+            delta0,
+            densities[:, p0:p1],
+            ao[0],
+        )
+        output += lib.einsum(
+            "gu,nua,ga->ng",
+            ao[0],
+            densities[:, :, p0:p1],
+            delta0,
+        )
+        return output[:, None]
+
+    delta = delta_ao(ao, p0, p1, xyz)
+    feature_count = 4 if xctype == "GGA" else 5
+    output = np.empty(
+        (len(densities), feature_count, ao.shape[-2]),
+    )
+    output[:, 0] = lib.einsum(
+        "ga,nau,gu->ng",
+        delta[0, :, p0:p1],
+        densities[:, p0:p1],
+        ao[0],
+    )
+    output[:, 0] += lib.einsum(
+        "gu,nua,ga->ng",
+        ao[0],
+        densities[:, :, p0:p1],
+        delta[0, :, p0:p1],
+    )
+    for feature in range(1, 4):
+        output[:, feature] = lib.einsum(
+            "ga,nau,gu->ng",
+            delta[feature, :, p0:p1],
+            densities[:, p0:p1],
+            ao[0],
+        )
+        output[:, feature] += lib.einsum(
+            "gu,nua,ga->ng",
+            ao[feature],
+            densities[:, :, p0:p1],
+            delta[0, :, p0:p1],
+        )
+        output[:, feature] += lib.einsum(
+            "ga,nau,gu->ng",
+            delta[0, :, p0:p1],
+            densities[:, p0:p1],
+            ao[feature],
+        )
+        output[:, feature] += lib.einsum(
+            "gu,nua,ga->ng",
+            ao[0],
+            densities[:, :, p0:p1],
+            delta[feature, :, p0:p1],
+        )
+    if xctype == "GGA":
+        return output[:, :4]
+
+    output[:, 4] = 0.0
+    for feature in range(1, 4):
+        output[:, 4] += 0.5 * lib.einsum(
+            "ga,nau,gu->ng",
+            delta[feature, :, p0:p1],
+            densities[:, p0:p1],
+            ao[feature],
+        )
+        output[:, 4] += 0.5 * lib.einsum(
+            "gu,nua,ga->ng",
+            ao[feature],
+            densities[:, :, p0:p1],
+            delta[feature, :, p0:p1],
+        )
+    return output
+
+
+def _contract_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst, xctype, max_memory):
+    """Contract all fixed-grid XC potential derivatives in one grid pass."""
+    mol = mf.mol
+    ni = mf._numint
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    atmlst = tuple(atmlst)
+    probe_alpha, probe_beta, single_probe = _spin_probe_stacks(
+        probe_alpha, probe_beta,
+    )
+    output = np.zeros((len(probe_alpha), len(atmlst), 3))
+    if not atmlst:
+        return output[0] if single_probe else output
+
+    density_alpha = 0.5 * (
+        np.asarray(density_alpha) + np.asarray(density_alpha).T
+    )
+    density_beta = 0.5 * (
+        np.asarray(density_beta) + np.asarray(density_beta).T
+    )
+    probe_densities = np.stack(
+        (probe_alpha, probe_beta), axis=1,
+    ).reshape(-1, *probe_alpha.shape[1:])
+    density_stack = np.concatenate((
+        np.asarray((density_alpha, density_beta)),
+        probe_densities,
+    ))
+    offsets = mol.offset_nr_by_atom()
+    ao_deriv = 1 if xctype == "LDA" else 2
+    for ao, mask, weights, _coords in ni.block_loop(
+            mol, mf.grids, mol.nao_nr(), ao_deriv,
+            max_memory=max_memory):
+        rho = np.asarray([
+            _xc_density(ni, mol, ao, density, mask, xctype)
+            for density in density_stack
+        ])
+        reference_rho = rho[:2]
+        probe_rho = rho[2:].reshape(
+            len(probe_alpha), 2, *rho.shape[1:],
+        )
+        vxc, fxc = ni.eval_xc_eff(
+            mf.xc, reference_rho, deriv=2, xctype=xctype, spin=1,
+        )[1:3]
+
+        for k, atom in enumerate(atmlst):
+            p0, p1 = offsets[atom][2:]
+            for xyz in range(3):
+                density_derivative = _xc_density_derivatives(
+                    ao, density_stack, p0, p1, xyz, xctype,
+                )
+                reference_derivative = density_derivative[:2]
+                probe_derivative = density_derivative[2:].reshape(
+                    len(probe_alpha), 2, *density_derivative.shape[1:],
+                )
+                output[:, k, xyz] += lib.einsum(
+                    "nsxg,sxg,g->n",
+                    probe_derivative,
+                    vxc,
+                    weights,
+                )
+                response_weights = lib.einsum(
+                    "axg,axbyg,g->byg",
+                    reference_derivative,
+                    fxc,
+                    weights,
+                )
+                output[:, k, xyz] += lib.einsum(
+                    "nbyg,byg->n", probe_rho, response_weights,
+                )
+    return output[0] if single_probe else output
+
+
+def contract_lda_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst=None, max_memory=2000):
+    """Contract all requested LDA XC potential nuclear derivatives."""
+    return _contract_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst, "LDA", max_memory,
+    )
+
+
+def contract_gga_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst=None, max_memory=2000):
+    """Contract all requested GGA XC potential nuclear derivatives."""
+    return _contract_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst, "GGA", max_memory,
+    )
+
+
+def contract_mgga_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst=None, max_memory=2000):
+    """Contract all requested MGGA XC potential nuclear derivatives."""
+    return _contract_vxc_derivative(
+        mf, density_alpha, density_beta, probe_alpha, probe_beta,
+        atmlst, "MGGA", max_memory,
     )
 
 
@@ -629,52 +802,6 @@ def lda_nobeta_reference_q(tdobj, p0, max_memory=None):
         tdobj, q_alpha, q_beta, matrix_alpha, matrix_beta,
     )
     return q_alpha, q_beta
-
-
-def full_lda_vxc_derivative_atom(mf, density_alpha, density_beta, atom,
-                                  max_memory=2000):
-    """Full fixed-grid nuclear derivative of both LDA XC potentials."""
-    mol = mf.mol
-    ni = mf._numint
-    nao = mol.nao_nr()
-    p0, p1 = mol.offset_nr_by_atom()[atom][2:]
-    derivative = np.zeros((2, 3, nao, nao))
-    for ao, mask, weights, _coords in ni.block_loop(
-            mol, mf.grids, nao, 1, max_memory=max_memory):
-        ao0 = ao[0]
-        rho_alpha = ni.eval_rho(
-            mol, ao0, density_alpha, mask, "LDA", hermi=1,
-            with_lapl=False,
-        )
-        rho_beta = ni.eval_rho(
-            mol, ao0, density_beta, mask, "LDA", hermi=1,
-            with_lapl=False,
-        )
-        vxc, fxc = ni.eval_xc_eff(
-            mf.xc, (rho_alpha, rho_beta), deriv=2,
-            xctype="LDA", spin=1,
-        )[1:3]
-        for xyz in range(3):
-            ao_atom = ao[xyz + 1][:, p0:p1]
-            for spin in range(2):
-                weighted_ao = ao0 * (weights * vxc[spin, 0])[:, None]
-                derivative[spin, xyz, p0:p1] -= ao_atom.T @ weighted_ao
-                derivative[spin, xyz, :, p0:p1] -= weighted_ao.T @ ao_atom
-            drho_alpha = _lda_density_derivative(
-                ao0, ao_atom, density_alpha, p0, p1,
-            )
-            drho_beta = _lda_density_derivative(
-                ao0, ao_atom, density_beta, p0, p1,
-            )
-            for spin in range(2):
-                response_weight = weights * (
-                    fxc[spin, 0, 0, 0] * drho_alpha
-                    + fxc[spin, 0, 1, 0] * drho_beta
-                )
-                derivative[spin, xyz] += (
-                    ao0.T @ (ao0 * response_weight[:, None])
-                )
-    return derivative[0], derivative[1]
 
 
 # GGA quadrature
@@ -1044,54 +1171,6 @@ def gga_nobeta_reference_q(tdobj, p0, max_memory=None):
     return q_alpha, q_beta
 
 
-def full_gga_vxc_derivative_atom(
-        mf, density_alpha, density_beta, atom, max_memory=2000):
-    """Full fixed-grid nuclear derivative of both GGA XC potentials."""
-    mol = mf.mol
-    ni = mf._numint
-    nao = mol.nao_nr()
-    p0, p1 = mol.offset_nr_by_atom()[atom][2:]
-    output = np.zeros((2, 3, nao, nao))
-    for ao, mask, weights, _coords in ni.block_loop(
-            mol, mf.grids, nao, 2, max_memory=max_memory):
-        rho_alpha = ni.eval_rho(
-            mol, ao, density_alpha, mask, "GGA", hermi=1,
-            with_lapl=False,
-        )
-        rho_beta = ni.eval_rho(
-            mol, ao, density_beta, mask, "GGA", hermi=1,
-            with_lapl=False,
-        )
-        vxc, fxc = ni.eval_xc_eff(
-            mf.xc, (rho_alpha, rho_beta), deriv=2,
-            xctype="GGA", spin=1,
-        )[1:3]
-        weighted_vxc = weights * vxc
-        weighted_vxc[:, 0] *= 0.5
-        for spin in range(2):
-            output[spin] += gga_matrix_derivative_fixed_weights(
-                mol, ao, weighted_vxc[spin], p0, p1,
-            )
-        for xyz in range(3):
-            drho_alpha = gga_density_derivative(
-                ao, density_alpha, p0, p1, xyz,
-            )
-            drho_beta = gga_density_derivative(
-                ao, density_beta, p0, p1, xyz,
-            )
-            response_weights = lib.einsum(
-                "xg,xbyg,g->byg", drho_alpha, fxc[0], weights,
-            )
-            response_weights += lib.einsum(
-                "xg,xbyg,g->byg", drho_beta, fxc[1], weights,
-            )
-            for spin in range(2):
-                output[spin, xyz] += gga_eval_matrix(
-                    mol, ao, response_weights[spin], mask,
-                )
-    return output[0], output[1]
-
-
 # meta-GGA quadrature
 
 def _mgga_fref_kref(mf, rho0):
@@ -1457,50 +1536,3 @@ def mgga_nobeta_reference_q(tdobj, p0, max_memory=None):
         )
     _add_reference_q(tdobj, q_alpha, q_beta, matrix_alpha, matrix_beta)
     return q_alpha, q_beta
-
-
-def full_mgga_vxc_derivative_atom(
-        mf, density_alpha, density_beta, atom, max_memory=2000):
-    """Full fixed-grid nuclear derivative of both MGGA XC potentials."""
-    mol = mf.mol
-    ni = mf._numint
-    nao = mol.nao_nr()
-    p0, p1 = mol.offset_nr_by_atom()[atom][2:]
-    output = np.zeros((2, 3, nao, nao))
-    for ao, mask, weights, _coords in ni.block_loop(
-            mol, mf.grids, nao, 2, max_memory=max_memory):
-        rho_alpha = ni.eval_rho(
-            mol, ao, density_alpha, mask, "MGGA", hermi=1,
-            with_lapl=False,
-        )
-        rho_beta = ni.eval_rho(
-            mol, ao, density_beta, mask, "MGGA", hermi=1,
-            with_lapl=False,
-        )
-        vxc, fxc = ni.eval_xc_eff(
-            mf.xc, (rho_alpha, rho_beta), deriv=2,
-            xctype="MGGA", spin=1,
-        )[1:3]
-        weighted_vxc = weights * vxc
-        for spin in range(2):
-            output[spin] += mgga_matrix_derivative_fixed_weights(
-                mol, ao, weighted_vxc[spin], p0, p1,
-            )
-        for xyz in range(3):
-            drho_alpha = mgga_density_derivative(
-                ao, density_alpha, p0, p1, xyz,
-            )
-            drho_beta = mgga_density_derivative(
-                ao, density_beta, p0, p1, xyz,
-            )
-            response_weights = lib.einsum(
-                "xg,xbyg,g->byg", drho_alpha, fxc[0], weights,
-            )
-            response_weights += lib.einsum(
-                "xg,xbyg,g->byg", drho_beta, fxc[1], weights,
-            )
-            for spin in range(2):
-                output[spin, xyz] += mgga_eval_matrix(
-                    mol, ao, response_weights[spin], mask,
-                )
-    return output[0], output[1]

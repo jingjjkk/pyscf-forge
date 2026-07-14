@@ -791,11 +791,11 @@ def spin_fock_direct_dft(
         )
     xctype = ni._xc_type(mf.xc)
     if xctype == "LDA":
-        derivative_builder = xc_backend.full_lda_vxc_derivative_atom
+        derivative_contractor = xc_backend.contract_lda_vxc_derivative
     elif xctype == "GGA":
-        derivative_builder = xc_backend.full_gga_vxc_derivative_atom
+        derivative_contractor = xc_backend.contract_gga_vxc_derivative
     elif xctype == "MGGA":
-        derivative_builder = xc_backend.full_mgga_vxc_derivative_atom
+        derivative_contractor = xc_backend.contract_mgga_vxc_derivative
     else:
         raise NotImplementedError(
             "ordinary Fock direct derivative is not implemented for %s" %
@@ -803,35 +803,33 @@ def spin_fock_direct_dft(
         )
     if nobeta_p0 is not None and tdobj.nobeta:
         density0 = 0.5 * (density_alpha + density_beta)
+        actual_probe_alpha = np.array(p_alpha, copy=True)
+        actual_probe_beta = np.array(p_beta, copy=True)
+        actual_probe_alpha[0] -= 0.5 * nobeta_p0
+        actual_probe_beta[0] -= 0.5 * nobeta_p0
     else:
         density0 = None
-    for k, atom in enumerate(atmlst):
-        vxc_alpha, vxc_beta = derivative_builder(
+        actual_probe_alpha = p_alpha
+        actual_probe_beta = p_beta
+    gradient += derivative_contractor(
+        mf,
+        density_alpha,
+        density_beta,
+        actual_probe_alpha,
+        actual_probe_beta,
+        atmlst=atmlst,
+        max_memory=gradient_driver.max_memory,
+    )
+    if density0 is not None:
+        gradient[0] += derivative_contractor(
             mf,
-            density_alpha,
-            density_beta,
-            atom,
+            density0,
+            density0,
+            0.5 * nobeta_p0,
+            0.5 * nobeta_p0,
+            atmlst=atmlst,
             max_memory=gradient_driver.max_memory,
         )
-        gradient[:, k] += lib.einsum(
-            "npq,xpq->nx", p_alpha, vxc_alpha,
-        )
-        gradient[:, k] += lib.einsum(
-            "npq,xpq->nx", p_beta, vxc_beta,
-        )
-        if density0 is not None:
-            equal_alpha, equal_beta = derivative_builder(
-                mf,
-                density0,
-                density0,
-                atom,
-                max_memory=gradient_driver.max_memory,
-            )
-            gradient[0, k] += 0.5 * lib.einsum(
-                "pq,xpq->x",
-                nobeta_p0,
-                equal_alpha + equal_beta - vxc_alpha - vxc_beta,
-            )
     return gradient[0] if single_probe else gradient
 
 

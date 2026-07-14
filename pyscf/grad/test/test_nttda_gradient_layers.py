@@ -135,7 +135,7 @@ class GradientLayerChecks(unittest.TestCase):
                          "k_batch": []}
                 original_j = driver.get_j
                 original_k = driver.get_k
-                original_vxc = xc_backend.full_gga_vxc_derivative_atom
+                original_vxc = xc_backend.contract_gga_vxc_derivative
 
                 def counted_j(mol=None, dm=None, **kwargs):
                     calls["j"] += 1
@@ -153,7 +153,7 @@ class GradientLayerChecks(unittest.TestCase):
 
                 driver.get_j = counted_j
                 driver.get_k = counted_k
-                xc_backend.full_gga_vxc_derivative_atom = counted_vxc
+                xc_backend.contract_gga_vxc_derivative = counted_vxc
                 try:
                     builder = (
                         lowering_grad_elec if delta_s == -1
@@ -166,7 +166,7 @@ class GradientLayerChecks(unittest.TestCase):
                         atmlst=range(mf.mol.natm),
                     )
                 finally:
-                    xc_backend.full_gga_vxc_derivative_atom = original_vxc
+                    xc_backend.contract_gga_vxc_derivative = original_vxc
 
                 with self.subTest(delta_s=delta_s, nobeta=nobeta):
                     self.assertTrue(np.all(np.isfinite(result.total)))
@@ -174,7 +174,7 @@ class GradientLayerChecks(unittest.TestCase):
                     self.assertLessEqual(calls["k"], 8)
                     self.assertGreater(max(calls["j_batch"]), 1)
                     self.assertGreater(max(calls["k_batch"]), 1)
-                    expected_vxc = mf.mol.natm * (2 if nobeta else 1)
+                    expected_vxc = 2 if nobeta else 1
                     self.assertEqual(calls["vxc"], expected_vxc)
 
     def test_full_m_matrix_for_both_channels_and_fock_modes(self):
