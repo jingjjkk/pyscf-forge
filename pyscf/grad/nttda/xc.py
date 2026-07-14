@@ -135,30 +135,40 @@ def mgga_density_derivative(ao, density, p0, p1, xyz):
     return output
 
 
-def pair_features(ao, density):
+def pair_feature_batches(ao, densities):
+    """Pair features and reusable ``AO @ D`` contractions by channel."""
+    densities = np.asarray(densities)
     grids = ao.shape[-2]
-    features = np.empty((4, 4, grids))
-    contracted = [ao[index] @ density for index in range(4)]
+    features = np.empty((len(densities), 4, 4, grids))
+    contracted = np.asarray([
+        ao[index] @ densities for index in range(4)
+    ]).transpose(1, 0, 2, 3)
     for left in range(4):
         for right in range(4):
-            features[left, right] = lib.einsum(
-                "gu,gu->g", contracted[left], ao[right],
+            features[:, left, right] = lib.einsum(
+                "ngu,gu->ng", contracted[:, left], ao[right],
             )
-    return features
+    return features, contracted
 
 
-def pair_features_derivative(ao, density, p0, p1, xyz):
-    delta = delta_ao(ao, p0, p1, xyz)
-    derivative = np.empty((4, 4, ao.shape[-2]))
-    contracted_ao = [ao[index] @ density for index in range(4)]
-    contracted_delta = [delta[index] @ density for index in range(4)]
+def pair_features_derivatives(
+        ao, densities, delta, contracted_ao, p0, p1):
+    """Pair-feature derivatives using only the nonzero AO-center block."""
+    densities = np.asarray(densities)
+    derivative = np.empty((len(densities), 4, 4, ao.shape[-2]))
+    contracted_delta = [
+        delta[index, :, p0:p1] @ densities[:, p0:p1]
+        for index in range(4)
+    ]
     for left in range(4):
         for right in range(4):
-            derivative[left, right] = lib.einsum(
-                "gu,gu->g", contracted_delta[left], ao[right],
+            derivative[:, left, right] = lib.einsum(
+                "ngu,gu->ng", contracted_delta[left], ao[right],
             )
-            derivative[left, right] += lib.einsum(
-                "gu,gu->g", contracted_ao[left], delta[right],
+            derivative[:, left, right] += lib.einsum(
+                "nga,ga->ng",
+                contracted_ao[:, left, :, p0:p1],
+                delta[right, :, p0:p1],
             )
     return derivative
 
@@ -368,11 +378,18 @@ def _xc_density(ni, mol, ao, density, mask, xctype):
     return rho[None] if rho.ndim == 1 else rho
 
 
-def _xc_density_derivatives(ao, densities, p0, p1, xyz, xctype):
+def _xc_ao_center_derivative(ao, p0, p1, xyz, xctype):
+    if xctype == "LDA":
+        return -ao[xyz + 1][:, p0:p1]
+    return delta_ao(ao, p0, p1, xyz)
+
+
+def _xc_density_derivatives(
+        ao, densities, p0, p1, xctype, ao_center_derivative):
     """AO-center derivatives for a stack of probe/reference densities."""
     densities = np.asarray(densities)
     if xctype == "LDA":
-        delta0 = -ao[xyz + 1][:, p0:p1]
+        delta0 = ao_center_derivative
         output = lib.einsum(
             "ga,nau,gu->ng",
             delta0,
@@ -387,7 +404,7 @@ def _xc_density_derivatives(ao, densities, p0, p1, xyz, xctype):
         )
         return output[:, None]
 
-    delta = delta_ao(ao, p0, p1, xyz)
+    delta = ao_center_derivative
     feature_count = 4 if xctype == "GGA" else 5
     output = np.empty(
         (len(densities), feature_count, ao.shape[-2]),
@@ -449,6 +466,39 @@ def _xc_density_derivatives(ao, densities, p0, p1, xyz, xctype):
     return output
 
 
+def _response_density_stack(
+        densities, density_alpha, density_beta):
+    labels = tuple(densities)
+    stack = np.asarray(
+        [densities[label] for label in labels]
+        + [density_alpha, density_beta]
+    )
+    return labels, stack
+
+
+def _response_density_derivatives(
+        ao, density_stack, labels, p0, p1, xyz, xctype):
+    """Generate every channel/reference density derivative from one AO delta."""
+    ao_center_derivative = _xc_ao_center_derivative(
+        ao, p0, p1, xyz, xctype,
+    )
+    derivatives = _xc_density_derivatives(
+        ao, density_stack, p0, p1, xctype, ao_center_derivative,
+    )
+    if xctype == "LDA":
+        derivatives = derivatives[:, 0]
+    channel_count = len(labels)
+    channel_derivatives = dict(zip(
+        labels, derivatives[:channel_count],
+    ))
+    return (
+        channel_derivatives,
+        derivatives[channel_count],
+        derivatives[channel_count + 1],
+        ao_center_derivative,
+    )
+
+
 def _contract_vxc_derivative(
         mf, density_alpha, density_beta, probe_alpha, probe_beta,
         atmlst, xctype, max_memory):
@@ -498,8 +548,12 @@ def _contract_vxc_derivative(
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
             for xyz in range(3):
+                ao_center_derivative = _xc_ao_center_derivative(
+                    ao, p0, p1, xyz, xctype,
+                )
                 density_derivative = _xc_density_derivatives(
-                    ao, density_stack, p0, p1, xyz, xctype,
+                    ao, density_stack, p0, p1, xctype,
+                    ao_center_derivative,
                 )
                 reference_derivative = density_derivative[:2]
                 probe_derivative = density_derivative[2:].reshape(
@@ -577,6 +631,9 @@ def lda_response_terms(
     mo = np.asarray(mf.mo_coeff)
     density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
     density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+    density_labels, density_stack = _response_density_stack(
+        densities, density_alpha, density_beta,
+    )
     offsets = mol.offset_nr_by_atom()
 
     for ao, mask, weights, _coords in ni.block_loop(
@@ -613,18 +670,11 @@ def lda_response_terms(
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
             for xyz in range(3):
-                ao_atom = ao[xyz + 1][:, p0:p1]
-                drho = {
-                    label: _lda_density_derivative(
-                        ao0, ao_atom, density, p0, p1,
+                drho, drho_alpha, drho_beta, _ao_delta = (
+                    _response_density_derivatives(
+                        ao, density_stack, density_labels,
+                        p0, p1, xyz, "LDA",
                     )
-                    for label, density in densities.items()
-                }
-                drho_alpha = _lda_density_derivative(
-                    ao0, ao_atom, density_alpha, p0, p1,
-                )
-                drho_beta = _lda_density_derivative(
-                    ao0, ao_atom, density_beta, p0, p1,
                 )
                 value = 0.0
                 for target, source, coefficient in coefficients:
@@ -843,6 +893,9 @@ def gga_response_terms(
             for term in terms
         )
     )
+    pair_density_stack = np.asarray([
+        densities[label] for label in pair_labels
+    ])
     nao = mol.nao_nr()
     potentials = {label: np.zeros((nao, nao)) for label in densities}
     reference_alpha = np.zeros((nao, nao))
@@ -851,6 +904,9 @@ def gga_response_terms(
     mo = np.asarray(mf.mo_coeff)
     density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
     density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+    density_labels, density_stack = _response_density_stack(
+        densities, density_alpha, density_beta,
+    )
     offsets = mol.offset_nr_by_atom()
     sparse = sparse_context(mf)
 
@@ -867,7 +923,10 @@ def gga_response_terms(
             )
             for label, density in densities.items()
         }
-        pairs = {label: pair_features(ao, densities[label]) for label in pair_labels}
+        pair_values, contracted_pair_ao = pair_feature_batches(
+            ao, pair_density_stack,
+        )
+        pairs = dict(zip(pair_labels, pair_values))
         pair_potentials = {
             label: gga_pair_potential(fref, pairs[label])
             for label in pair_labels
@@ -936,24 +995,19 @@ def gga_response_terms(
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
             for xyz in range(3):
-                drho = {
-                    label: gga_density_derivative(
-                        ao, density, p0, p1, xyz,
+                drho, drho_alpha, drho_beta, ao_delta = (
+                    _response_density_derivatives(
+                        ao, density_stack, density_labels,
+                        p0, p1, xyz, "GGA",
                     )
-                    for label, density in densities.items()
-                }
-                drho_alpha = gga_density_derivative(
-                    ao, density_alpha, p0, p1, xyz,
                 )
-                drho_beta = gga_density_derivative(
-                    ao, density_beta, p0, p1, xyz,
-                )
-                dpairs = {
-                    label: pair_features_derivative(
-                        ao, densities[label], p0, p1, xyz,
-                    )
-                    for label in pair_labels
-                }
+                dpairs = dict(zip(
+                    pair_labels,
+                    pair_features_derivatives(
+                        ao, pair_density_stack, ao_delta,
+                        contracted_pair_ao, p0, p1,
+                    ),
+                ))
                 value = 0.0
                 for term in terms:
                     if term.vref0:
@@ -1210,6 +1264,9 @@ def mgga_response_terms(
             for term in terms
         )
     )
+    pair_density_stack = np.asarray([
+        densities[label] for label in pair_labels
+    ])
     nao = mol.nao_nr()
     potentials = {label: np.zeros((nao, nao)) for label in densities}
     reference_alpha = np.zeros((nao, nao))
@@ -1218,6 +1275,9 @@ def mgga_response_terms(
     mo = np.asarray(mf.mo_coeff)
     density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
     density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+    density_labels, density_stack = _response_density_stack(
+        densities, density_alpha, density_beta,
+    )
     offsets = mol.offset_nr_by_atom()
     sparse = sparse_context(mf)
 
@@ -1234,7 +1294,10 @@ def mgga_response_terms(
             )
             for label, density in densities.items()
         }
-        pairs = {label: pair_features(ao, densities[label]) for label in pair_labels}
+        pair_values, contracted_pair_ao = pair_feature_batches(
+            ao, pair_density_stack,
+        )
+        pairs = dict(zip(pair_labels, pair_values))
         pair_potentials = {
             label: mgga_pair_potential(fref, pairs[label])
             for label in pair_labels
@@ -1303,24 +1366,19 @@ def mgga_response_terms(
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
             for xyz in range(3):
-                drho = {
-                    label: mgga_density_derivative(
-                        ao, density, p0, p1, xyz,
+                drho, drho_alpha, drho_beta, ao_delta = (
+                    _response_density_derivatives(
+                        ao, density_stack, density_labels,
+                        p0, p1, xyz, "MGGA",
                     )
-                    for label, density in densities.items()
-                }
-                drho_alpha = mgga_density_derivative(
-                    ao, density_alpha, p0, p1, xyz,
                 )
-                drho_beta = mgga_density_derivative(
-                    ao, density_beta, p0, p1, xyz,
-                )
-                dpairs = {
-                    label: pair_features_derivative(
-                        ao, densities[label], p0, p1, xyz,
-                    )
-                    for label in pair_labels
-                }
+                dpairs = dict(zip(
+                    pair_labels,
+                    pair_features_derivatives(
+                        ao, pair_density_stack, ao_delta,
+                        contracted_pair_ao, p0, p1,
+                    ),
+                ))
                 value = 0.0
                 for term in terms:
                     if term.vref0:
