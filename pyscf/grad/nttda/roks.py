@@ -22,8 +22,12 @@ class GradientComponents:
 
 def finish_gradient(
         gradient_driver, tdobj, m_matrix, direct, atmlst,
-        tolerance, max_cycle, fock_direct):
-    """Solve the common ROKS Z-vector equation and assemble ``d omega/dR``."""
+        tolerance, max_cycle, fock_direct, direct_fock_probes=None):
+    """Solve the common ROKS Z-vector equation and assemble ``d omega/dR``.
+
+    ``direct_fock_probes`` enables one batched Fock-derivative evaluation: its
+    contraction is the first result and the Z-vector contraction is the second.
+    """
     transpose_action, pairs = make_hessian_transpose_action(tdobj)
     rhs = pack_m_matrix(m_matrix, pairs)
     zvector = solve_zvector(
@@ -34,21 +38,43 @@ def finish_gradient(
         tolerance=tolerance,
         max_cycle=max_cycle,
     )
-    residual = float(np.max(np.abs(transpose_action(zvector) - rhs)))
+    adjoint = zvector_adjoint_matrix(tdobj, pairs, zvector)
+    residual = float(np.max(np.abs(pack_m_matrix(adjoint, pairs) - rhs)))
+    probe_alpha, probe_beta = zvector_probe_densities(
+        tdobj, pairs, zvector,
+    )
+    if direct_fock_probes is None:
+        fock_contraction = fock_direct(
+            gradient_driver,
+            tdobj,
+            probe_alpha,
+            probe_beta,
+            atmlst=atmlst,
+        )
+        direct_total = direct
+    else:
+        direct_alpha, direct_beta = direct_fock_probes
+        fock_contractions = fock_direct(
+            gradient_driver,
+            tdobj,
+            np.asarray((direct_alpha, probe_alpha)),
+            np.asarray((direct_beta, probe_beta)),
+            atmlst=atmlst,
+        )
+        direct_total = direct + fock_contractions[0]
+        fock_contraction = fock_contractions[1]
     orbital = _orbital_gradient(
-        gradient_driver,
         tdobj,
         m_matrix,
-        pairs,
-        zvector,
-        fock_direct,
+        adjoint,
+        fock_contraction,
         atmlst=atmlst,
     )
     return GradientComponents(
         m_matrix=m_matrix,
-        direct=direct,
+        direct=direct_total,
         orbital=orbital,
-        total=direct + orbital,
+        total=direct_total + orbital,
         zvector=zvector,
         residual=residual,
     )
@@ -268,24 +294,12 @@ def zvector_probe_densities(tdobj, pairs, zvector):
 
 
 def _orbital_gradient(
-        gradient_driver, tdobj, m_matrix, pairs, zvector,
-        fock_direct, atmlst=None):
+        tdobj, m_matrix, adjoint, fock_contraction, atmlst=None):
     mol = tdobj.mol
     mf = tdobj._scf
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
-    probe_alpha, probe_beta = zvector_probe_densities(
-        tdobj, pairs, zvector,
-    )
-    fock_contraction = fock_direct(
-        gradient_driver,
-        tdobj,
-        probe_alpha,
-        probe_beta,
-        atmlst=atmlst,
-    )
-    adjoint = zvector_adjoint_matrix(tdobj, pairs, zvector)
     mo = np.asarray(mf.mo_coeff)
     overlap_derivative = mf.nuc_grad_method().get_ovlp(mol)
     offsets = mol.offset_nr_by_atom()

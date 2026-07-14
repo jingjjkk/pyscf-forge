@@ -34,6 +34,7 @@ from pyscf.grad.nttda.delta_s_zero import (  # noqa: E402
     grad_elec as same_spin_grad_elec,
     same_spin_ledger_scalar,
 )
+from pyscf.grad.nttda import xc as xc_backend  # noqa: E402
 from pyscf.sftda.nttda import NTTDA  # noqa: E402
 
 
@@ -124,6 +125,58 @@ def frozen_scalar_at(base_mf, tdobj, xy, coords):
 
 
 class GradientLayerChecks(unittest.TestCase):
+    def test_batched_jk_and_shared_vxc_call_counts(self):
+        mf = make_reference(make_molecule(), "CAM-B3LYP")
+        for delta_s in (-1, 0):
+            for nobeta in (False, True):
+                tdobj, xy = exact_state_two(mf, delta_s, nobeta)
+                driver = mf.nuc_grad_method()
+                calls = {"j": 0, "k": 0, "vxc": 0, "j_batch": [],
+                         "k_batch": []}
+                original_j = driver.get_j
+                original_k = driver.get_k
+                original_vxc = xc_backend.full_gga_vxc_derivative_atom
+
+                def counted_j(mol=None, dm=None, **kwargs):
+                    calls["j"] += 1
+                    calls["j_batch"].append(1 if dm.ndim == 2 else len(dm))
+                    return original_j(mol, dm, **kwargs)
+
+                def counted_k(mol=None, dm=None, **kwargs):
+                    calls["k"] += 1
+                    calls["k_batch"].append(1 if dm.ndim == 2 else len(dm))
+                    return original_k(mol, dm, **kwargs)
+
+                def counted_vxc(*args, **kwargs):
+                    calls["vxc"] += 1
+                    return original_vxc(*args, **kwargs)
+
+                driver.get_j = counted_j
+                driver.get_k = counted_k
+                xc_backend.full_gga_vxc_derivative_atom = counted_vxc
+                try:
+                    builder = (
+                        lowering_grad_elec if delta_s == -1
+                        else same_spin_grad_elec
+                    )
+                    result = builder(
+                        driver,
+                        tdobj,
+                        xy,
+                        atmlst=range(mf.mol.natm),
+                    )
+                finally:
+                    xc_backend.full_gga_vxc_derivative_atom = original_vxc
+
+                with self.subTest(delta_s=delta_s, nobeta=nobeta):
+                    self.assertTrue(np.all(np.isfinite(result.total)))
+                    self.assertLessEqual(calls["j"], 4)
+                    self.assertLessEqual(calls["k"], 8)
+                    self.assertGreater(max(calls["j_batch"]), 1)
+                    self.assertGreater(max(calls["k_batch"]), 1)
+                    expected_vxc = mf.mol.natm * (2 if nobeta else 1)
+                    self.assertEqual(calls["vxc"], expected_vxc)
+
     def test_full_m_matrix_for_both_channels_and_fock_modes(self):
         rng = np.random.default_rng(103)
         for delta_s in (-1, 0):

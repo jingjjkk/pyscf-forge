@@ -582,13 +582,6 @@ def spin_lowering_fock_q(tdobj, xy, max_memory=None):
 
 # AO J/K nuclear derivatives
 
-def _as_stack(array):
-    array = np.asarray(array)
-    if array.ndim == 2:
-        array = array[None]
-    return array
-
-
 def _as_derivative_stack(array):
     array = np.asarray(array)
     if array.ndim == 3:
@@ -596,78 +589,156 @@ def _as_derivative_stack(array):
     return array
 
 
-def _add_j_derivative(
-        gradient, gradient_driver, mol, left, right, atoms, offsets,
-        scale=1.0, omega=None):
-    """Differentiate ``scale * left:J(right)`` at fixed AO coefficients."""
-    if scale == 0.0:
-        return
-    left = _as_stack(left)
-    right = _as_stack(right)
-    if omega is None:
-        j_right = gradient_driver.get_j(mol, right, hermi=0)
-        j_left = gradient_driver.get_j(mol, left, hermi=0)
+def _density_key(density):
+    density = np.asarray(density)
+    data = density.__array_interface__["data"][0]
+    return data, density.shape, density.strides, density.dtype.str
+
+
+def _term_densities(term, exchange):
+    left, right, _scale, _omega = term
+    if exchange:
+        return left, right, left.T, right.T
+    return left, right
+
+
+def _density_batches(terms, exchange, max_memory, nao):
+    """Group bilinear terms while bounding derivative-potential storage."""
+    minimum = 4 if exchange else 2
+    bytes_per_density = 4 * nao * nao * np.dtype(float).itemsize
+    batch_limit = max(
+        minimum,
+        int(0.2 * max_memory * 1e6 / bytes_per_density),
+    )
+    batch = []
+    keys = set()
+    for term in terms:
+        term_keys = {
+            _density_key(density)
+            for density in _term_densities(term, exchange)
+        }
+        if batch and len(keys | term_keys) > batch_limit:
+            yield batch
+            batch = []
+            keys = set()
+        batch.append(term)
+        keys.update(term_keys)
+    if batch:
+        yield batch
+
+
+def _jk_derivative_potentials(
+        gradient_driver, mol, terms, operator, omega):
+    exchange = operator == "k"
+    densities = {}
+    for term in terms:
+        for density in _term_densities(term, exchange):
+            density = np.asarray(density)
+            densities.setdefault(_density_key(density), density)
+    keys = tuple(densities)
+    stack = np.asarray([densities[key] for key in keys])
+    if operator == "j":
+        if omega is None:
+            values = gradient_driver.get_j(mol, stack, hermi=0)
+        else:
+            values = gradient_driver.get_j(
+                mol, stack, hermi=0, omega=omega,
+            )
     else:
-        j_right = gradient_driver.get_j(mol, right, hermi=0, omega=omega)
-        j_left = gradient_driver.get_j(mol, left, hermi=0, omega=omega)
-    j_right = _as_derivative_stack(j_right)
-    j_left = _as_derivative_stack(j_left)
-    for k, atom in enumerate(atoms):
-        p0, p1 = offsets[atom][2:]
-        value = lib.einsum(
-            "nxpq,npq->x", j_right[:, :, p0:p1], left[:, p0:p1],
-        )
-        value += lib.einsum(
-            "nxpq,nqp->x", j_right[:, :, p0:p1], left[:, :, p0:p1],
-        )
-        value += lib.einsum(
-            "nxpq,npq->x", j_left[:, :, p0:p1], right[:, p0:p1],
-        )
-        value += lib.einsum(
-            "nxpq,nqp->x", j_left[:, :, p0:p1], right[:, :, p0:p1],
-        )
-        gradient[k] += scale * value
+        if omega is None:
+            values = gradient_driver.get_k(mol, stack, hermi=0)
+        else:
+            values = gradient_driver.get_k(
+                mol, stack, hermi=0, omega=omega,
+            )
+    values = _as_derivative_stack(values)
+    return dict(zip(keys, values))
 
 
-def _get_k_derivative(gradient_driver, mol, densities, omega):
-    if omega is None:
-        value = gradient_driver.get_k(mol, densities, hermi=0)
-    else:
-        value = gradient_driver.get_k(
-            mol, densities, hermi=0, omega=omega,
-        )
-    return _as_derivative_stack(value)
-
-
-def _add_k_derivative(
-        gradient, gradient_driver, mol, left, right, atoms, offsets,
-        scale=1.0, omega=None):
-    """Differentiate ``scale * left:K(right)`` at fixed AO coefficients."""
-    if scale == 0.0:
+def _contract_derivative_terms(
+        gradient, gradient_driver, mol, atoms, offsets, terms,
+        operator):
+    if not atoms:
         return
-    left = _as_stack(left)
-    right = _as_stack(right)
-    right_t = np.swapaxes(right, -1, -2)
-    left_t = np.swapaxes(left, -1, -2)
-    k_right = _get_k_derivative(gradient_driver, mol, right, omega)
-    k_right_t = _get_k_derivative(gradient_driver, mol, right_t, omega)
-    k_left = _get_k_derivative(gradient_driver, mol, left, omega)
-    k_left_t = _get_k_derivative(gradient_driver, mol, left_t, omega)
-    for k, atom in enumerate(atoms):
-        p0, p1 = offsets[atom][2:]
-        value = lib.einsum(
-            "nxpq,npq->x", k_right[:, :, p0:p1, :], left[:, p0:p1, :],
-        )
-        value += lib.einsum(
-            "nxqp,npq->x", k_right_t[:, :, p0:p1, :], left[:, :, p0:p1],
-        )
-        value += lib.einsum(
-            "nxpq,npq->x", k_left[:, :, p0:p1, :], right[:, p0:p1, :],
-        )
-        value += lib.einsum(
-            "nxqp,npq->x", k_left_t[:, :, p0:p1, :], right[:, :, p0:p1],
-        )
-        gradient[k] += scale * value
+    terms_by_omega = {}
+    for term in terms:
+        if term[2] != 0.0:
+            terms_by_omega.setdefault(term[3], []).append(term)
+    exchange = operator == "k"
+    for omega, omega_terms in terms_by_omega.items():
+        for batch in _density_batches(
+                omega_terms, exchange, gradient_driver.max_memory,
+                mol.nao_nr()):
+            potentials = _jk_derivative_potentials(
+                gradient_driver, mol, batch, operator, omega,
+            )
+            for left, right, scale, _omega in batch:
+                left = np.asarray(left)
+                right = np.asarray(right)
+                right_derivative = potentials[_density_key(right)]
+                left_derivative = potentials[_density_key(left)]
+                if exchange:
+                    right_t_derivative = potentials[
+                        _density_key(right.T)
+                    ]
+                    left_t_derivative = potentials[_density_key(left.T)]
+                for k, atom in enumerate(atoms):
+                    p0, p1 = offsets[atom][2:]
+                    if exchange:
+                        value = lib.einsum(
+                            "xpq,pq->x",
+                            right_derivative[:, p0:p1, :],
+                            left[p0:p1, :],
+                        )
+                        value += lib.einsum(
+                            "xqp,pq->x",
+                            right_t_derivative[:, p0:p1, :],
+                            left[:, p0:p1],
+                        )
+                        value += lib.einsum(
+                            "xpq,pq->x",
+                            left_derivative[:, p0:p1, :],
+                            right[p0:p1, :],
+                        )
+                        value += lib.einsum(
+                            "xqp,pq->x",
+                            left_t_derivative[:, p0:p1, :],
+                            right[:, p0:p1],
+                        )
+                    else:
+                        value = lib.einsum(
+                            "xpq,pq->x",
+                            right_derivative[:, p0:p1],
+                            left[p0:p1],
+                        )
+                        value += lib.einsum(
+                            "xpq,qp->x",
+                            right_derivative[:, p0:p1],
+                            left[:, p0:p1],
+                        )
+                        value += lib.einsum(
+                            "xpq,pq->x",
+                            left_derivative[:, p0:p1],
+                            right[p0:p1],
+                        )
+                        value += lib.einsum(
+                            "xpq,qp->x",
+                            left_derivative[:, p0:p1],
+                            right[:, p0:p1],
+                        )
+                    gradient[k] += scale * value
+
+
+def _contract_jk_derivatives(
+        gradient, gradient_driver, mol, atoms, offsets,
+        j_terms=(), k_terms=()):
+    """Contract fixed-AO J/K derivatives, batched by range parameter."""
+    _contract_derivative_terms(
+        gradient, gradient_driver, mol, atoms, offsets, j_terms, "j",
+    )
+    _contract_derivative_terms(
+        gradient, gradient_driver, mol, atoms, offsets, k_terms, "k",
+    )
 
 
 def _reference_spin_densities(tdobj):
@@ -679,54 +750,69 @@ def _reference_spin_densities(tdobj):
     )
 
 
+def _spin_probe_stacks(p_alpha, p_beta):
+    p_alpha = np.asarray(p_alpha)
+    p_beta = np.asarray(p_beta)
+    single_probe = p_alpha.ndim == 2
+    if single_probe:
+        p_alpha = p_alpha[None]
+        p_beta = p_beta[None]
+    return p_alpha, p_beta, single_probe
+
+
 def spin_fock_direct_dft(
-        gradient_driver, tdobj, p_alpha, p_beta, atmlst=None):
-    """Differentiate an ordinary UKS Fock scalar for LDA/GGA/MGGA."""
+        gradient_driver, tdobj, p_alpha, p_beta, atmlst=None,
+        nobeta_p0=None):
+    """Differentiate one or more ordinary UKS Fock scalar probes.
+
+    The optional ``nobeta_p0`` correction belongs to the first, explicit-direct
+    probe in the batch.
+    """
     mf = tdobj._scf
     mol = tdobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
     offsets = mol.offset_nr_by_atom()
-    p_alpha = np.asarray(p_alpha)
-    p_beta = np.asarray(p_beta)
+    p_alpha, p_beta, single_probe = _spin_probe_stacks(
+        p_alpha, p_beta,
+    )
     p_total = p_alpha + p_beta
     density_alpha, density_beta = _reference_spin_densities(tdobj)
-    gradient = np.zeros((len(atmlst), 3))
+    gradient = np.zeros((len(p_alpha), len(atmlst), 3))
     hcore_derivative = mf.nuc_grad_method().hcore_generator(mol)
     for k, atom in enumerate(atmlst):
-        gradient[k] += lib.einsum(
-            "pq,xpq->x", p_total, hcore_derivative(atom),
+        gradient[:, k] += lib.einsum(
+            "npq,xpq->nx", p_total, hcore_derivative(atom),
         )
-    _add_j_derivative(
-        gradient, gradient_driver, mol, p_total, density_alpha,
-        atmlst, offsets,
-    )
-    _add_j_derivative(
-        gradient, gradient_driver, mol, p_total, density_beta,
-        atmlst, offsets,
-    )
     ni = mf._numint
     omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
-    if ni.libxc.is_hybrid_xc(mf.xc):
-        _add_k_derivative(
-            gradient, gradient_driver, mol, p_alpha, density_alpha,
-            atmlst, offsets, scale=-hybrid,
+    for probe in range(len(p_alpha)):
+        j_terms = [
+            (p_total[probe], density_alpha, 1.0, None),
+            (p_total[probe], density_beta, 1.0, None),
+        ]
+        k_terms = []
+        if ni.libxc.is_hybrid_xc(mf.xc):
+            k_terms.extend((
+                (p_alpha[probe], density_alpha, -hybrid, None),
+                (p_beta[probe], density_beta, -hybrid, None),
+            ))
+            if omega != 0:
+                long_range = -(alpha - hybrid)
+                k_terms.extend((
+                    (p_alpha[probe], density_alpha, long_range, omega),
+                    (p_beta[probe], density_beta, long_range, omega),
+                ))
+        _contract_jk_derivatives(
+            gradient[probe],
+            gradient_driver,
+            mol,
+            atmlst,
+            offsets,
+            j_terms=j_terms,
+            k_terms=k_terms,
         )
-        _add_k_derivative(
-            gradient, gradient_driver, mol, p_beta, density_beta,
-            atmlst, offsets, scale=-hybrid,
-        )
-        if omega != 0:
-            long_range = -(alpha - hybrid)
-            _add_k_derivative(
-                gradient, gradient_driver, mol, p_alpha, density_alpha,
-                atmlst, offsets, scale=long_range, omega=omega,
-            )
-            _add_k_derivative(
-                gradient, gradient_driver, mol, p_beta, density_beta,
-                atmlst, offsets, scale=long_range, omega=omega,
-            )
     xctype = ni._xc_type(mf.xc)
     if xctype == "LDA":
         derivative_builder = xc_backend.full_lda_vxc_derivative_atom
@@ -739,6 +825,10 @@ def spin_fock_direct_dft(
             "ordinary Fock direct derivative is not implemented for %s" %
             xctype
         )
+    if nobeta_p0 is not None and tdobj.nobeta:
+        density0 = 0.5 * (density_alpha + density_beta)
+    else:
+        density0 = None
     for k, atom in enumerate(atmlst):
         vxc_alpha, vxc_beta = derivative_builder(
             mf,
@@ -747,47 +837,65 @@ def spin_fock_direct_dft(
             atom,
             max_memory=gradient_driver.max_memory,
         )
-        gradient[k] += lib.einsum("pq,xpq->x", p_alpha, vxc_alpha)
-        gradient[k] += lib.einsum("pq,xpq->x", p_beta, vxc_beta)
-    return gradient
+        gradient[:, k] += lib.einsum(
+            "npq,xpq->nx", p_alpha, vxc_alpha,
+        )
+        gradient[:, k] += lib.einsum(
+            "npq,xpq->nx", p_beta, vxc_beta,
+        )
+        if density0 is not None:
+            equal_alpha, equal_beta = derivative_builder(
+                mf,
+                density0,
+                density0,
+                atom,
+                max_memory=gradient_driver.max_memory,
+            )
+            gradient[0, k] += 0.5 * lib.einsum(
+                "pq,xpq->x",
+                nobeta_p0,
+                equal_alpha + equal_beta - vxc_alpha - vxc_beta,
+            )
+    return gradient[0] if single_probe else gradient
 
 
 def spin_fock_direct_hf(
         gradient_driver, tdobj, p_alpha, p_beta, atmlst=None):
-    """Differentiate an arbitrary spin-resolved HF Fock scalar."""
+    """Differentiate one or more spin-resolved HF Fock scalar probes."""
     mol = tdobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
     offsets = mol.offset_nr_by_atom()
-    p_alpha = np.asarray(p_alpha)
-    p_beta = np.asarray(p_beta)
+    p_alpha, p_beta, single_probe = _spin_probe_stacks(
+        p_alpha, p_beta,
+    )
     p_total = p_alpha + p_beta
     dm_alpha, dm_beta = _reference_spin_densities(tdobj)
-    gradient = np.zeros((len(atmlst), 3))
+    gradient = np.zeros((len(p_alpha), len(atmlst), 3))
 
     hcore_derivative = tdobj._scf.nuc_grad_method().hcore_generator(mol)
     for k, atom in enumerate(atmlst):
-        gradient[k] += lib.einsum(
-            "pq,xpq->x", p_total, hcore_derivative(atom),
+        gradient[:, k] += lib.einsum(
+            "npq,xpq->nx", p_total, hcore_derivative(atom),
         )
-    _add_j_derivative(
-        gradient, gradient_driver, mol, p_total, dm_alpha,
-        atmlst, offsets,
-    )
-    _add_j_derivative(
-        gradient, gradient_driver, mol, p_total, dm_beta,
-        atmlst, offsets,
-    )
-    _add_k_derivative(
-        gradient, gradient_driver, mol, p_alpha, dm_alpha,
-        atmlst, offsets, scale=-1.0,
-    )
-    _add_k_derivative(
-        gradient, gradient_driver, mol, p_beta, dm_beta,
-        atmlst, offsets, scale=-1.0,
-    )
-    return gradient
+    for probe in range(len(p_alpha)):
+        _contract_jk_derivatives(
+            gradient[probe],
+            gradient_driver,
+            mol,
+            atmlst,
+            offsets,
+            j_terms=(
+                (p_total[probe], dm_alpha, 1.0, None),
+                (p_total[probe], dm_beta, 1.0, None),
+            ),
+            k_terms=(
+                (p_alpha[probe], dm_alpha, -1.0, None),
+                (p_beta[probe], dm_beta, -1.0, None),
+            ),
+        )
+    return gradient[0] if single_probe else gradient
 
 
 def response_direct_hfx(
@@ -809,24 +917,35 @@ def response_direct_hfx(
     scales = [(hybrid, None)]
     if omega != 0:
         scales.append((alpha - hybrid, omega))
+    j_terms = []
+    k_terms = []
     for term in response_terms:
         target = densities[term.target]
         source = densities[term.source]
         for coefficient, range_omega in scales:
             if term.vref0:
-                _add_k_derivative(
-                    gradient, gradient_driver, mol, target, source,
-                    atmlst, offsets,
-                    scale=-coefficient * term.vref0,
-                    omega=range_omega,
-                )
+                k_terms.append((
+                    target,
+                    source,
+                    -coefficient * term.vref0,
+                    range_omega,
+                ))
             if term.vref1:
-                _add_j_derivative(
-                    gradient, gradient_driver, mol, target, source,
-                    atmlst, offsets,
-                    scale=-coefficient * term.vref1,
-                    omega=range_omega,
-                )
+                j_terms.append((
+                    target,
+                    source,
+                    -coefficient * term.vref1,
+                    range_omega,
+                ))
+    _contract_jk_derivatives(
+        gradient,
+        gradient_driver,
+        mol,
+        atmlst,
+        offsets,
+        j_terms=j_terms,
+        k_terms=k_terms,
+    )
     return gradient
 
 
@@ -855,6 +974,7 @@ def spin_lowering_fockz_hfx_terms(
     if omega != 0:
         scales.append((alpha - hybrid, omega))
     offsets = mol.offset_nr_by_atom()
+    k_terms = []
     for coefficient, range_omega in scales:
         if coefficient == 0.0:
             continue
@@ -868,17 +988,20 @@ def spin_lowering_fockz_hfx_terms(
             mo.conj().T @ (potential + potential.T) @ spaces.c_open
         )
         if with_direct:
-            _add_k_derivative(
-                direct,
-                gradient_driver,
-                mol,
+            k_terms.append((
                 pz,
                 density_open,
-                atmlst,
-                offsets,
-                scale=-0.5 * coefficient,
-                omega=range_omega,
-            )
+                -0.5 * coefficient,
+                range_omega,
+            ))
+    _contract_jk_derivatives(
+        direct,
+        gradient_driver,
+        mol,
+        atmlst,
+        offsets,
+        k_terms=k_terms,
+    )
     return xc_backend.XCGradientTerms(q_alpha, q_beta, direct)
 
 # Channel assembly
@@ -915,14 +1038,11 @@ def grad_elec(
         m_matrix = (
             fock_alpha + fock_beta + hfx_alpha + hfx_beta
         )
-        direct = spin_fock_direct_hf(
-            gradient_driver,
-            tdobj,
+        direct_fock_probes = (
             0.5 * (p0 + pz),
             0.5 * (p0 - pz),
-            atmlst=atmlst,
         )
-        direct += response_direct_hfx(
+        direct = response_direct_hfx(
             gradient_driver,
             tdobj,
             densities,
@@ -933,24 +1053,21 @@ def grad_elec(
     else:
         # 3b. Semilocal XC, hybrid/RSH, Fz, and nobeta contributions.
         try:
-            response_builder, fockz_builder, nobeta_q_builder, nobeta_direct = {
+            response_builder, fockz_builder, nobeta_q_builder = {
                 "LDA": (
                     xc_backend.lda_response_terms,
                     xc_backend.lda_fockz_terms,
                     xc_backend.lda_nobeta_reference_q,
-                    xc_backend.nobeta_common_direct_lda,
                 ),
                 "GGA": (
                     xc_backend.gga_response_terms,
                     xc_backend.gga_fockz_terms,
                     xc_backend.gga_nobeta_reference_q,
-                    xc_backend.nobeta_common_direct_gga,
                 ),
                 "MGGA": (
                     xc_backend.mgga_response_terms,
                     xc_backend.mgga_fockz_terms,
                     xc_backend.mgga_nobeta_reference_q,
-                    xc_backend.nobeta_common_direct_mgga,
                 ),
             }[xctype]
         except KeyError as error:
@@ -984,14 +1101,8 @@ def grad_elec(
             + common_alpha + common_beta
         )
 
-        direct = spin_fock_direct_dft(
-            gradient_driver,
-            tdobj,
-            0.5 * p0,
-            0.5 * p0,
-            atmlst=atmlst,
-        )
-        direct += response_direct_hfx(
+        direct_fock_probes = (0.5 * p0, 0.5 * p0)
+        direct = response_direct_hfx(
             gradient_driver,
             tdobj,
             densities,
@@ -1001,10 +1112,15 @@ def grad_elec(
         direct += response_xc.direct
         direct += fockz_xc.direct
         direct += fockz_hfx.direct
-        direct += nobeta_direct(
-            gradient_driver, tdobj, p0, atmlst=atmlst,
-        )
-        fock_direct = spin_fock_direct_dft
+        def fock_direct(driver, obj, p_alpha, p_beta, atmlst=None):
+            return spin_fock_direct_dft(
+                driver,
+                obj,
+                p_alpha,
+                p_beta,
+                atmlst=atmlst,
+                nobeta_p0=p0,
+            )
 
     # 4-5. ROKS transpose-Hessian adjoint, Dz Fock derivative, and Pulay term.
     return finish_gradient(
@@ -1016,4 +1132,5 @@ def grad_elec(
         tolerance,
         max_cycle,
         fock_direct,
+        direct_fock_probes=direct_fock_probes,
     )

@@ -631,15 +631,6 @@ def lda_nobeta_reference_q(tdobj, p0, max_memory=None):
     return q_alpha, q_beta
 
 
-def _reference_spin_densities(tdobj):
-    mf = tdobj._scf
-    mo = np.asarray(mf.mo_coeff)
-    return (
-        mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T,
-        mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T,
-    )
-
-
 def full_lda_vxc_derivative_atom(mf, density_alpha, density_beta, atom,
                                   max_memory=2000):
     """Full fixed-grid nuclear derivative of both LDA XC potentials."""
@@ -684,37 +675,6 @@ def full_lda_vxc_derivative_atom(mf, density_alpha, density_beta, atom,
                     ao0.T @ (ao0 * response_weight[:, None])
                 )
     return derivative[0], derivative[1]
-
-
-def nobeta_common_direct_lda(
-        gradient_driver, tdobj, p0, atmlst=None):
-    """Skeleton correction from equal-spin ``F0`` in ``nobeta`` mode."""
-    if atmlst is None:
-        atmlst = range(tdobj.mol.natm)
-    atmlst = tuple(atmlst)
-    result = np.zeros((len(atmlst), 3))
-    if not tdobj.nobeta:
-        return result
-    mf = tdobj._scf
-    density_alpha, density_beta = _reference_spin_densities(tdobj)
-    density0 = 0.5 * (density_alpha + density_beta)
-    for k, atom in enumerate(atmlst):
-        actual_alpha, actual_beta = full_lda_vxc_derivative_atom(
-            mf, density_alpha, density_beta, atom,
-            max_memory=gradient_driver.max_memory,
-        )
-        equal_alpha, equal_beta = full_lda_vxc_derivative_atom(
-            mf, density0, density0, atom,
-            max_memory=gradient_driver.max_memory,
-        )
-        result[k] += lib.einsum(
-            "pq,xpq->x",
-            p0,
-            0.5 * (
-                equal_alpha + equal_beta - actual_alpha - actual_beta
-            ),
-        )
-    return result
 
 
 # GGA quadrature
@@ -1132,35 +1092,6 @@ def full_gga_vxc_derivative_atom(
     return output[0], output[1]
 
 
-def nobeta_common_direct_gga(
-        gradient_driver, tdobj, p0, atmlst=None):
-    if atmlst is None:
-        atmlst = range(tdobj.mol.natm)
-    atmlst = tuple(atmlst)
-    output = np.zeros((len(atmlst), 3))
-    if not tdobj.nobeta:
-        return output
-    mf = tdobj._scf
-    mo = np.asarray(mf.mo_coeff)
-    density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
-    density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
-    density0 = 0.5 * (density_alpha + density_beta)
-    for k, atom in enumerate(atmlst):
-        actual = full_gga_vxc_derivative_atom(
-            mf, density_alpha, density_beta, atom,
-            max_memory=gradient_driver.max_memory,
-        )
-        equal = full_gga_vxc_derivative_atom(
-            mf, density0, density0, atom,
-            max_memory=gradient_driver.max_memory,
-        )
-        output[k] += lib.einsum(
-            "pq,xpq->x", p0,
-            0.5 * (equal[0] + equal[1] - actual[0] - actual[1]),
-        )
-    return output
-
-
 # meta-GGA quadrature
 
 def _mgga_fref_kref(mf, rho0):
@@ -1573,32 +1504,3 @@ def full_mgga_vxc_derivative_atom(
                     mol, ao, response_weights[spin], mask,
                 )
     return output[0], output[1]
-
-
-def nobeta_common_direct_mgga(
-        gradient_driver, tdobj, p0, atmlst=None):
-    if atmlst is None:
-        atmlst = range(tdobj.mol.natm)
-    atmlst = tuple(atmlst)
-    output = np.zeros((len(atmlst), 3))
-    if not tdobj.nobeta:
-        return output
-    mf = tdobj._scf
-    mo = np.asarray(mf.mo_coeff)
-    density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
-    density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
-    density0 = 0.5 * (density_alpha + density_beta)
-    for k, atom in enumerate(atmlst):
-        actual = full_mgga_vxc_derivative_atom(
-            mf, density_alpha, density_beta, atom,
-            max_memory=gradient_driver.max_memory,
-        )
-        equal = full_mgga_vxc_derivative_atom(
-            mf, density0, density0, atom,
-            max_memory=gradient_driver.max_memory,
-        )
-        output[k] += lib.einsum(
-            "pq,xpq->x", p0,
-            0.5 * (equal[0] + equal[1] - actual[0] - actual[1]),
-        )
-    return output
