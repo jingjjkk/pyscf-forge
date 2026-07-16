@@ -571,8 +571,51 @@ def _density_key(density):
     return data, density.shape, density.strides, density.dtype.str
 
 
+@dataclass(frozen=True)
+class _JKDerivativeTerm:
+    """One fixed-AO bilinear derivative with a named output slot."""
+
+    left: np.ndarray
+    right: np.ndarray
+    scale: float
+    omega: float
+    slot: object
+
+
+class _JKDerivativeLedger:
+    """Channel-local scheduler for fixed-AO J/K derivative contractions."""
+
+    def __init__(self):
+        self._terms = {"j": [], "k": []}
+
+    def add(self, operator, slot, terms):
+        self._terms[operator].extend(
+            _JKDerivativeTerm(left, right, scale, omega, slot)
+            for left, right, scale, omega in terms
+            if scale != 0.0
+        )
+
+    def contract(self, gradient_driver, mol, atoms, slots=()):
+        atoms = tuple(atoms)
+        shape = (len(atoms), 3)
+        gradients = {slot: np.zeros(shape) for slot in slots}
+        for operator in ("j", "k"):
+            for term in self._terms[operator]:
+                gradients.setdefault(term.slot, np.zeros(shape))
+            _contract_derivative_terms(
+                gradients,
+                gradient_driver,
+                mol,
+                atoms,
+                mol.offset_nr_by_atom(),
+                self._terms[operator],
+                operator,
+            )
+        return gradients
+
+
 def _term_densities(term, exchange):
-    left, right, _scale, _omega = term
+    left, right = term.left, term.right
     if exchange:
         return left, right, left.T, right.T
     return left, right
@@ -632,14 +675,13 @@ def _jk_derivative_potentials(
 
 
 def _contract_derivative_terms(
-        gradient, gradient_driver, mol, atoms, offsets, terms,
+        gradients, gradient_driver, mol, atoms, offsets, terms,
         operator):
     if not atoms:
         return
     terms_by_omega = {}
     for term in terms:
-        if term[2] != 0.0:
-            terms_by_omega.setdefault(term[3], []).append(term)
+        terms_by_omega.setdefault(term.omega, []).append(term)
     exchange = operator == "k"
     for omega, omega_terms in terms_by_omega.items():
         for batch in _density_batches(
@@ -648,9 +690,9 @@ def _contract_derivative_terms(
             potentials = _jk_derivative_potentials(
                 gradient_driver, mol, batch, operator, omega,
             )
-            for left, right, scale, _omega in batch:
-                left = np.asarray(left)
-                right = np.asarray(right)
+            for term in batch:
+                left = np.asarray(term.left)
+                right = np.asarray(term.right)
                 right_derivative = potentials[_density_key(right)]
                 left_derivative = potentials[_density_key(left)]
                 if exchange:
@@ -702,19 +744,7 @@ def _contract_derivative_terms(
                             left_derivative[:, p0:p1],
                             right[:, p0:p1],
                         )
-                    gradient[k] += scale * value
-
-
-def _contract_jk_derivatives(
-        gradient, gradient_driver, mol, atoms, offsets,
-        j_terms=(), k_terms=()):
-    """Contract fixed-AO J/K derivatives, batched by range parameter."""
-    _contract_derivative_terms(
-        gradient, gradient_driver, mol, atoms, offsets, j_terms, "j",
-    )
-    _contract_derivative_terms(
-        gradient, gradient_driver, mol, atoms, offsets, k_terms, "k",
-    )
+                    gradients[term.slot][k] += term.scale * value
 
 
 def _reference_spin_densities(tdobj):
@@ -738,7 +768,7 @@ def _spin_probe_stacks(p_alpha, p_beta):
 
 def spin_fock_direct_dft(
         gradient_driver, tdobj, p_alpha, p_beta, atmlst=None,
-        nobeta_p0=None):
+        nobeta_p0=None, jk_ledger=None, output_slots=None):
     """Differentiate one or more ordinary UKS Fock scalar probes.
 
     The optional ``nobeta_p0`` correction belongs to the first, explicit-direct
@@ -749,10 +779,11 @@ def spin_fock_direct_dft(
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
-    offsets = mol.offset_nr_by_atom()
     p_alpha, p_beta, single_probe = _spin_probe_stacks(
         p_alpha, p_beta,
     )
+    if output_slots is None:
+        output_slots = tuple(range(len(p_alpha)))
     p_total = p_alpha + p_beta
     density_alpha, density_beta = _reference_spin_densities(tdobj)
     gradient = np.zeros((len(p_alpha), len(atmlst), 3))
@@ -763,6 +794,8 @@ def spin_fock_direct_dft(
         )
     ni = mf._numint
     omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    local_ledger = _JKDerivativeLedger()
+    ledger = jk_ledger if jk_ledger is not None else local_ledger
     for probe in range(len(p_alpha)):
         j_terms = [
             (p_total[probe], density_alpha, 1.0, None),
@@ -780,15 +813,8 @@ def spin_fock_direct_dft(
                     (p_alpha[probe], density_alpha, long_range, omega),
                     (p_beta[probe], density_beta, long_range, omega),
                 ))
-        _contract_jk_derivatives(
-            gradient[probe],
-            gradient_driver,
-            mol,
-            atmlst,
-            offsets,
-            j_terms=j_terms,
-            k_terms=k_terms,
-        )
+        ledger.add("j", output_slots[probe], j_terms)
+        ledger.add("k", output_slots[probe], k_terms)
     xctype = ni._xc_type(mf.xc)
     if xctype == "LDA":
         derivative_contractor = xc_backend.contract_lda_vxc_derivative
@@ -830,20 +856,28 @@ def spin_fock_direct_dft(
             atmlst=atmlst,
             max_memory=gradient_driver.max_memory,
         )
+    if jk_ledger is None:
+        contractions = local_ledger.contract(
+            gradient_driver, mol, atmlst, slots=output_slots,
+        )
+        for probe, slot in enumerate(output_slots):
+            gradient[probe] += contractions[slot]
     return gradient[0] if single_probe else gradient
 
 
 def spin_fock_direct_hf(
-        gradient_driver, tdobj, p_alpha, p_beta, atmlst=None):
+        gradient_driver, tdobj, p_alpha, p_beta, atmlst=None,
+        jk_ledger=None, output_slots=None):
     """Differentiate one or more spin-resolved HF Fock scalar probes."""
     mol = tdobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
-    offsets = mol.offset_nr_by_atom()
     p_alpha, p_beta, single_probe = _spin_probe_stacks(
         p_alpha, p_beta,
     )
+    if output_slots is None:
+        output_slots = tuple(range(len(p_alpha)))
     p_total = p_alpha + p_beta
     dm_alpha, dm_beta = _reference_spin_densities(tdobj)
     gradient = np.zeros((len(p_alpha), len(atmlst), 3))
@@ -853,33 +887,38 @@ def spin_fock_direct_hf(
         gradient[:, k] += lib.einsum(
             "npq,xpq->nx", p_total, hcore_derivative(atom),
         )
+    local_ledger = _JKDerivativeLedger()
+    ledger = jk_ledger if jk_ledger is not None else local_ledger
     for probe in range(len(p_alpha)):
-        _contract_jk_derivatives(
-            gradient[probe],
-            gradient_driver,
-            mol,
-            atmlst,
-            offsets,
-            j_terms=(
+        ledger.add(
+            "j", output_slots[probe], (
                 (p_total[probe], dm_alpha, 1.0, None),
                 (p_total[probe], dm_beta, 1.0, None),
             ),
-            k_terms=(
+        )
+        ledger.add(
+            "k", output_slots[probe], (
                 (p_alpha[probe], dm_alpha, -1.0, None),
                 (p_beta[probe], dm_beta, -1.0, None),
             ),
         )
+    if jk_ledger is None:
+        contractions = local_ledger.contract(
+            gradient_driver, mol, atmlst, slots=output_slots,
+        )
+        for probe, slot in enumerate(output_slots):
+            gradient[probe] += contractions[slot]
     return gradient[0] if single_probe else gradient
 
 
 def response_direct_hfx(
-        gradient_driver, tdobj, densities, response_terms, atmlst=None):
+        gradient_driver, tdobj, densities, response_terms, atmlst=None,
+        jk_ledger=None, output_slot=0):
     """J/K skeleton derivative for a channel response-term ledger."""
     mol = tdobj.mol
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
-    offsets = mol.offset_nr_by_atom()
     gradient = np.zeros((len(atmlst), 3))
     ni = tdobj._scf._numint
     omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(
@@ -911,22 +950,22 @@ def response_direct_hfx(
                     -coefficient * term.vref1,
                     range_omega,
                 ))
-    _contract_jk_derivatives(
-        gradient,
-        gradient_driver,
-        mol,
-        atmlst,
-        offsets,
-        j_terms=j_terms,
-        k_terms=k_terms,
-    )
+    local_ledger = _JKDerivativeLedger()
+    ledger = jk_ledger if jk_ledger is not None else local_ledger
+    ledger.add("j", output_slot, j_terms)
+    ledger.add("k", output_slot, k_terms)
+    if jk_ledger is None:
+        gradient += local_ledger.contract(
+            gradient_driver, mol, atmlst, slots=(output_slot,),
+        )[output_slot]
     return gradient
 
 
 # Hybrid/RSH Fz correction
 
 def same_spin_fockz_hfx_terms(
-        gradient_driver, tdobj, pz, atmlst=None, with_direct=True):
+        gradient_driver, tdobj, pz, atmlst=None, with_direct=True,
+        jk_ledger=None, output_slot=0):
     """Differentiate ``-1/2 Pz:K(D_OO)`` excluding the Pz projection."""
     mf = tdobj._scf
     mol = mf.mol
@@ -947,7 +986,6 @@ def same_spin_fockz_hfx_terms(
     scales = [(hybrid, None)]
     if omega != 0:
         scales.append((alpha - hybrid, omega))
-    offsets = mol.offset_nr_by_atom()
     k_terms = []
     for coefficient, range_omega in scales:
         if coefficient == 0.0:
@@ -968,14 +1006,14 @@ def same_spin_fockz_hfx_terms(
                 -0.5 * coefficient,
                 range_omega,
             ))
-    _contract_jk_derivatives(
-        direct,
-        gradient_driver,
-        mol,
-        atmlst,
-        offsets,
-        k_terms=k_terms,
-    )
+    if with_direct:
+        local_ledger = _JKDerivativeLedger()
+        ledger = jk_ledger if jk_ledger is not None else local_ledger
+        ledger.add("k", output_slot, k_terms)
+        if jk_ledger is None:
+            direct += local_ledger.contract(
+                gradient_driver, mol, atmlst, slots=(output_slot,),
+            )[output_slot]
     return xc_backend.XCGradientTerms(q_alpha, q_beta, direct)
 
 
@@ -1029,6 +1067,9 @@ def grad_elec(
     response_terms = same_spin_response_terms(spaces.spin)
     channel_data = (spaces, amplitudes, densities, blocks, response_terms)
     p0, pz = same_spin_fock_probes(tdobj, xy)
+    jk_ledger = _JKDerivativeLedger()
+    direct_slot = "direct"
+    zvector_slot = "zvector"
 
     # 2. Explicit Fock contribution to the orbital-rotation M matrix.
     fock_alpha, fock_beta = same_spin_fock_q(tdobj, xy)
@@ -1051,8 +1092,29 @@ def grad_elec(
             densities,
             response_terms,
             atmlst=atmlst,
+            jk_ledger=jk_ledger,
+            output_slot=direct_slot,
         )
-        fock_direct = spin_fock_direct_hf
+
+        def fock_direct(driver, obj, p_alpha, p_beta, atmlst=None):
+            local = spin_fock_direct_hf(
+                driver,
+                obj,
+                p_alpha,
+                p_beta,
+                atmlst=atmlst,
+                jk_ledger=jk_ledger,
+                output_slots=(direct_slot, zvector_slot),
+            )
+            contractions = jk_ledger.contract(
+                driver,
+                obj.mol,
+                atmlst,
+                slots=(direct_slot, zvector_slot),
+            )
+            local[0] += contractions[direct_slot]
+            local[1] += contractions[zvector_slot]
+            return local
     else:
         # 3b. Semilocal XC, hybrid/RSH, Fz, and nobeta contributions.
         try:
@@ -1093,7 +1155,12 @@ def grad_elec(
             atmlst=atmlst,
         )
         fockz_hfx = same_spin_fockz_hfx_terms(
-            gradient_driver, tdobj, pz, atmlst=atmlst,
+            gradient_driver,
+            tdobj,
+            pz,
+            atmlst=atmlst,
+            jk_ledger=jk_ledger,
+            output_slot=direct_slot,
         )
         common_alpha, common_beta = nobeta_q_builder(tdobj, p0)
         m_matrix = (
@@ -1112,19 +1179,32 @@ def grad_elec(
             densities,
             response_terms,
             atmlst=atmlst,
+            jk_ledger=jk_ledger,
+            output_slot=direct_slot,
         )
         direct += response_xc.direct
         direct += fockz_xc.direct
         direct += fockz_hfx.direct
         def fock_direct(driver, obj, p_alpha, p_beta, atmlst=None):
-            return spin_fock_direct_dft(
+            local = spin_fock_direct_dft(
                 driver,
                 obj,
                 p_alpha,
                 p_beta,
                 atmlst=atmlst,
                 nobeta_p0=p0,
+                jk_ledger=jk_ledger,
+                output_slots=(direct_slot, zvector_slot),
             )
+            contractions = jk_ledger.contract(
+                driver,
+                obj.mol,
+                atmlst,
+                slots=(direct_slot, zvector_slot),
+            )
+            local[0] += contractions[direct_slot]
+            local[1] += contractions[zvector_slot]
+            return local
 
     # 4-5. ROKS transpose-Hessian adjoint, Dz Fock derivative, and Pulay term.
     return finish_gradient(

@@ -170,8 +170,8 @@ class GradientLayerChecks(unittest.TestCase):
 
                 with self.subTest(delta_s=delta_s, nobeta=nobeta):
                     self.assertTrue(np.all(np.isfinite(result.total)))
-                    self.assertLessEqual(calls["j"], 4)
-                    self.assertLessEqual(calls["k"], 8)
+                    self.assertEqual(calls["j"], 2)
+                    self.assertEqual(calls["k"], 2)
                     self.assertGreater(max(calls["j_batch"]), 1)
                     self.assertGreater(max(calls["k_batch"]), 1)
                     expected_vxc = 2 if nobeta else 1

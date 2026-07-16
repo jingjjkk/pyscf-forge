@@ -78,61 +78,67 @@ def second_derivative_index(first, second):
     }[(first, second)]
 
 
-def delta_ao(ao, p0, p1, xyz):
-    grids, nao = ao.shape[-2:]
-    delta = np.zeros((4, grids, nao))
-    delta[0, :, p0:p1] = -ao[xyz + 1][:, p0:p1]
+def _compact_ao_center_derivative(ao, p0, p1, xyz, xctype):
+    """AO-center derivative restricted to one atom's AO columns."""
+    if xctype == "LDA":
+        return -ao[xyz + 1][:, p0:p1]
+    delta = np.empty((4, ao.shape[-2], p1 - p0))
+    delta[0] = -ao[xyz + 1][:, p0:p1]
     for feature in range(3):
-        delta[feature + 1, :, p0:p1] = -ao[
+        delta[feature + 1] = -ao[
             second_derivative_index(xyz, feature)
         ][:, p0:p1]
     return delta
 
 
-def gga_density_derivative(ao, density, p0, p1, xyz):
-    delta = delta_ao(ao, p0, p1, xyz)
-    output = np.empty((4, ao.shape[-2]))
-    output[0] = lib.einsum(
-        "ga,au,gu->g", delta[0, :, p0:p1], density[p0:p1], ao[0],
+def _hermitian_density_derivative_batches(
+        ao, densities, p0, p1, xctype):
+    """Yield AO-center derivatives for a stack of real symmetric densities."""
+    densities = np.asarray(densities)
+    feature_count = 1 if xctype == "LDA" else 4
+    density_rows = densities[:, p0:p1]
+    packed_rows = density_rows.transpose(2, 0, 1).reshape(
+        density_rows.shape[-1], -1,
     )
-    output[0] += lib.einsum(
-        "gu,ua,ga->g", ao[0], density[:, p0:p1], delta[0, :, p0:p1],
-    )
-    for feature in range(1, 4):
-        output[feature] = lib.einsum(
-            "ga,au,gu->g",
-            delta[feature, :, p0:p1], density[p0:p1], ao[0],
-        )
-        output[feature] += lib.einsum(
-            "gu,ua,ga->g",
-            ao[feature], density[:, p0:p1], delta[0, :, p0:p1],
-        )
-        output[feature] += lib.einsum(
-            "ga,au,gu->g",
-            delta[0, :, p0:p1], density[p0:p1], ao[feature],
-        )
-        output[feature] += lib.einsum(
-            "gu,ua,ga->g",
-            ao[0], density[:, p0:p1], delta[feature, :, p0:p1],
-        )
-    return output
+    contracted = (ao[:feature_count] @ packed_rows).reshape(
+        feature_count, ao.shape[-2], len(densities), p1 - p0,
+    ).transpose(2, 0, 1, 3)
 
+    for xyz in range(3):
+        delta = _compact_ao_center_derivative(
+            ao, p0, p1, xyz, xctype,
+        )
+        if xctype == "LDA":
+            yield 2.0 * lib.einsum(
+                "ga,nga->ng", delta, contracted[:, 0],
+            )[:, None]
+            continue
 
-def mgga_density_derivative(ao, density, p0, p1, xyz):
-    output = np.empty((5, ao.shape[-2]))
-    output[:4] = gga_density_derivative(ao, density, p0, p1, xyz)
-    delta = delta_ao(ao, p0, p1, xyz)
-    output[4] = 0.0
-    for feature in range(1, 4):
-        output[4] += 0.5 * lib.einsum(
-            "ga,au,gu->g",
-            delta[feature, :, p0:p1], density[p0:p1], ao[feature],
+        derivative_count = 4 if xctype == "GGA" else 5
+        output = np.empty((
+            len(densities), derivative_count, ao.shape[-2],
+        ))
+        output[:, 0] = 2.0 * lib.einsum(
+            "ga,nga->ng", delta[0], contracted[:, 0],
         )
-        output[4] += 0.5 * lib.einsum(
-            "gu,ua,ga->g",
-            ao[feature], density[:, p0:p1], delta[feature, :, p0:p1],
-        )
-    return output
+        for feature in range(1, 4):
+            output[:, feature] = 2.0 * (
+                lib.einsum(
+                    "ga,nga->ng", delta[feature], contracted[:, 0],
+                )
+                + lib.einsum(
+                    "ga,nga->ng", delta[0], contracted[:, feature],
+                )
+            )
+        if xctype == "GGA":
+            yield output
+            continue
+        output[:, 4] = 0.0
+        for feature in range(1, 4):
+            output[:, 4] += lib.einsum(
+                "ga,nga->ng", delta[feature], contracted[:, feature],
+            )
+        yield output
 
 
 def pair_feature_batches(ao, densities):
@@ -151,26 +157,28 @@ def pair_feature_batches(ao, densities):
     return features, contracted
 
 
-def pair_features_derivatives(
-        ao, densities, delta, contracted_ao, p0, p1):
-    """Pair-feature derivatives using only the nonzero AO-center block."""
+def contract_pair_feature_derivatives(
+        ao, densities, delta, contracted_ao, p0, p1,
+        tensor_weights, grid_weights):
+    """Contract pair-feature derivatives without materializing ``dPair``."""
     densities = np.asarray(densities)
-    derivative = np.empty((len(densities), 4, 4, ao.shape[-2]))
-    contracted_delta = [
-        delta[index, :, p0:p1] @ densities[:, p0:p1]
-        for index in range(4)
-    ]
+    tensor_weights = np.asarray(tensor_weights)
+    value = 0.0
     for left in range(4):
-        for right in range(4):
-            derivative[:, left, right] = lib.einsum(
-                "ngu,gu->ng", contracted_delta[left], ao[right],
-            )
-            derivative[:, left, right] += lib.einsum(
-                "nga,ga->ng",
-                contracted_ao[:, left, :, p0:p1],
-                delta[right, :, p0:p1],
-            )
-    return derivative
+        contracted_delta = delta[left] @ densities[:, p0:p1]
+        value += lib.einsum(
+            "pbg,pgu,bgu,g->",
+            tensor_weights[:, left], contracted_delta, ao[:4],
+            grid_weights, optimize=True,
+        )
+    contracted_atom = contracted_ao[:, :, :, p0:p1]
+    for right in range(4):
+        value += lib.einsum(
+            "pag,pagq,gq,g->",
+            tensor_weights[:, :, right], contracted_atom,
+            delta[right], grid_weights, optimize=True,
+        )
+    return value
 
 
 def gga_pair_potential(kernel, features):
@@ -316,16 +324,6 @@ def _lda_matrix(ao0, weights):
     return ao0.T @ (ao0 * np.asarray(weights)[:, None])
 
 
-def _lda_density_derivative(ao0, ao_atom, density, p0, p1):
-    left = lib.einsum(
-        "ga,au,gu->g", ao_atom, density[p0:p1], ao0,
-    )
-    right = lib.einsum(
-        "gu,ua,ga->g", ao0, density[:, p0:p1], ao_atom,
-    )
-    return -(left + right)
-
-
 def _project_channel_potentials(tdobj, potentials, blocks):
     """Project transition-factor potentials for any NTTDA spin channel."""
     mo = np.asarray(tdobj._scf.mo_coeff)
@@ -379,9 +377,9 @@ def _xc_density(ni, mol, ao, density, mask, xctype):
 
 
 def _xc_ao_center_derivative(ao, p0, p1, xyz, xctype):
-    if xctype == "LDA":
-        return -ao[xyz + 1][:, p0:p1]
-    return delta_ao(ao, p0, p1, xyz)
+    return _compact_ao_center_derivative(
+        ao, p0, p1, xyz, xctype,
+    )
 
 
 def _xc_density_derivatives(
@@ -411,7 +409,7 @@ def _xc_density_derivatives(
     )
     output[:, 0] = lib.einsum(
         "ga,nau,gu->ng",
-        delta[0, :, p0:p1],
+        delta[0],
         densities[:, p0:p1],
         ao[0],
     )
@@ -419,12 +417,12 @@ def _xc_density_derivatives(
         "gu,nua,ga->ng",
         ao[0],
         densities[:, :, p0:p1],
-        delta[0, :, p0:p1],
+        delta[0],
     )
     for feature in range(1, 4):
         output[:, feature] = lib.einsum(
             "ga,nau,gu->ng",
-            delta[feature, :, p0:p1],
+            delta[feature],
             densities[:, p0:p1],
             ao[0],
         )
@@ -432,11 +430,11 @@ def _xc_density_derivatives(
             "gu,nua,ga->ng",
             ao[feature],
             densities[:, :, p0:p1],
-            delta[0, :, p0:p1],
+            delta[0],
         )
         output[:, feature] += lib.einsum(
             "ga,nau,gu->ng",
-            delta[0, :, p0:p1],
+            delta[0],
             densities[:, p0:p1],
             ao[feature],
         )
@@ -444,7 +442,7 @@ def _xc_density_derivatives(
             "gu,nua,ga->ng",
             ao[0],
             densities[:, :, p0:p1],
-            delta[feature, :, p0:p1],
+            delta[feature],
         )
     if xctype == "GGA":
         return output[:, :4]
@@ -453,7 +451,7 @@ def _xc_density_derivatives(
     for feature in range(1, 4):
         output[:, 4] += 0.5 * lib.einsum(
             "ga,nau,gu->ng",
-            delta[feature, :, p0:p1],
+            delta[feature],
             densities[:, p0:p1],
             ao[feature],
         )
@@ -461,7 +459,7 @@ def _xc_density_derivatives(
             "gu,nua,ga->ng",
             ao[feature],
             densities[:, :, p0:p1],
-            delta[feature, :, p0:p1],
+            delta[feature],
         )
     return output
 
@@ -658,6 +656,9 @@ def lda_response_terms(
             pair = coefficient * rho[target] * rho[source]
             pair_alpha += kref_alpha * pair
             pair_beta += kref_beta * pair
+        potential_weight_stack = np.asarray([
+            potential_weights[label] for label in density_labels
+        ])
         for label in potentials:
             potentials[label] += _lda_matrix(
                 ao0, weights * potential_weights[label],
@@ -676,19 +677,19 @@ def lda_response_terms(
                         p0, p1, xyz, "LDA",
                     )
                 )
-                value = 0.0
-                for target, source, coefficient in coefficients:
-                    value += coefficient * np.dot(
-                        weights,
-                        fref * (
-                            drho[target] * rho[source]
-                            + rho[target] * drho[source]
-                        )
-                        + rho[target] * rho[source] * (
-                            kref_alpha * drho_alpha
-                            + kref_beta * drho_beta
-                        ),
-                    )
+                drho_stack = np.asarray([
+                    drho[label] for label in density_labels
+                ])
+                value = lib.einsum(
+                    "ng,ng,g->",
+                    potential_weight_stack, drho_stack, weights,
+                )
+                value += lib.einsum(
+                    "g,g,g->", pair_alpha, drho_alpha, weights,
+                )
+                value += lib.einsum(
+                    "g,g,g->", pair_beta, drho_beta, weights,
+                )
                 direct[k, xyz] += value
 
     q_alpha, q_beta = _project_channel_potentials(
@@ -721,6 +722,9 @@ def lda_fockz_terms(
     mo = np.asarray(mf.mo_coeff)
     density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
     density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+    density_stack = np.asarray((
+        pz_symmetric, density_open, density_alpha, density_beta,
+    ))
     offsets = mol.offset_nr_by_atom()
 
     for ao, mask, weights, _coords in ni.block_loop(
@@ -749,19 +753,12 @@ def lda_fockz_terms(
             continue
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
-            for xyz in range(3):
-                ao_atom = ao[xyz + 1][:, p0:p1]
-                drho_pz = _lda_density_derivative(
-                    ao0, ao_atom, pz_symmetric, p0, p1,
-                )
-                drho_open = _lda_density_derivative(
-                    ao0, ao_atom, density_open, p0, p1,
-                )
-                drho_alpha = _lda_density_derivative(
-                    ao0, ao_atom, density_alpha, p0, p1,
-                )
-                drho_beta = _lda_density_derivative(
-                    ao0, ao_atom, density_beta, p0, p1,
+            derivative_batches = _hermitian_density_derivative_batches(
+                ao, density_stack, p0, p1, "LDA",
+            )
+            for xyz, derivatives in enumerate(derivative_batches):
+                drho_pz, drho_open, drho_alpha, drho_beta = (
+                    derivatives[:, 0]
                 )
                 direct[k, xyz] += 0.5 * np.dot(
                     weights,
@@ -973,6 +970,12 @@ def gga_response_terms(
                 reference_weights_beta += lib.einsum(
                     "xyg,xyzg->zg", pair, kref_beta,
                 )
+        ordinary_weight_stack = np.asarray([
+            ordinary_weights[label] for label in density_labels
+        ])
+        special_weight_stack = np.asarray([
+            special_weights[label] for label in pair_labels
+        ])
 
         for label in potentials:
             add_gga_matrix(
@@ -1001,57 +1004,26 @@ def gga_response_terms(
                         p0, p1, xyz, "GGA",
                     )
                 )
-                dpairs = dict(zip(
-                    pair_labels,
-                    pair_features_derivatives(
-                        ao, pair_density_stack, ao_delta,
-                        contracted_pair_ao, p0, p1,
-                    ),
-                ))
-                value = 0.0
-                for term in terms:
-                    if term.vref0:
-                        value += term.vref0 * lib.einsum(
-                            "xg,xyg,yg,g->",
-                            drho[term.target], fref, rho[term.source], weights,
-                        )
-                        value += term.vref0 * lib.einsum(
-                            "xg,xyg,yg,g->",
-                            rho[term.target], fref, drho[term.source], weights,
-                        )
-                        pair = term.vref0 * lib.einsum(
-                            "xg,yg->xyg", rho[term.target], rho[term.source],
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_alpha, drho_alpha, weights,
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_beta, drho_beta, weights,
-                        )
-                    if term.vref1:
-                        value += term.vref1 * lib.einsum(
-                            "abg,abg,g->",
-                            pair_potentials[term.source],
-                            dpairs[term.target], weights,
-                        )
-                        value += term.vref1 * lib.einsum(
-                            "abg,abg,g->",
-                            pair_potentials[term.target],
-                            dpairs[term.source], weights,
-                        )
-                        pair = term.vref1 * gga_pair_kernel_cross(
-                            pairs[term.target], pairs[term.source],
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_alpha, drho_alpha, weights,
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_beta, drho_beta, weights,
-                        )
+                drho_stack = np.asarray([
+                    drho[label] for label in density_labels
+                ])
+                value = lib.einsum(
+                    "nfg,nfg,g->",
+                    ordinary_weight_stack, drho_stack, weights,
+                )
+                value += lib.einsum(
+                    "fg,fg,g->",
+                    reference_weights_alpha, drho_alpha, weights,
+                )
+                value += lib.einsum(
+                    "fg,fg,g->",
+                    reference_weights_beta, drho_beta, weights,
+                )
+                value += contract_pair_feature_derivatives(
+                    ao, pair_density_stack, ao_delta,
+                    contracted_pair_ao, p0, p1,
+                    special_weight_stack, weights,
+                )
                 direct[k, xyz] += value
 
     q_alpha, q_beta = _project_channel_potentials(
@@ -1083,6 +1055,9 @@ def gga_fockz_terms(
     mo = np.asarray(mf.mo_coeff)
     density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
     density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+    density_stack = np.asarray((
+        pz, density_open, density_alpha, density_beta,
+    ))
     offsets = mol.offset_nr_by_atom()
     sparse = sparse_context(mf)
 
@@ -1120,17 +1095,11 @@ def gga_fockz_terms(
             continue
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
-            for xyz in range(3):
-                drho_pz = gga_density_derivative(ao, pz, p0, p1, xyz)
-                drho_open = gga_density_derivative(
-                    ao, density_open, p0, p1, xyz,
-                )
-                drho_alpha = gga_density_derivative(
-                    ao, density_alpha, p0, p1, xyz,
-                )
-                drho_beta = gga_density_derivative(
-                    ao, density_beta, p0, p1, xyz,
-                )
+            derivative_batches = _hermitian_density_derivative_batches(
+                ao, density_stack, p0, p1, "GGA",
+            )
+            for xyz, derivatives in enumerate(derivative_batches):
+                drho_pz, drho_open, drho_alpha, drho_beta = derivatives
                 direct[k, xyz] += 0.5 * lib.einsum(
                     "xg,xyg,yg,g->", drho_pz, fref, rho_open, weights,
                 )
@@ -1344,6 +1313,12 @@ def mgga_response_terms(
                 reference_weights_beta += lib.einsum(
                     "xyg,xyzg->zg", pair, kref_beta,
                 )
+        ordinary_weight_stack = np.asarray([
+            ordinary_weights[label] for label in density_labels
+        ])
+        special_weight_stack = np.asarray([
+            special_weights[label] for label in pair_labels
+        ])
 
         for label in potentials:
             add_mgga_matrix(
@@ -1372,57 +1347,26 @@ def mgga_response_terms(
                         p0, p1, xyz, "MGGA",
                     )
                 )
-                dpairs = dict(zip(
-                    pair_labels,
-                    pair_features_derivatives(
-                        ao, pair_density_stack, ao_delta,
-                        contracted_pair_ao, p0, p1,
-                    ),
-                ))
-                value = 0.0
-                for term in terms:
-                    if term.vref0:
-                        value += term.vref0 * lib.einsum(
-                            "xg,xyg,yg,g->",
-                            drho[term.target], fref, rho[term.source], weights,
-                        )
-                        value += term.vref0 * lib.einsum(
-                            "xg,xyg,yg,g->",
-                            rho[term.target], fref, drho[term.source], weights,
-                        )
-                        pair = term.vref0 * lib.einsum(
-                            "xg,yg->xyg", rho[term.target], rho[term.source],
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_alpha, drho_alpha, weights,
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_beta, drho_beta, weights,
-                        )
-                    if term.vref1:
-                        value += term.vref1 * lib.einsum(
-                            "abg,abg,g->",
-                            pair_potentials[term.source],
-                            dpairs[term.target], weights,
-                        )
-                        value += term.vref1 * lib.einsum(
-                            "abg,abg,g->",
-                            pair_potentials[term.target],
-                            dpairs[term.source], weights,
-                        )
-                        pair = term.vref1 * mgga_pair_kernel_cross(
-                            pairs[term.target], pairs[term.source],
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_alpha, drho_alpha, weights,
-                        )
-                        value += lib.einsum(
-                            "xyg,xyzg,zg,g->",
-                            pair, kref_beta, drho_beta, weights,
-                        )
+                drho_stack = np.asarray([
+                    drho[label] for label in density_labels
+                ])
+                value = lib.einsum(
+                    "nfg,nfg,g->",
+                    ordinary_weight_stack, drho_stack, weights,
+                )
+                value += lib.einsum(
+                    "fg,fg,g->",
+                    reference_weights_alpha, drho_alpha, weights,
+                )
+                value += lib.einsum(
+                    "fg,fg,g->",
+                    reference_weights_beta, drho_beta, weights,
+                )
+                value += contract_pair_feature_derivatives(
+                    ao, pair_density_stack, ao_delta,
+                    contracted_pair_ao, p0, p1,
+                    special_weight_stack, weights,
+                )
                 direct[k, xyz] += value
 
     q_alpha, q_beta = _project_channel_potentials(
@@ -1454,6 +1398,9 @@ def mgga_fockz_terms(
     mo = np.asarray(mf.mo_coeff)
     density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
     density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+    density_stack = np.asarray((
+        pz, density_open, density_alpha, density_beta,
+    ))
     offsets = mol.offset_nr_by_atom()
     sparse = sparse_context(mf)
 
@@ -1491,17 +1438,11 @@ def mgga_fockz_terms(
             continue
         for k, atom in enumerate(atmlst):
             p0, p1 = offsets[atom][2:]
-            for xyz in range(3):
-                drho_pz = mgga_density_derivative(ao, pz, p0, p1, xyz)
-                drho_open = mgga_density_derivative(
-                    ao, density_open, p0, p1, xyz,
-                )
-                drho_alpha = mgga_density_derivative(
-                    ao, density_alpha, p0, p1, xyz,
-                )
-                drho_beta = mgga_density_derivative(
-                    ao, density_beta, p0, p1, xyz,
-                )
+            derivative_batches = _hermitian_density_derivative_batches(
+                ao, density_stack, p0, p1, "MGGA",
+            )
+            for xyz, derivatives in enumerate(derivative_batches):
+                drho_pz, drho_open, drho_alpha, drho_beta = derivatives
                 direct[k, xyz] += 0.5 * lib.einsum(
                     "xg,xyg,yg,g->", drho_pz, fref, rho_open, weights,
                 )
