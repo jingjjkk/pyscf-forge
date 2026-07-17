@@ -994,6 +994,27 @@ class NTTDA(TDBase):
 
     Gradients = nuc_grad_method
 
+    def nac_method(self):
+        """Return the NTTDA ``deltaS=-1`` nonadiabatic-coupling driver."""
+        import os
+        import pyscf
+        import pyscf.nac
+
+        forge_path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), os.pardir,
+        ))
+        if forge_path in pyscf.__path__:
+            pyscf.__path__.remove(forge_path)
+        pyscf.__path__.insert(0, forge_path)
+        nac_path = os.path.join(forge_path, "nac")
+        if nac_path in pyscf.nac.__path__:
+            pyscf.nac.__path__.remove(nac_path)
+        pyscf.nac.__path__.insert(0, nac_path)
+        from pyscf.nac.nttda import NonAdiabaticCouplings
+        return NonAdiabaticCouplings(self)
+
+    NAC = nac_method
+
     def init_guess(self, hdiag, nstates=None):
         if nstates is None:
             nstates = self.nstates
