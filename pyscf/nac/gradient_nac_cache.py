@@ -2,16 +2,14 @@
 
 import copy
 import hashlib
-import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 
 from pyscf.dft import numint2c
 from pyscf.sftda.numint2c_sftd import mcfun_eval_xc_adapter_sf
 
-
-logger = logging.getLogger(__name__)
+_MISSING = object()
 
 
 def _clone_value(value):
@@ -54,18 +52,49 @@ def _hash_payload(payload):
 
 
 class GradientNACCacheManager:
-    def __init__(self):
+    """Cache expensive intermediates within one gradient/NAC batch.
+
+    Target objects are bound only for the lifetime of the context manager. All
+    cached arrays and target bindings are released on exit, including when the
+    calculation raises an exception.
+    """
+
+    _cache_attribute = '_gradient_nac_cache'
+
+    def __init__(self, *targets):
         self._xc_block_cache: Dict[Tuple[Any, ...], Tuple[Dict[str, Any], ...]] = {}
         self._jk_cache: Dict[Tuple[Any, ...], Any] = {}
-        self._state_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._targets = targets
+        self._previous_managers = []
+        self._active = False
         self._stats = {
             'xc_block_hits': 0,
             'xc_block_misses': 0,
             'jk_hits': 0,
             'jk_misses': 0,
-            'state_hits': 0,
-            'state_misses': 0,
         }
+
+    def __enter__(self):
+        if self._active:
+            raise RuntimeError('GradientNACCacheManager cannot be re-entered')
+        self.clear()
+        self._active = True
+        self._previous_managers = []
+        for target in self._targets:
+            previous = getattr(target, self._cache_attribute, _MISSING)
+            self._previous_managers.append((target, previous))
+            setattr(target, self._cache_attribute, self)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for target, previous in reversed(self._previous_managers):
+            if previous is _MISSING:
+                delattr(target, self._cache_attribute)
+            else:
+                setattr(target, self._cache_attribute, previous)
+        self._previous_managers = []
+        self.clear()
+        self._active = False
 
     def _geometry_key(self, mf, mol, td_obj=None):
         return (
@@ -86,21 +115,6 @@ class GradientNACCacheManager:
             mol = target.mol
             td_obj = None
         return self._geometry_key(mf, mol, td_obj)
-
-    def _state_key(self, td_obj, state_id):
-        return self._geometry_key(td_obj._scf, td_obj.mol, td_obj) + (state_id,)
-
-    def get_state_data(self, td_obj, state_id):
-        key = self._state_key(td_obj, state_id)
-        if key in self._state_cache:
-            self._stats['state_hits'] += 1
-            return self._state_cache[key]
-        self._stats['state_misses'] += 1
-        return None
-
-    def store_state_data(self, td_obj, state_id, **data):
-        key = self._state_key(td_obj, state_id)
-        self._state_cache[key] = data
 
     def get_xc_blocks(self, td_grad, xc_code, ao_deriv, deriv, max_memory, need_sc):
         mf = td_grad.base._scf
@@ -187,7 +201,6 @@ class GradientNACCacheManager:
     def clear(self):
         self._xc_block_cache.clear()
         self._jk_cache.clear()
-        self._state_cache.clear()
         for key in self._stats:
             self._stats[key] = 0
 
@@ -195,7 +208,6 @@ class GradientNACCacheManager:
         stats = dict(self._stats)
         stats['xc_block_cache_size'] = len(self._xc_block_cache)
         stats['jk_cache_size'] = len(self._jk_cache)
-        stats['state_cache_size'] = len(self._state_cache)
         return stats
 
     def print_stats(self):
@@ -206,20 +218,10 @@ class GradientNACCacheManager:
             f"size={stats['xc_block_cache_size']}"
         )
         print(f"  jk calls  hits={stats['jk_hits']} misses={stats['jk_misses']} size={stats['jk_cache_size']}")
-        print(
-            f"  states    hits={stats['state_hits']} misses={stats['state_misses']} size={stats['state_cache_size']}"
-        )
 
 
-_CACHE_MANAGER: Optional[GradientNACCacheManager] = None
-
-
-def get_cache_manager():
-    global _CACHE_MANAGER
-    if _CACHE_MANAGER is None:
-        _CACHE_MANAGER = GradientNACCacheManager()
-    return _CACHE_MANAGER
-
-
-def clear_all_caches():
-    get_cache_manager().clear()
+def get_cache_manager(target):
+    manager = getattr(target, GradientNACCacheManager._cache_attribute, None)
+    if manager is None:
+        manager = GradientNACCacheManager()
+    return manager

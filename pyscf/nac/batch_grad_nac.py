@@ -3,12 +3,10 @@
 import time
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-
 from pyscf.lib import logger
 from pyscf.grad import tduks_sf as tduks_sf_grad
 from pyscf.nac import tduks_sf as tduks_sf_nac
-from pyscf.tools.gradient_nac_cache import clear_all_caches, get_cache_manager
+from pyscf.nac.gradient_nac_cache import GradientNACCacheManager
 
 
 def _apply_cphf_options(obj, cphf_options):
@@ -28,10 +26,6 @@ def _resolve_state_id(state_id, state_map):
 
 def _default_nac_pairs(states):
     return [(states[i], states[j]) for i in range(len(states) - 1) for j in range(i + 1, len(states))]
-
-
-def clear_cache_for_new_geometry():
-    clear_all_caches()
 
 
 def compute_gradients_and_nacs(
@@ -59,28 +53,33 @@ def compute_gradients_and_nacs(
     grad_obj.verbose = verbose
     _apply_cphf_options(grad_obj, cphf_options)
 
-    for state_id in states:
-        pyscf_state = _resolve_state_id(state_id, state_map)
-        t0 = time.perf_counter()
-        gradients[state_id] = grad_obj.kernel(state=pyscf_state, atmlst=atmlst)
-        timings['gradient_times'][state_id] = time.perf_counter() - t0
-
-    for state_i, state_j in nac_pairs:
+    nac_objects = {}
+    for pair in nac_pairs:
         nac_obj = tduks_sf_nac.NAC(td_obj)
         nac_obj.max_memory = max_memory
         nac_obj.verbose = verbose
         _apply_cphf_options(nac_obj, cphf_options)
-        t0 = time.perf_counter()
-        nacs[(state_i, state_j)] = nac_obj.kernel(
-            state_I=_resolve_state_id(state_i, state_map),
-            state_J=_resolve_state_id(state_j, state_map),
-            atmlst=atmlst,
-            ediff=ediff,
-            use_etfs=use_etfs,
-        )
-        timings['nac_pair_times'][(state_i, state_j)] = time.perf_counter() - t0
+        nac_objects[pair] = nac_obj
 
-    timings['cache_stats'] = get_cache_manager().get_stats()
+    with GradientNACCacheManager(grad_obj, *nac_objects.values()) as cache_mgr:
+        for state_id in states:
+            pyscf_state = _resolve_state_id(state_id, state_map)
+            t0 = time.perf_counter()
+            gradients[state_id] = grad_obj.kernel(state=pyscf_state, atmlst=atmlst)
+            timings['gradient_times'][state_id] = time.perf_counter() - t0
+
+        for (state_i, state_j), nac_obj in nac_objects.items():
+            t0 = time.perf_counter()
+            nacs[(state_i, state_j)] = nac_obj.kernel(
+                state_I=_resolve_state_id(state_i, state_map),
+                state_J=_resolve_state_id(state_j, state_map),
+                atmlst=atmlst,
+                ediff=ediff,
+                use_etfs=use_etfs,
+            )
+            timings['nac_pair_times'][(state_i, state_j)] = time.perf_counter() - t0
+
+        timings['cache_stats'] = cache_mgr.get_stats()
     return gradients, nacs, timings
 
 
@@ -135,27 +134,32 @@ def compute_fssh_data(
     grad_obj.verbose = verbose
     _apply_cphf_options(grad_obj, cphf_options)
 
-    grad_start = time.perf_counter()
-    active_grad = grad_obj.kernel(state=_resolve_state_id(active_state, state_map), atmlst=atmlst)
-    timings['gradient_s'] = time.perf_counter() - grad_start
-
-    nacs = {}
-    nac_start = time.perf_counter()
-    for state_i, state_j in nac_pairs:
+    nac_objects = {}
+    for pair in nac_pairs:
         nac_obj = tduks_sf_nac.NAC(td_obj)
         nac_obj.max_memory = max_memory
         nac_obj.verbose = verbose
         _apply_cphf_options(nac_obj, cphf_options)
-        pair_start = time.perf_counter()
-        nacs[(state_i, state_j)] = nac_obj.kernel(
-            state_I=_resolve_state_id(state_i, state_map),
-            state_J=_resolve_state_id(state_j, state_map),
-            atmlst=atmlst,
-            ediff=ediff,
-            use_etfs=use_etfs,
-        )
-        timings['nac_pair_times'][(state_i, state_j)] = time.perf_counter() - pair_start
-    timings['nac_total_s'] = time.perf_counter() - nac_start
-    timings['cache_stats'] = get_cache_manager().get_stats()
+        nac_objects[pair] = nac_obj
+
+    with GradientNACCacheManager(grad_obj, *nac_objects.values()) as cache_mgr:
+        grad_start = time.perf_counter()
+        active_grad = grad_obj.kernel(state=_resolve_state_id(active_state, state_map), atmlst=atmlst)
+        timings['gradient_s'] = time.perf_counter() - grad_start
+
+        nacs = {}
+        nac_start = time.perf_counter()
+        for (state_i, state_j), nac_obj in nac_objects.items():
+            pair_start = time.perf_counter()
+            nacs[(state_i, state_j)] = nac_obj.kernel(
+                state_I=_resolve_state_id(state_i, state_map),
+                state_J=_resolve_state_id(state_j, state_map),
+                atmlst=atmlst,
+                ediff=ediff,
+                use_etfs=use_etfs,
+            )
+            timings['nac_pair_times'][(state_i, state_j)] = time.perf_counter() - pair_start
+        timings['nac_total_s'] = time.perf_counter() - nac_start
+        timings['cache_stats'] = cache_mgr.get_stats()
 
     return -active_grad, nacs, timings

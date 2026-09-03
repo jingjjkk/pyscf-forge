@@ -68,7 +68,6 @@ if str(REPO_ROOT) not in sys.path:
 import pyscf
 import pyscf.grad
 import pyscf.nac
-import pyscf.tools
 
 if str(PYSCF_NS_PATH) in pyscf.__path__:
     pyscf.__path__.remove(str(PYSCF_NS_PATH))
@@ -77,16 +76,14 @@ if str(PYSCF_NS_PATH / 'grad') not in pyscf.grad.__path__:
     pyscf.grad.__path__.insert(0, str(PYSCF_NS_PATH / 'grad'))
 if str(PYSCF_NS_PATH / 'nac') not in pyscf.nac.__path__:
     pyscf.nac.__path__.insert(0, str(PYSCF_NS_PATH / 'nac'))
-if str(PYSCF_NS_PATH / 'tools') not in pyscf.tools.__path__:
-    pyscf.tools.__path__.insert(0, str(PYSCF_NS_PATH / 'tools'))
 
 from pyscf import dft
 from pyscf import gto
 from pyscf import sftda
 from pyscf.grad import tduks_sf as packaged_grad
+from pyscf.nac import batch_grad_nac
 from pyscf.nac import tduks_sf as packaged_nac
 from pyscf.sftda.uhf_sf import get_ab_sf
-from pyscf.tools import batch_grad_nac
 
 
 def solve_shared_tddft(mf, extype=1, collinear_samples=50):
@@ -199,7 +196,6 @@ def test_batch_matches_current_standalone(xc, extype):
     solved_data = solve_shared_tddft(mf, extype=extype, collinear_samples=50)
     td = build_td_object(mf, solved_data, extype=extype, collinear_samples=50, xy_format='new')
 
-    batch_grad_nac.clear_cache_for_new_geometry()
     force, nacs, timings = batch_grad_nac.compute_fssh_data(
         td, states=[1, 2], active_state=1, use_etfs=True, ediff=True, verbose=0
     )
@@ -220,7 +216,6 @@ def test_batch_matches_current_full_nac():
     solved_data = solve_shared_tddft(mf, extype=1, collinear_samples=50)
     td = build_td_object(mf, solved_data, extype=1, collinear_samples=50, xy_format='new')
 
-    batch_grad_nac.clear_cache_for_new_geometry()
     _, nacs, timings = batch_grad_nac.compute_fssh_data(td, states=[1, 2], active_state=1, use_etfs=False, ediff=True, verbose=0)
     nac_ref = packaged_nac.NAC(td).kernel(state_I=1, state_J=2, use_etfs=False, ediff=True)
 
@@ -237,7 +232,6 @@ def test_batch_matches_old_reference(xc, extype, use_etfs):
     solved_data = solve_shared_tddft(mf, extype=extype, collinear_samples=50)
     td = build_td_object(mf, solved_data, extype=extype, collinear_samples=50, xy_format='new')
 
-    batch_grad_nac.clear_cache_for_new_geometry()
     force, nacs, timings = batch_grad_nac.compute_fssh_data(
         td, states=[1, 2], active_state=1, use_etfs=use_etfs, ediff=True, verbose=0
     )

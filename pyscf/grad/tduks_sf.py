@@ -29,7 +29,7 @@ from pyscf.grad import tdrhf as tdrhf_grad
 from pyscf.grad import tdrks as tdrks_grad
 from pyscf.grad import tduks as tduks_grad
 from pyscf.sftda.numint2c_sftd import mcfun_eval_xc_adapter_sf
-from pyscf.tools.gradient_nac_cache import get_cache_manager
+from pyscf.nac.gradient_nac_cache import get_cache_manager
 
 
 def _cached_get_jk(cache_mgr, target, mol, dm, **kwargs):
@@ -60,7 +60,7 @@ def grad_elec(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INFO):
 
     mol = td_grad.mol
     mf = td_grad.base._scf
-    cache_mgr = get_cache_manager()
+    cache_mgr = get_cache_manager(td_grad)
 
     mo_coeff = mf.mo_coeff
     mo_energy = mf.mo_energy
@@ -311,7 +311,7 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True, with_k
     else:
         raise NotImplementedError(f'td-uks for functional {xc_code}')
 
-    cache_mgr = get_cache_manager()
+    cache_mgr = get_cache_manager(td_grad)
     need_sc = dmoo is not None or with_vxc
     cached_blocks = cache_mgr.get_xc_blocks(td_grad, xc_code, ao_deriv, deriv, max_memory, need_sc=need_sc)
 
