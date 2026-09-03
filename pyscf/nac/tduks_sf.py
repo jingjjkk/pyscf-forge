@@ -19,14 +19,20 @@ from pyscf.nac.gradient_nac_cache import GradientNACCacheManager, get_cache_mana
 
 
 def _cached_get_jk(cache_mgr, target, mol, dm, **kwargs):
+    if cache_mgr is None:
+        return target.get_jk(mol, dm, **kwargs)
     return cache_mgr.cached_jk_call(target, 'get_jk', dm, kwargs, lambda: target.get_jk(mol, dm, **kwargs))
 
 
 def _cached_get_j(cache_mgr, target, mol, dm, **kwargs):
+    if cache_mgr is None:
+        return target.get_j(mol, dm, **kwargs)
     return cache_mgr.cached_jk_call(target, 'get_j', dm, kwargs, lambda: target.get_j(mol, dm, **kwargs))
 
 
 def _cached_get_k(cache_mgr, target, mol, dm, **kwargs):
+    if cache_mgr is None:
+        return target.get_k(mol, dm, **kwargs)
     return cache_mgr.cached_jk_call(target, 'get_k', dm, kwargs, lambda: target.get_k(mol, dm, **kwargs))
 
 
@@ -47,7 +53,7 @@ def get_Hellmann_Feymann(td_grad, x_y_I, x_y_J, atmlst=None, max_memory=6000, ve
 
     mol = td_grad.mol
     mf = td_grad.base._scf
-    cache_mgr = get_cache_manager(td_grad)
+    cache_mgr = get_cache_manager(td_grad, create=False)
 
     mo_coeff = mf.mo_coeff
     mo_energy = mf.mo_energy
@@ -344,9 +350,10 @@ def _contract_xc_kernel(td_grad, xc_code, dmvo_I, dmvo_J, dmoo=None, with_vxc=Tr
     else:
         raise NotImplementedError(f'td-uks for functional {xc_code}')
 
-    cache_mgr = get_cache_manager(td_grad)
+    cache_mgr = get_cache_manager(td_grad, create=False)
     need_sc = dmoo is not None or with_vxc
-    cached_blocks = cache_mgr.get_xc_blocks(td_grad, xc_code, ao_deriv, deriv, max_memory, need_sc=need_sc)
+    block_provider = cache_mgr if cache_mgr is not None else GradientNACCacheManager()
+    cached_blocks = block_provider.get_xc_blocks(td_grad, xc_code, ao_deriv, deriv, max_memory, need_sc=need_sc)
 
     for block_id, (ao, mask, weight, coords) in enumerate(ni.block_loop(mol, grids, nao, ao_deriv, max_memory)):
         ao0 = ao[0] if xctype == 'LDA' else ao

@@ -220,8 +220,9 @@ class GradientNACCacheManager:
         print(f"  jk calls  hits={stats['jk_hits']} misses={stats['jk_misses']} size={stats['jk_cache_size']}")
 
 
-def get_cache_manager(target):
+def get_cache_manager(target, create=True):
+    """Return a bound cache, optionally creating an unbound local cache."""
     manager = getattr(target, GradientNACCacheManager._cache_attribute, None)
-    if manager is None:
+    if manager is None and create:
         manager = GradientNACCacheManager()
     return manager

@@ -3,7 +3,11 @@
 import numpy as np
 import pytest
 
+from pyscf import dft
+from pyscf import gto
+from pyscf import scf
 from pyscf.nac.gradient_nac_cache import GradientNACCacheManager, get_cache_manager
+from pyscf.nac import tduks_sf
 
 
 class FakeMolecule:
@@ -77,6 +81,36 @@ def test_context_caches_jk_calls_and_returns_copies():
     assert cache.get_stats()['jk_cache_size'] == 0
 
 
+def test_cached_jk_matches_direct_pyscf_jk():
+    mol = gto.M(atom='H 0 0 0; H 0 0 0.74', basis='sto-3g', verbose=0)
+    mf = scf.RHF(mol)
+    dm = np.array([[1.0, 0.2], [0.2, 0.8]])
+    direct_j, direct_k = mf.get_jk(mol, dm, hermi=1)
+
+    with GradientNACCacheManager(mf) as cache:
+        cached_j, cached_k = cache.cached_jk_call(
+            mf,
+            'get_jk',
+            dm,
+            {'hermi': 1},
+            lambda: mf.get_jk(mol, dm, hermi=1),
+        )
+        reused_j, reused_k = cache.cached_jk_call(
+            mf,
+            'get_jk',
+            dm,
+            {'hermi': 1},
+            lambda: pytest.fail('the cached JK result was not reused'),
+        )
+
+        np.testing.assert_allclose(cached_j, direct_j)
+        np.testing.assert_allclose(cached_k, direct_k)
+        np.testing.assert_allclose(reused_j, direct_j)
+        np.testing.assert_allclose(reused_k, direct_k)
+        assert cache.get_stats()['jk_misses'] == 1
+        assert cache.get_stats()['jk_hits'] == 1
+
+
 def test_cache_keys_include_geometry():
     target = FakeMeanField()
     dm = np.eye(2)
@@ -126,6 +160,37 @@ def test_nested_contexts_are_isolated_and_restored_after_exception():
         assert inner.get_stats()['jk_cache_size'] == 0
 
     assert not hasattr(target, GradientNACCacheManager._cache_attribute)
+
+
+def test_end_to_end_nac_is_unchanged_by_cache():
+    mol = gto.M(
+        atom='O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587',
+        basis='sto-3g',
+        spin=2,
+        verbose=0,
+    )
+    mf = dft.UKS(mol)
+    mf.xc = 'B3LYP'
+    mf.grids.level = 0
+    mf.kernel()
+    td = mf.TDDFT_SF().set(extype=1, collinear_samples=20, nstates=3).run()
+
+    uncached = tduks_sf.NAC(td).kernel(
+        state_I=1,
+        state_J=2,
+        use_etfs=False,
+        ediff=False,
+        use_cache=False,
+    )
+    cached = tduks_sf.NAC(td).kernel(
+        state_I=1,
+        state_J=2,
+        use_etfs=False,
+        ediff=False,
+        use_cache=True,
+    )
+
+    np.testing.assert_allclose(cached, uncached, rtol=1e-10, atol=1e-10)
 
 
 if __name__ == '__main__':
